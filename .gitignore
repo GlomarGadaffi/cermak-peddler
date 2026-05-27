@@ -1,0 +1,59 @@
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# IDE / Build Tools
+.vscode/
+.vs/
+build/
+bin/
+CMakeCache.txt
+CMakeFiles/
+CMakeSettings.json
+Makefile
+cmake_install.cmake
+*.sln
+*.vcxproj
+*.vcxproj.user
+*.vcxproj.filters
+*.dir/
+
+# ESP-IDF / Arduino
+sdkconfig
+sdkconfig.old
+.espressif/
+.pio/
+.pioenvs/
+.piolibdeps/
+.clang-format
+node_modules/
+
+# OS specific files
+.DS_Store
+Thumbs.db
