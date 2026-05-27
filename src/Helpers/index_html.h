@@ -874,12 +874,12 @@ function processCommand(cmd) {
       termPrint('');
       termPrint(' 05/27/2026  05:03p     <DIR>          .', 'var(--fg)');
       termPrint(' 05/27/2026  05:03p     <DIR>          ..', 'var(--fg)');
-      termPrint(' 05/27/2026  05:03p          12,288    SipEngine.C', 'var(--fg)');
-      termPrint(' 05/27/2026  05:03p           8,192    UdpServer.C', 'var(--fg)');
-      termPrint(' 05/27/2026  05:03p           4,096    SipParser.C', 'var(--fg)');
-      termPrint(' 05/27/2026  05:03p           2,048    Config.CFG', 'var(--fg)');
-      termPrint(' 05/27/2026  05:03p          16,384    SysOracle.C', 'var(--fg)');
-      termPrint(' 05/27/2026  05:03p           1,024    README.TXT', 'var(--yellow)');
+      termPrint(' 05/27/2026  05:03p          12,288    SipServer.cpp', 'var(--fg)');
+      termPrint(' 05/27/2026  05:03p           8,192    UdpServer.cpp', 'var(--fg)');
+      termPrint(' 05/27/2026  05:03p           4,096    HttpServer.cpp', 'var(--fg)');
+      termPrint(' 05/27/2026  05:03p           2,048    CMakeLists.txt', 'var(--fg)');
+      termPrint(' 05/27/2026  05:03p          16,384    IPHelper.hpp', 'var(--fg)');
+      termPrint(' 05/27/2026  05:03p           1,024    README.md', 'var(--yellow)');
       termPrint('        6 File(s)     44,032 bytes', 'var(--gray)');
       termPrint('        2 Dir(s)     1.44MB free', 'var(--gray)');
       termPrint('');
@@ -965,8 +965,8 @@ function processCommand(cmd) {
 
     case 'ver':
       termPrint('');
-      termPrint(' CGA CRT SipServer v5.03', 'var(--yellow)');
-      termPrint(' CGA Compiler v2.17', 'var(--cyan)');
+      termPrint(' pocket-dial v5.03', 'var(--yellow)');
+      termPrint(' C++17 Compiler Engine', 'var(--cyan)');
       termPrint(' Built: May 27, 2026', 'var(--gray)');
       termPrint(' "CGA CRT Switchboard"', 'var(--dk-gray)');
       termPrint(' Public domain — Classic License.', 'var(--dk-gray)');
