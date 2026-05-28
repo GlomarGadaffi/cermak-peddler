@@ -137,29 +137,22 @@ WiFi.softAP(ssid);`
 // 2. QUICKSTART OS INSTRUCTIONS REGISTRY
 // ==========================================================================
 const QUICKSTART_OS = {
-    'win': `> RUN AUTOMATED WINDOWS SCRIPT:
-Double-click quickstart.bat or run via Developer Command Prompt:
+    'win': `> ONE-LINE DOWNLOAD & BOOT PIPELINE (Recommended)
+Paste this in a standard Windows Command Prompt (CMD):
 -----------------------------------------------------------------
-C:\\pocket-dial> quickstart.bat
+curl -L https://github.com/GlomarGadaffi/pocket-dial/archive/refs/heads/main.zip -o pd.zip && tar -xf pd.zip && cd pocket-dial-main && quickstart.bat
 
-> MANUAL BUILD ACTIONS:
+> LOCAL DEVELOPMENT ACTIONS (If cloned):
 -----------------------------------------------------------------
-mkdir build && cd build
-cmake ..
-cmake --build . --config Release
-.\\Release\\SipServer.exe --ip 192.168.1.100`,
-    'nix': `> RUN AUTOMATED BASH SCRIPT:
-Configure execution permissions and trigger build pipeline:
+C:\\pocket-dial> quickstart.bat`,
+    'nix': `> ONE-LINE DOWNLOAD & BOOT PIPELINE (Recommended)
+Paste this in your Linux / macOS Terminal (Bash):
 -----------------------------------------------------------------
-$ chmod +x quickstart.sh
-$ ./quickstart.sh
+curl -L https://github.com/GlomarGadaffi/pocket-dial/archive/refs/heads/main.zip -o pd.zip && tar -xf pd.zip && cd pocket-dial-main && chmod +x quickstart.sh && ./quickstart.sh
 
-> MANUAL MAKE ACTIONS:
+> LOCAL DEVELOPMENT ACTIONS (If cloned):
 -----------------------------------------------------------------
-$ mkdir build && cd build
-$ cmake ..
-$ make
-$ ./SipServer --ip 192.168.1.100`
+$ chmod +x quickstart.sh && ./quickstart.sh`
 };
 
 // ==========================================================================

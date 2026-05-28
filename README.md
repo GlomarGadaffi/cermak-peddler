@@ -1,12 +1,18 @@
 # pocket-dial
 
 > [!TIP]
-> **TL;DR (Extra Super Lazy Quickstart)**
-> * **Windows**: Just double-click `quickstart.bat`
-> * **Linux / macOS**: Run `chmod +x quickstart.sh && ./quickstart.sh`
+> **TL;DR (One-Line Curl Download & Run)**
+> * **Windows Command Prompt**:
+>   ```cmd
+>   curl -L https://github.com/GlomarGadaffi/pocket-dial/archive/refs/heads/main.zip -o pd.zip && tar -xf pd.zip && cd pocket-dial-main && quickstart.bat
+>   ```
+> * **Linux / macOS Bash**:
+>   ```bash
+>   curl -L https://github.com/GlomarGadaffi/pocket-dial/archive/refs/heads/main.zip -o pd.zip && tar -xf pd.zip && cd pocket-dial-main && chmod +x quickstart.sh && ./quickstart.sh
+>   ```
 > * **ESP32 / CYD (Arduino)**: Open `sketches/SipServer/SipServer.ino` in Arduino IDE, hit **Upload**, connect to the `esp32-sipserver` AP, and open `http://192.168.4.1/`!
 > 
-> That's it. This will automatically configure, compile, run the server, and open/show the retro CRT dashboard.
+> That's it! Running the one-liner automatically downloads the project, extracts the zip, runs the CMake configuration, compiles the binary, boots the SIP server, and opens the retro console dashboard in your browser.
 
 A C++17 SIP registrar and stateless proxy designed for flat, trusted local networks. It runs on desktop environments (Windows/Linux) and embedded targets (ESP32-S3 via Wi-Fi or W5500 PoE Ethernet) and includes a CGA CRT retro-styled web administration console.
 
@@ -32,32 +38,38 @@ Forked and extended from [BarGabriel/SipServer](https://github.com/BarGabriel/Si
   * **Live Status Dashboard**: Grids displaying registered extensions, active session states, and diagnostic packet counters.
   * **WiFi Manager**: Onboard Wi-Fi setup module to scan and connect the device to local networks (on embedded platforms).
 
----
-
 ## Quickstart (Desktop)
 
-The repository provides zero-dependency automated quickstart scripts that configure CMake, compile the executable, launch the SIP server, and automatically open the retro console dashboard in your default browser.
+You can download, configure, build, and run the server with a **single, zero-dependency one-liner** using `curl` and `tar` (pre-installed natively on modern Windows, Linux, and macOS).
 
-### Windows
-Double-click `quickstart.bat` or run it from the command line:
+### Windows (CMD)
+Open a standard Command Prompt and paste:
+```cmd
+curl -L https://github.com/GlomarGadaffi/pocket-dial/archive/refs/heads/main.zip -o pd.zip && tar -xf pd.zip && cd pocket-dial-main && quickstart.bat
+```
+
+### Linux / macOS (Bash)
+Open a terminal and paste:
+```bash
+curl -L https://github.com/GlomarGadaffi/pocket-dial/archive/refs/heads/main.zip -o pd.zip && tar -xf pd.zip && cd pocket-dial-main && chmod +x quickstart.sh && ./quickstart.sh
+```
+
+---
+
+## Local Development Execution (Inside Repository)
+
+If you have cloned the repository locally:
+
+### Windows (CMD)
+Double-click `quickstart.bat` or run:
 ```cmd
 quickstart.bat
 ```
 
-### Linux / macOS
-Run the bash script:
+### Linux / macOS (Bash)
 ```bash
-./quickstart.sh
+chmod +x quickstart.sh && ./quickstart.sh
 ```
-
----
-
-## Manual Build (Desktop Fallback)
-
-If you prefer to compile manually, follow the standard CMake workflow:
-
-### Windows (MSVC)
-Open a Visual Studio Developer Command Prompt:
 ```bash
 mkdir build
 cd build
