@@ -69,21 +69,51 @@ int SipSdpMessage::getRtpPort() const
 
 void SipSdpMessage::parseSdp()
 {
-	size_t pos_start = _messageStr.find("v=");
+	size_t bodyStart = _messageStr.find("\r\n\r\n");
+	if (bodyStart != std::string::npos)
+	{
+		bodyStart += 4;
+	}
+	else if ((bodyStart = _messageStr.find("\n\n")) != std::string::npos)
+	{
+		bodyStart += 2;
+	}
+	else
+	{
+		bodyStart = 0;
+	}
+
+	size_t pos_start = _messageStr.find("v=", bodyStart);
 	if (pos_start == std::string::npos) {
 		throw std::runtime_error("SDP body missing version line");
 	}
 
-	const size_t delimLen = std::strlen(SipMessageHeaders::HEADERS_DELIMETER);
 	size_t pos_end;
-
-	while ((pos_end = _messageStr.find(SipMessageHeaders::HEADERS_DELIMETER, pos_start)) != std::string::npos)
+	while (pos_start < _messageStr.size())
 	{
-		if (pos_start == pos_end) {
-			break;
+		pos_end = _messageStr.find("\r\n", pos_start);
+		size_t next_start = pos_end + 2;
+		if (pos_end == std::string::npos)
+		{
+			pos_end = _messageStr.find("\n", pos_start);
+			next_start = pos_end + 1;
 		}
 
-		std::string line = _messageStr.substr(pos_start, pos_end - pos_start);
+		std::string line;
+		if (pos_end == std::string::npos)
+		{
+			line = _messageStr.substr(pos_start);
+			pos_start = _messageStr.size();
+		}
+		else
+		{
+			line = _messageStr.substr(pos_start, pos_end - pos_start);
+			pos_start = next_start;
+		}
+
+		if (line.empty()) {
+			continue;
+		}
 
 		if (line.compare(0, 2, "v=") == 0)
 		{
@@ -110,8 +140,6 @@ void SipSdpMessage::parseSdp()
 			_media = line;
 			_rtpPort = extractRtpPort(line);
 		}
-
-		pos_start = pos_end + delimLen;
 	}
 }
 
