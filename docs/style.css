@@ -1,0 +1,669 @@
+/* ==========================================================================
+   pocket-dial retro CGA CRT style system
+   ========================================================================== */
+
+:root {
+    --bg-black: #000000;
+    --cga-blue: #0000AA;
+    --cga-green: #00AA00;
+    --cga-cyan: #00AAAA;
+    --cga-red: #AA0000;
+    --cga-magenta: #AA00AA;
+    --cga-brown: #AA5500;
+    --cga-light-gray: #AAAAAA;
+    --cga-dark-gray: #555555;
+    
+    /* Glowing/bright variants */
+    --cyan: #00FFFF;
+    --green: #55FF55;
+    --red: #FF5555;
+    --yellow: #FFFF55;
+    --white: #FFFFFF;
+    
+    --monitor-bezel-bg: #1c1c1f;
+    --monitor-border: #2e2e33;
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    background-color: var(--bg-black);
+    color: var(--cga-light-gray);
+    font-family: 'JetBrains Mono', 'Courier New', monospace;
+    font-size: 14px;
+    line-height: 1.5;
+    overflow-x: hidden;
+    padding: 20px;
+    position: relative;
+}
+
+/* ==========================================================================
+   CRT MONITOR & SCREEN SCANLINE FILTERS
+   ========================================================================== */
+
+.crt-filter {
+    text-shadow: 0 0 2px rgba(0, 255, 255, 0.4), 0 0 4px rgba(0, 255, 255, 0.2);
+}
+
+/* Scanlines overlay */
+.scanlines {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    background: linear-gradient(
+        rgba(18, 16, 16, 0) 50%, 
+        rgba(0, 0, 0, 0.15) 50%
+    );
+    background-size: 100% 4px;
+    z-index: 9999;
+    pointer-events: none;
+}
+
+/* CRT Screen flicker */
+.screen-flicker {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    background: transparent;
+    z-index: 9998;
+    pointer-events: none;
+    animation: crt-flicker 0.15s infinite;
+}
+
+@keyframes crt-flicker {
+    0% { background-color: rgba(255, 255, 255, 0.003); }
+    50% { background-color: rgba(0, 0, 0, 0.003); }
+    100% { background-color: rgba(255, 255, 255, 0.005); }
+}
+
+/* ==========================================================================
+   BASE LAYOUT CONTAINERS
+   ========================================================================== */
+
+.wrapper {
+    max-width: 1200px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+/* ==========================================================================
+   BIOS HEADER & LOGO
+   ========================================================================== */
+
+.bios-header {
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+    border-bottom: 2px double var(--cga-dark-gray);
+    padding-bottom: 20px;
+}
+
+.ascii-logo {
+    font-family: 'Share Tech Mono', 'JetBrains Mono', monospace;
+    font-size: 12px;
+    line-height: 1.1;
+    color: var(--cyan);
+    white-space: pre;
+    overflow-x: auto;
+}
+
+.bios-info-box {
+    font-size: 12px;
+    color: var(--cga-light-gray);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.bios-info-box .line {
+    letter-spacing: 0.5px;
+}
+
+/* ==========================================================================
+   CGA PANEL BOXES
+   ========================================================================== */
+
+.cga-panel {
+    display: flex;
+    flex-direction: column;
+    background-color: var(--bg-black);
+}
+
+.panel-header {
+    color: var(--cyan);
+    font-size: 14px;
+    white-space: nowrap;
+    overflow: hidden;
+    user-select: none;
+}
+
+.panel-content {
+    padding: 10px 15px;
+}
+
+.panel-footer {
+    color: var(--cyan);
+    font-size: 14px;
+    white-space: nowrap;
+    overflow: hidden;
+    user-select: none;
+}
+
+/* ==========================================================================
+   GRID: TERMINAL & MONITOR PANELS
+   ========================================================================== */
+
+.grid-container {
+    display: grid;
+    grid-template-columns: 1.2fr 0.8fr;
+    gap: 20px;
+}
+
+@media (max-width: 900px) {
+    .grid-container {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* --- TERMINAL INNER --- */
+.terminal-panel {
+    min-height: 480px;
+}
+
+.terminal-body {
+    background-color: #000000;
+    border: 1px solid var(--cga-dark-gray);
+    height: 420px;
+    padding: 15px;
+    font-size: 13px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    position: relative;
+}
+
+.system-message {
+    color: var(--cga-light-gray);
+}
+
+.terminal-output {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+.terminal-input-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: auto;
+}
+
+.prompt {
+    color: var(--green);
+    font-weight: bold;
+    user-select: none;
+}
+
+#terminal-input {
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--cyan);
+    font-family: inherit;
+    font-size: inherit;
+    flex: 1;
+    width: 100%;
+}
+
+.blinking-cursor {
+    color: var(--cyan);
+    animation: cursor-blink 1.2s step-end infinite;
+    user-select: none;
+}
+
+@keyframes cursor-blink {
+    from, to { opacity: 1; }
+    50% { opacity: 0; }
+}
+
+/* --- RETRO MONITOR BEZEL --- */
+.monitor-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+}
+
+.retro-monitor-bezel {
+    background-color: var(--monitor-bezel-bg);
+    border: 10px solid var(--monitor-border);
+    border-radius: 20px;
+    padding: 15px 15px 5px 15px;
+    box-shadow: inset 0 0 15px rgba(0,0,0,0.8), 0 10px 25px rgba(0,0,0,0.5);
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.monitor-inner-screen {
+    background-color: #020202;
+    border: 12px solid #141416;
+    border-radius: 30px;
+    height: 300px;
+    overflow: hidden;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: inset 0 0 20px rgba(0,0,0,0.9);
+}
+
+.crt-reflection {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(
+        135deg, 
+        rgba(255, 255, 255, 0.04) 0%, 
+        rgba(255, 255, 255, 0.02) 20%, 
+        rgba(255, 255, 255, 0) 40%
+    );
+    pointer-events: none;
+    z-index: 5;
+}
+
+.monitor-screenshot {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    image-rendering: pixelated;
+    transition: opacity 0.3s ease;
+    opacity: 1;
+}
+
+.monitor-screenshot.power-off {
+    opacity: 0 !important;
+}
+
+/* Monitor knobs / LEDs controls bar */
+.monitor-controls {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 2px 10px;
+    border-top: 2px solid var(--monitor-border);
+    color: #4a4a52;
+    font-size: 11px;
+    font-weight: bold;
+    user-select: none;
+}
+
+.monitor-logo {
+    letter-spacing: 1px;
+}
+
+.dial-group {
+    display: flex;
+    gap: 10px;
+}
+
+.dial-knob {
+    width: 14px;
+    height: 14px;
+    background-color: #121214;
+    border: 2px solid #2e2e33;
+    border-radius: 50%;
+    position: relative;
+    cursor: pointer;
+}
+
+.dial-knob::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 2px;
+    height: 5px;
+    background-color: #4a4a52;
+}
+
+.power-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.power-led {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background-color: #330000;
+    box-shadow: 0 0 2px rgba(0,0,0,0.5);
+    transition: background-color 0.2s, box-shadow 0.2s;
+}
+
+.power-led.status-on {
+    background-color: #00FF00;
+    box-shadow: 0 0 8px #00FF00, 0 0 12px #00FF00;
+}
+
+.power-button {
+    width: 16px;
+    height: 16px;
+    background-color: #8a0000;
+    border: 2px solid #550000;
+    border-radius: 2px;
+    cursor: pointer;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.4);
+    transition: transform 0.1s, background-color 0.2s;
+}
+
+.power-button:active {
+    transform: scale(0.92);
+}
+
+.power-button.off {
+    background-color: #3d0000;
+    border-color: #220000;
+}
+
+/* --- STATS PANEL --- */
+.stats-panel {
+    font-size: 13px;
+}
+
+.text-columns {
+    display: flex;
+    justify-content: space-between;
+    gap: 15px;
+}
+
+.stat-col {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+/* ==========================================================================
+   HARDWARE TABS & PROFILES MATRIX
+   ========================================================================== */
+
+.hardware-section {
+    margin-top: 10px;
+}
+
+.board-tabs-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    border-bottom: 1px solid var(--cga-dark-gray);
+    padding-bottom: 10px;
+    margin-bottom: 15px;
+}
+
+.board-tab {
+    background: transparent;
+    border: 1px solid var(--cga-dark-gray);
+    color: var(--cga-light-gray);
+    font-family: inherit;
+    font-size: 12px;
+    padding: 6px 12px;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s;
+}
+
+.board-tab:hover {
+    border-color: var(--yellow);
+    color: var(--yellow);
+}
+
+.board-tab.active {
+    border-color: var(--cyan);
+    color: var(--cyan);
+    font-weight: bold;
+}
+
+/* Board Explorer Content Layout */
+.board-display-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+}
+
+@media (max-width: 800px) {
+    .board-display-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+.board-ascii-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.ascii-frame {
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+    line-height: 1.25;
+    color: var(--green);
+    background-color: #020202;
+    border: 1px solid var(--cga-dark-gray);
+    padding: 12px;
+    overflow-x: auto;
+    white-space: pre;
+}
+
+.board-details-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    font-size: 13px;
+}
+
+.board-title {
+    font-size: 16px;
+    color: var(--yellow);
+    font-weight: bold;
+    border-bottom: 1px solid var(--cga-dark-gray);
+    padding-bottom: 4px;
+}
+
+.board-specs-table {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.board-spec-row {
+    display: flex;
+    justify-content: space-between;
+    border-bottom: 1px dashed #222;
+    padding-bottom: 4px;
+}
+
+.spec-label {
+    color: var(--cga-light-gray);
+}
+
+.spec-val {
+    color: var(--white);
+    font-weight: bold;
+}
+
+.config-code-block {
+    display: flex;
+    flex-direction: column;
+    background-color: #020202;
+    border: 1px solid var(--cga-dark-gray);
+}
+
+.code-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background-color: #121214;
+    border-bottom: 1px solid var(--cga-dark-gray);
+    padding: 4px 10px;
+    font-size: 11px;
+    color: var(--cga-light-gray);
+}
+
+.copy-btn {
+    background: transparent;
+    border: 1px solid var(--cga-dark-gray);
+    color: var(--cyan);
+    font-family: inherit;
+    font-size: 10px;
+    padding: 1px 6px;
+    cursor: pointer;
+}
+
+.copy-btn:hover {
+    border-color: var(--yellow);
+    color: var(--yellow);
+}
+
+.code-pre {
+    padding: 10px;
+    overflow-x: auto;
+    font-size: 11px;
+    color: var(--cyan);
+    white-space: pre;
+}
+
+/* ==========================================================================
+   QUICKSTART OS SELECTORS & SPECS
+   ========================================================================== */
+
+.specs-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 25px;
+}
+
+@media (max-width: 850px) {
+    .specs-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+.spec-block {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.block-title {
+    color: var(--yellow);
+    font-weight: bold;
+    font-size: 14px;
+    border-bottom: 1px solid var(--cga-dark-gray);
+    padding-bottom: 5px;
+}
+
+.block-text {
+    font-size: 13px;
+    color: var(--cga-light-gray);
+}
+
+.tab-group-os {
+    display: flex;
+    gap: 8px;
+}
+
+.os-tab {
+    background: transparent;
+    border: 1px solid var(--cga-dark-gray);
+    color: var(--cga-light-gray);
+    font-family: inherit;
+    font-size: 11px;
+    padding: 4px 10px;
+    cursor: pointer;
+}
+
+.os-tab.active {
+    border-color: var(--cyan);
+    color: var(--cyan);
+    font-weight: bold;
+}
+
+.security-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.sec-item {
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.sec-item strong {
+    color: var(--white);
+}
+
+/* ==========================================================================
+   FOOTER SECTION
+   ========================================================================== */
+
+.system-footer {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-top: 10px;
+    margin-top: 10px;
+}
+
+.footer-line {
+    color: var(--cga-dark-gray);
+    font-size: 12px;
+    line-height: 1;
+    overflow: hidden;
+    white-space: nowrap;
+    user-select: none;
+}
+
+.footer-columns {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--cga-dark-gray);
+}
+
+.footer-link {
+    color: var(--cyan);
+    text-decoration: none;
+    border-bottom: 1px dashed var(--cyan);
+}
+
+.footer-link:hover {
+    color: var(--yellow);
+    border-bottom-color: var(--yellow);
+}
+
+/* ==========================================================================
+   RETRO COLOR UTILITIES & TEXT DECORATIONS
+   ========================================================================== */
+
+.highlight-cyan { color: var(--cyan); }
+.highlight-green { color: var(--green); }
+.highlight-red { color: var(--red); }
+.highlight-yellow { color: var(--yellow); }
+.highlight-white { color: var(--white); }
