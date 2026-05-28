@@ -48,6 +48,8 @@ private:
 	void sendHtml(int sock);
 	void sendApiStatus(int sock);
 	void sendApiKill(int sock, const std::string& body);
+	void sendApiWifiScan(int sock);
+	void sendApiWifiConnect(int sock, const std::string& body);
 	void send404(int sock);
 
 	// Close a client socket portably

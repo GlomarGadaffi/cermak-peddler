@@ -17,7 +17,7 @@ UdpServer::UdpServer(std::string ip, int port, OnNewMessageEvent event) : _ip(st
 		throw std::runtime_error("socket creation failed");
 	}
 
-	std::memset(&_servaddr, 0, sizeof(_servaddr));
+	_servaddr = {};
 	_servaddr.sin_family = AF_INET;
 	_servaddr.sin_addr.s_addr = inet_addr(_ip.c_str());
 	_servaddr.sin_port = htons(port);
@@ -40,12 +40,12 @@ void UdpServer::startReceive()
 		{
 			char buffer[BUFFER_SIZE];
 			sockaddr_in senderEndPoint;
-			std::memset(&senderEndPoint, 0, sizeof(senderEndPoint));
+			senderEndPoint = {};
 			int len = sizeof(senderEndPoint);
 
 			while (_keepRunning)
 			{
-				std::memset(&senderEndPoint, 0, sizeof(senderEndPoint));
+				senderEndPoint = {};
 				int bytesReceived;
 #if defined(__linux__) || defined(ESP_PLATFORM)
 				bytesReceived = static_cast<int>(recvfrom(_sockfd, buffer, BUFFER_SIZE, 0,

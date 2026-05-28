@@ -7,6 +7,11 @@
 #include <iostream>
 #include <chrono>
 #include <algorithm>
+#include <vector>
+
+#if defined(ESP_PLATFORM)
+#include "esp_wifi.h"
+#endif
 
 HttpServer::HttpServer(const std::string& ip, int port, RequestsHandler& handler)
 	: _ip(ip), _port(port), _listenSock(-1), _handler(handler), _running(false)
@@ -100,8 +105,7 @@ void HttpServer::acceptLoop()
 void HttpServer::handleClient(int clientSock)
 {
 	// Read the request (up to 4KB is plenty for our simple API)
-	char buf[4096];
-	std::memset(buf, 0, sizeof(buf));
+	char buf[4096]{};
 
 #if defined _WIN32 || defined _WIN64
 	int bytesRead = recv(clientSock, buf, sizeof(buf) - 1, 0);
@@ -130,6 +134,14 @@ void HttpServer::handleClient(int clientSock)
 	else if (req.method == "POST" && req.path == "/api/kill")
 	{
 		sendApiKill(clientSock, req.body);
+	}
+	else if (req.method == "GET" && req.path == "/api/wifi/scan")
+	{
+		sendApiWifiScan(clientSock);
+	}
+	else if (req.method == "POST" && req.path == "/api/wifi/connect")
+	{
+		sendApiWifiConnect(clientSock, req.body);
 	}
 	else
 	{
@@ -320,4 +332,148 @@ uint64_t HttpServer::currentTimeMs() const
 			std::chrono::steady_clock::now().time_since_epoch()
 		).count()
 	);
+}
+
+// Helpers for URL decoding and parsing post/form params
+static std::string urlDecode(const std::string& src)
+{
+	std::string ret;
+	char ch = '\0';
+	int ii = 0;
+	for (size_t pos = 0; pos < src.length(); ++pos) {
+		if (src[pos] == '+') {
+			ret += ' ';
+		} else if (src[pos] == '%') {
+			if (pos + 2 < src.length() && 
+				sscanf(src.substr(pos + 1, 2).c_str(), "%x", &ii) == 1) {
+				ch = static_cast<char>(ii);
+				ret += ch;
+				pos += 2;
+			} else {
+				ret += src[pos];
+			}
+		} else {
+			ret += src[pos];
+		}
+	}
+	return ret;
+}
+
+static std::string getFormParam(const std::string& body, const std::string& key)
+{
+	std::string prefix = key + "=";
+	size_t pos = body.find(prefix);
+	if (pos == std::string::npos)
+	{
+		prefix = "&" + key + "=";
+		pos = body.find(prefix);
+		if (pos == std::string::npos) return "";
+	}
+	size_t start = pos + prefix.length();
+	size_t end = body.find('&', start);
+	std::string val;
+	if (end == std::string::npos) {
+		val = body.substr(start);
+	} else {
+		val = body.substr(start, end - start);
+	}
+	while (!val.empty() && (val.back() == '\r' || val.back() == '\n' || val.back() == ' ')) {
+		val.pop_back();
+	}
+	return urlDecode(val);
+}
+
+void HttpServer::sendApiWifiScan(int sock)
+{
+#if defined(ESP_PLATFORM)
+	// Switch mode to AP+STA so we can scan
+	wifi_mode_t current_mode;
+	if (esp_wifi_get_mode(&current_mode) == ESP_OK) {
+		if (current_mode == WIFI_MODE_AP) {
+			esp_wifi_set_mode(WIFI_MODE_APSTA);
+		}
+	}
+
+	wifi_scan_config_t scan_config = {};
+	scan_config.show_hidden = true;
+	
+	esp_err_t err = esp_wifi_scan_start(&scan_config, true);
+	if (err != ESP_OK) {
+		sendResponse(sock, 500, "Internal Server Error", "application/json", 
+		             "{\"error\":\"WiFi scan start failed\",\"code\":" + std::to_string(err) + "}");
+		return;
+	}
+
+	uint16_t ap_count = 0;
+	esp_wifi_scan_get_ap_num(&ap_count);
+	
+	std::vector<wifi_ap_record_t> ap_records(ap_count);
+	if (ap_count > 0) {
+		esp_wifi_scan_get_ap_records(&ap_count, ap_records.data());
+	}
+
+	std::ostringstream json;
+	json << "{\"networks\":[";
+	for (uint16_t i = 0; i < ap_count; ++i) {
+		if (i > 0) json << ",";
+		std::string ssid(reinterpret_cast<char*>(ap_records[i].ssid));
+		int rssi = ap_records[i].rssi;
+		std::string enc = "OPEN";
+		switch (ap_records[i].authmode) {
+			case WIFI_AUTH_WEP: enc = "WEP"; break;
+			case WIFI_AUTH_WPA_PSK: enc = "WPA"; break;
+			case WIFI_AUTH_WPA2_PSK: enc = "WPA2"; break;
+			case WIFI_AUTH_WPA_WPA2_PSK: enc = "WPA/WPA2"; break;
+			case WIFI_AUTH_WPA2_ENTERPRISE: enc = "WPA2 Enterprise"; break;
+			case WIFI_AUTH_WPA3_PSK: enc = "WPA3"; break;
+			case WIFI_AUTH_WPA2_WPA3_PSK: enc = "WPA2/WPA3"; break;
+			default: break;
+		}
+		json << "{\"ssid\":\"" << jsonEscape(ssid) << "\",\"rssi\":" << rssi 
+		     << ",\"encryption\":\"" << jsonEscape(enc) << "\"}";
+	}
+	json << "]}";
+
+	sendResponse(sock, 200, "OK", "application/json", json.str());
+#else
+	sendResponse(sock, 200, "OK", "application/json", 
+	             "{\"networks\":[], \"note\":\"WiFi scan not available on desktop\"}");
+#endif
+}
+
+void HttpServer::sendApiWifiConnect(int sock, const std::string& body)
+{
+	std::string ssid = getFormParam(body, "ssid");
+	std::string password = getFormParam(body, "password");
+
+	if (ssid.empty())
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"missing ssid parameter\"}");
+		return;
+	}
+
+#if defined(ESP_PLATFORM)
+	wifi_config_t wifi_config = {};
+	strncpy(reinterpret_cast<char*>(wifi_config.sta.ssid), ssid.c_str(), sizeof(wifi_config.sta.ssid) - 1);
+	strncpy(reinterpret_cast<char*>(wifi_config.sta.password), password.c_str(), sizeof(wifi_config.sta.password) - 1);
+	
+	esp_wifi_set_mode(WIFI_MODE_APSTA);
+	esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+	
+	esp_err_t err = esp_wifi_connect();
+	if (err == ESP_OK)
+	{
+		sendResponse(sock, 200, "OK", "text/plain", "WiFi connection initiated successfully.");
+	}
+	else
+	{
+		sendResponse(sock, 500, "Internal Server Error", "application/json",
+		             "{\"error\":\"WiFi connection initiation failed\",\"code\":" + std::to_string(err) + "}");
+	}
+#else
+	(void)password;
+	sendResponse(sock, 501, "Not Implemented", "application/json",
+	             "{\"error\":\"WiFi connect not available on desktop\"}");
+#endif
 }
