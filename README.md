@@ -1,5 +1,12 @@
 # pocket-dial
 
+> [!TIP]
+> **TL;DR (Extra Super Lazy Quickstart)**
+> * **Windows**: Just double-click `quickstart.bat`
+> * **Linux / macOS**: Run `chmod +x quickstart.sh && ./quickstart.sh`
+> 
+> That's it. This will automatically configure CMake, compile the code, launch the server, and open the dashboard in your browser.
+
 A C++17 SIP registrar and stateless proxy designed for flat, trusted local networks. It runs on desktop environments (Windows/Linux) and embedded targets (ESP32-S3 via Wi-Fi or W5500 PoE Ethernet) and includes a CGA CRT retro-styled web administration console.
 
 Forked and extended from [BarGabriel/SipServer](https://github.com/BarGabriel/SipServer).
