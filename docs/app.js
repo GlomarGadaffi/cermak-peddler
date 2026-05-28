@@ -321,6 +321,8 @@ function initTerminalEmulator() {
         }
     });
 
+    // appendLine renders trusted, hardcoded markup. Any user-supplied or
+    // externally-sourced text MUST be passed through escapeHtml() first.
     function appendLine(text, colorClass = "") {
         const line = document.createElement("div");
         line.className = colorClass;
@@ -329,8 +331,17 @@ function initTerminalEmulator() {
         termScreen.scrollTop = termScreen.scrollHeight;
     }
 
+    function escapeHtml(s) {
+        return String(s)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+    }
+
     function handleCommand(cmdLine) {
-        appendLine(`<span class="prompt">guest@pocket-dial:&gt;</span> ${cmdLine}`, "highlight-white");
+        appendLine(`<span class="prompt">guest@pocket-dial:&gt;</span> ${escapeHtml(cmdLine)}`, "highlight-white");
 
         if (isDialing) {
             if (cmdLine.toLowerCase() === "bye" || cmdLine.toLowerCase() === "cancel") {
@@ -427,18 +438,18 @@ function initTerminalEmulator() {
                 break;
 
             default:
-                appendLine(`Bad command or extension: "${baseCmd}". Type <span class='highlight-cyan'>help</span> for valid commands.`, "highlight-red");
+                appendLine(`Bad command or extension: "${escapeHtml(baseCmd)}". Type <span class='highlight-cyan'>help</span> for valid commands.`, "highlight-red");
         }
     }
 
     // Interactive SIP Call flow animator
     function simulateSipCall(ext) {
         isDialing = true;
-        appendLine(`--> INITIATING SIP CALL FLOW FOR EXTENSION [${ext}]`, "highlight-cyan");
+        appendLine(`--> INITIATING SIP CALL FLOW FOR EXTENSION [${escapeHtml(ext)}]`, "highlight-cyan");
         
         setTimeout(() => {
             if (!isDialing) return;
-            appendLine("--> SENDING:   INVITE sip:" + ext + "@192.168.1.1:5060 SIP/2.0", "highlight-white");
+            appendLine("--> SENDING:   INVITE sip:" + escapeHtml(ext) + "@192.168.1.1:5060 SIP/2.0", "highlight-white");
         }, 600);
 
         setTimeout(() => {
@@ -454,7 +465,7 @@ function initTerminalEmulator() {
         setTimeout(() => {
             if (!isDialing) return;
             appendLine("<-- RECEIVING: SIP/2.0 200 OK (Call Accepted)", "highlight-green");
-            appendLine("--> SENDING:   ACK sip:" + ext + "@192.168.1.1:5060 SIP/2.0", "highlight-white");
+            appendLine("--> SENDING:   ACK sip:" + escapeHtml(ext) + "@192.168.1.1:5060 SIP/2.0", "highlight-white");
         }, 3000);
 
         setTimeout(() => {

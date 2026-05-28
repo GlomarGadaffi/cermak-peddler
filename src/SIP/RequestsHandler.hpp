@@ -8,6 +8,7 @@
 #include <vector>
 #include <tuple>
 #include <cstdint>
+#include <atomic>
 #include "SipMessage.hpp"
 #include "SipClient.hpp"
 #include "Session.hpp"

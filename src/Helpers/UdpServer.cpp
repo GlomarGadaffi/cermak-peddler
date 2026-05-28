@@ -47,9 +47,20 @@ void UdpServer::startReceive()
 {
 	_keepRunning = true;
 #if defined(ESP_PLATFORM)
+	if (_receiverExited == nullptr)
+	{
+		_receiverExited = xSemaphoreCreateBinary();
+	}
 	xTaskCreatePinnedToCore([](void* arg)
 		{
-			static_cast<UdpServer*>(arg)->receiveLoop();
+			auto* self = static_cast<UdpServer*>(arg);
+			self->receiveLoop();
+			// Signal closeServer() that the loop has fully exited and no longer
+			// touches any UdpServer members before the object is destroyed.
+			if (self->_receiverExited != nullptr)
+			{
+				xSemaphoreGive(self->_receiverExited);
+			}
 			vTaskDelete(NULL);
 		},
 		"udp_receiver_task",
@@ -104,9 +115,16 @@ void UdpServer::closeServer()
 #endif
 
 #if defined(ESP_PLATFORM)
-	// Task deletes itself when _keepRunning becomes false and receiveLoop() exits.
-	// Give it a brief delay to terminate cleanly before UdpServer object is destroyed.
-	vTaskDelay(pdMS_TO_TICKS(10));
+	// Block until receiveLoop() has fully exited before returning, so the
+	// UdpServer object is not destroyed out from under the running task.
+	// Closing the socket above unblocks recvfrom() immediately; the timeout is
+	// a backstop in case the task was never started.
+	if (_receiverExited != nullptr)
+	{
+		xSemaphoreTake(_receiverExited, pdMS_TO_TICKS(2000));
+		vSemaphoreDelete(_receiverExited);
+		_receiverExited = nullptr;
+	}
 #else
 	if (_receiverThread.joinable()) {
 		_receiverThread.join();

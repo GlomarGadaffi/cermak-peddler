@@ -23,7 +23,7 @@ Forked and extended from [BarGabriel/SipServer](https://github.com/BarGabriel/Si
 ## Features
 
 ### 1. SIP Signaling & Call Setup
-* **User Registration**: Supports the `REGISTER` transaction. Saves registered endpoints dynamically in memory. Unregistration is handled via `expires=0`. In private local networks, password validation is bypassed by design—your softphones will register successfully using *any* username and password combination you configure, making setup exceptionally simple and zero-friction.
+* **User Registration**: Supports the `REGISTER` transaction. Saves registered endpoints dynamically in memory. Unregistration is handled via `expires=0`. The registrar does not perform credential validation — any username/password is accepted. This is a deliberate scoping decision for flat, trusted LANs, not a security feature; see [Security Specifications](#security-specifications) before deploying.
 * **Stateless Proxy Routing**: Routes standard call setups via `INVITE`, `TRYING`, `RINGING`, `OK`, `ACK`, `CANCEL`, `BYE`, and error states (`486 Busy Here`, `480 Temporarily Unavailable`, `404 Not Found`).
 * **Direct RTP Flow**: Media (audio) flows peer-to-peer directly between endpoints, keeping the signaling server lightweight and suitable for constrained hardware.
 
@@ -195,8 +195,10 @@ pocket-dial/
 
 ## Security Specifications
 
+> ⚠️ **This server performs no authentication and is intended for flat, trusted local networks only. Do NOT expose SIP (UDP 5060) or the administration console (TCP 8080/80) directly to the public Internet.**
+
 The server is designed for flat, private networks:
-* **Zero-Friction Authentication**: By design, the registrar does not validate user passwords. You can enter absolutely *anything* in your softphone's password field—pocket-dial is built to trust and accept your device immediately. This eliminates provisioning headaches on local networks while keeping the code highly performant and lightweight within your trusted LAN. (Just remember: **do not expose SIP (UDP 5060) or administration (TCP 8080/80) ports directly to the public Internet!**)
+* **No Authentication**: The registrar does not validate credentials — any username/password combination is accepted. This removes provisioning overhead and keeps the codebase lightweight, which suits constrained hardware on a trusted LAN. It is a known limitation, not a hardening feature: anyone who can reach the SIP port can register as any extension.
 * **Decentralized Media**: Voice packets flow peer-to-peer, keeping memory footprint low.
 
 ---

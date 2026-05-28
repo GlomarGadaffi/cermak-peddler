@@ -22,6 +22,7 @@
 #if defined(ESP_PLATFORM)
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #endif
 
 class UdpServer
@@ -48,7 +49,8 @@ private:
 	std::atomic<bool> _keepRunning;
 
 #if defined(ESP_PLATFORM)
-	TaskHandle_t _receiverTaskHandle;
+	TaskHandle_t _receiverTaskHandle = nullptr;
+	SemaphoreHandle_t _receiverExited = nullptr;
 #else
 	std::thread _receiverThread;
 #endif

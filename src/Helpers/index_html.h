@@ -1168,19 +1168,46 @@ function scanWifi() {
 
 function renderWifiNetworks(networks) {
   const list = document.getElementById('wifi-networks-list');
+  list.innerHTML = '';
   if (networks.length === 0) {
-    list.innerHTML = '<div style="color:var(--dk-gray);">No networks found.</div>';
+    const empty = document.createElement('div');
+    empty.style.color = 'var(--dk-gray)';
+    empty.textContent = 'No networks found.';
+    list.appendChild(empty);
     return;
   }
-  list.innerHTML = networks.map(n => {
-    const bars = n.rssi > -50 ? '▂▄▆█' : n.rssi > -65 ? '▂▄▆░' : n.rssi > -75 ? '▂▄░░' : '▂░░░';
+  // Build each row as DOM nodes and bind the click handler programmatically.
+  // The SSID never reaches markup as a string, so a crafted SSID (e.g. one
+  // containing quotes) cannot break out into a script context.
+  networks.forEach(n => {
+    const ssid = String(n.ssid == null ? '' : n.ssid);
+    const rssi = Number(n.rssi) || 0;
     const enc = n.encryption || 'OPEN';
-    return '<div class="wifi-network" onclick="selectWifi(\'' + escapeHtml(n.ssid) + '\')">' +
-      '<span class="wifi-ssid">' + escapeHtml(n.ssid) + '</span>' +
-      '<span><span class="wifi-rssi">' + bars + ' ' + n.rssi + 'dBm</span> ' +
-      '<span class="wifi-enc">[' + escapeHtml(enc) + ']</span></span>' +
-      '</div>';
-  }).join('');
+    const bars = rssi > -50 ? '▂▄▆█' : rssi > -65 ? '▂▄▆░' : rssi > -75 ? '▂▄░░' : '▂░░░';
+
+    const row = document.createElement('div');
+    row.className = 'wifi-network';
+    row.addEventListener('click', () => selectWifi(ssid));
+
+    const ssidEl = document.createElement('span');
+    ssidEl.className = 'wifi-ssid';
+    ssidEl.textContent = ssid;
+
+    const metaEl = document.createElement('span');
+    const rssiEl = document.createElement('span');
+    rssiEl.className = 'wifi-rssi';
+    rssiEl.textContent = bars + ' ' + rssi + 'dBm';
+    const encEl = document.createElement('span');
+    encEl.className = 'wifi-enc';
+    encEl.textContent = '[' + enc + ']';
+    metaEl.appendChild(rssiEl);
+    metaEl.appendChild(document.createTextNode(' '));
+    metaEl.appendChild(encEl);
+
+    row.appendChild(ssidEl);
+    row.appendChild(metaEl);
+    list.appendChild(row);
+  });
 }
 
 function selectWifi(ssid) {
