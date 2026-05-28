@@ -9,7 +9,6 @@ public:
 	SipSdpMessage(std::string message, sockaddr_in src);
 
 	void setMedia(std::string value);
-	void setRtpPort(int port);
 
 	std::string getVersion() const;
 	std::string getOriginator() const;

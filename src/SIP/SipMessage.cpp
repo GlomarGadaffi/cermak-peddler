@@ -1,6 +1,5 @@
 #include "SipMessage.hpp"
 #include "SipMessageTypes.h"
-#include "SipMessageHeaders.h"
 #include <cstring>
 #include <cctype>
 
@@ -242,11 +241,14 @@ void SipMessage::setContact(std::string value)
 			_messageStr.replace(contactPos, _contact.length(), value);
 		}
 	} else {
-		auto clPos = _messageStr.find(_contentLength);
+		// Guard against empty _contentLength: std::string::find("") returns 0, not npos,
+		// which would insert before the start-line and corrupt the entire message.
+		size_t clPos = _contentLength.empty()
+		               ? std::string::npos
+		               : _messageStr.find(_contentLength);
 		if (clPos != std::string::npos) {
 			_messageStr.insert(clPos, value + "\r\n");
 		} else {
-			// fallback at end
 			_messageStr += value + "\r\n";
 		}
 	}

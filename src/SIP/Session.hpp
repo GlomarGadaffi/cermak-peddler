@@ -20,10 +20,10 @@ public:
 	};
 
 
-	Session(std::string callID, std::shared_ptr<SipClient> src, uint32_t srcRtpPort);
+	Session(std::string callID, std::shared_ptr<SipClient> src);
 
 	void setState(State state);
-	void setDest(std::shared_ptr<SipClient> dest, uint32_t destRtpPort);
+	void setDest(std::shared_ptr<SipClient> dest);
 
 	const std::string& getCallID() const;
 	std::shared_ptr<SipClient> getSrc() const;
@@ -36,8 +36,6 @@ private:
 	std::shared_ptr<SipClient> _dest;
 	State _state;
 
-	uint32_t _srcRtpPort;
-	uint32_t _destRtpPort;
 };
 
 #endif

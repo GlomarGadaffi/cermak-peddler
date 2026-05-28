@@ -1,5 +1,4 @@
 #include "SipSdpMessage.hpp"
-#include "SipMessageHeaders.h"
 #include <string>
 #include <cstring>
 #include <stdexcept>
@@ -19,18 +18,6 @@ void SipSdpMessage::setMedia(std::string value)
 	_media = std::move(value);
 }
 
-void SipSdpMessage::setRtpPort(int port)
-{
-	std::string currentRtpPort = std::to_string(_rtpPort);
-	std::string copyM = _media;
-	auto portPos = _media.find(currentRtpPort);
-	if (portPos != std::string::npos)
-	{
-		copyM.replace(portPos, currentRtpPort.length(), std::to_string(port));
-	}
-	_rtpPort = port;
-	setMedia(std::move(copyM));
-}
 
 std::string SipSdpMessage::getVersion() const
 {

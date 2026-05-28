@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **HTTP Dashboard for Wired-Ethernet Arduino Sketches (#20)**: All three wired-Ethernet Arduino sketches (`SipServerETH`, `SipServer_T_ETH_Lite_W5500`, `SipServer_T_POE_Pro_LAN8720`) now instantiate and start `HttpServer` on port 80, bringing them to feature parity with the WiFi sketch. The dashboard URL is printed to Serial after startup.
+
+### Fixed
+- **ESP32 HTTP Stack Buffer Overflow (#9)**: The 4 KB request-read buffer in `HttpServer::handleClient` is now heap-allocated (`std::vector<char>`) instead of stack-local, preventing a crash on ESP32 where the `std::thread` default pthread stack is ~3 KB.
+- **HTTP POST Body Truncation (#18)**: After the initial `recv`, `handleClient` now reads until `Content-Length` bytes have been received, ensuring POST bodies that span multiple TCP segments (e.g. WiFi credential POSTs under load) are never silently truncated.
+- **CSRF on Mutating API Endpoints (#10)**: Removed the wildcard `Access-Control-Allow-Origin: *` header. `/api/kill` and `/api/wifi/connect` now reject requests carrying an `Origin` header that doesn't match the `Host` header, blocking cross-origin form submissions from other pages on the same AP.
+- **`setContact` Empty-Needle Corruption (#11)**: Guarded the `_messageStr.find(_contentLength)` call in `SipMessage::setContact` against an empty `_contentLength` — `std::string::find("")` returns `0` (not `npos`), which would insert the Contact header before the start-line and corrupt the message.
+- **`inet_ntoa` Non-Thread-Safe (#19)**: Replaced `inet_ntoa()` with `inet_ntop()` into a stack-local `char[INET_ADDRSTRLEN]` buffer in `RequestsHandler::getActiveClients`.
+- **Landing Page Auth Framing (#12)**: Replaced the "Zero-Friction Auth" feature card copy (which framed no-authentication as a selling point) with accurate language and an explicit do-not-expose warning, matching the README.
+- **Installer Supply Chain Risk (#14)**: `install.sh` and `install.ps1` now download from the `v1.0.0` release tag instead of `refs/heads/main`, so the install scripts are pinned to a known-good version and unaffected by subsequent commits.
+
+### Changed
+- **`parseRequestedExpires` Optimization (#13)**: The standalone `Expires:` header fallback no longer copies and lowercases the entire SIP message. It now scans only lines beginning with `e`/`E` and stops at the header/body boundary blank line.
+
+### Removed
+- **Dead `SipMessageHeaders.h` (#15)**: Header file deleted; `SipMessage.cpp` and `SipSdpMessage.cpp` no longer include it (the parser uses its own `matchHeader` lambda with inline string literals).
+- **Dead `SipClient::renew()` (#16)**: Method removed. Re-registration constructs a fresh `SipClient` object with the new lease, so an in-place renewal method had no caller.
+- **Dead RTP port fields (#17)**: `Session::_srcRtpPort`, `Session::_destRtpPort`, and `SipSdpMessage::setRtpPort` removed. Media is peer-to-peer; the server never reads these values. `Session` and `SipSdpMessage` constructors/signatures updated accordingly.
+
+### Added
 - **Registration Lease Expiry / TTL Sweep (#4)**: the registrar now honours registration lifetimes per RFC 3261 §10.2.1. `onRegister` parses the requested expiry from the Contact `expires=` parameter or a standalone `Expires:` header (case-insensitive), clamps it to `[30, 3600]` seconds (default `3600` when unspecified), and echoes the granted value back in the 200 OK Contact. `SipClient` now carries a monotonic (`steady_clock`) lease deadline. Expired bindings are evicted by an opportunistic, throttled sweep (`maybeSweep`, at most once per second) that runs under the existing handler mutex on incoming traffic and on dashboard reads (`getActiveClients`, `getClientCount`) — no additional background thread/task is introduced. `expires=0` continues to de-register immediately.
 
 ### Fixed

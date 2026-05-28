@@ -104,13 +104,17 @@ void HttpServer::acceptLoop()
 
 void HttpServer::handleClient(int clientSock)
 {
-	// Read the request (up to 4KB is plenty for our simple API)
-	char buf[4096]{};
+	// Heap-allocate the read buffer. On ESP32 the accept loop runs on a std::thread
+	// whose default pthread stack is ~3 KB; a 4 KB stack-local buffer would overflow
+	// on the first request. Using std::vector keeps the data on the heap.
+	std::vector<char> buf(4096, 0);
 
+	// Read initial data. A follow-up loop below handles POST bodies that span
+	// multiple TCP segments (see Content-Length body-read completion below).
 #if defined _WIN32 || defined _WIN64
-	int bytesRead = recv(clientSock, buf, sizeof(buf) - 1, 0);
+	int bytesRead = recv(clientSock, buf.data(), static_cast<int>(buf.size()) - 1, 0);
 #else
-	int bytesRead = static_cast<int>(recv(clientSock, buf, sizeof(buf) - 1, 0));
+	int bytesRead = static_cast<int>(recv(clientSock, buf.data(), buf.size() - 1, 0));
 #endif
 
 	if (bytesRead <= 0)
@@ -119,7 +123,43 @@ void HttpServer::handleClient(int clientSock)
 		return;
 	}
 
-	std::string raw(buf, static_cast<size_t>(bytesRead));
+	// #18: ensure the complete POST body is present before parsing.
+	// If the headers indicate a Content-Length larger than what arrived in the
+	// first segment, keep reading until we have it all.
+	std::string raw(buf.data(), static_cast<size_t>(bytesRead));
+	size_t clPos = raw.find("Content-Length:");
+	if (clPos == std::string::npos)
+		clPos = raw.find("content-length:");
+	if (clPos != std::string::npos)
+	{
+		size_t valStart = raw.find_first_not_of(" \t", clPos + 15);
+		size_t valEnd   = raw.find_first_of("\r\n", valStart);
+		if (valStart != std::string::npos && valEnd != std::string::npos)
+		{
+			size_t contentLength = 0;
+			try { contentLength = static_cast<size_t>(std::stoul(raw.substr(valStart, valEnd - valStart))); }
+			catch (...) {}
+			size_t headerEnd = raw.find("\r\n\r\n");
+			if (headerEnd != std::string::npos)
+			{
+				size_t bodyStart  = headerEnd + 4;
+				size_t bodyHave   = raw.size() > bodyStart ? raw.size() - bodyStart : 0;
+				while (bodyHave < contentLength)
+				{
+					buf.assign(buf.size(), 0);
+#if defined _WIN32 || defined _WIN64
+					int n = recv(clientSock, buf.data(), static_cast<int>(buf.size()) - 1, 0);
+#else
+					int n = static_cast<int>(recv(clientSock, buf.data(), buf.size() - 1, 0));
+#endif
+					if (n <= 0) break;
+					raw.append(buf.data(), static_cast<size_t>(n));
+					bodyHave += static_cast<size_t>(n);
+				}
+			}
+		}
+	}
+
 	HttpRequest req = parseRequest(raw);
 
 	// Route
@@ -133,7 +173,15 @@ void HttpServer::handleClient(int clientSock)
 	}
 	else if (req.method == "POST" && req.path == "/api/kill")
 	{
-		sendApiKill(clientSock, req.body);
+		if (!isSameOrigin(req))
+		{
+			sendResponse(clientSock, 403, "Forbidden", "application/json",
+			             "{\"error\":\"cross-origin request rejected\"}");
+		}
+		else
+		{
+			sendApiKill(clientSock, req.body);
+		}
 	}
 	else if (req.method == "GET" && req.path == "/api/wifi/scan")
 	{
@@ -141,7 +189,15 @@ void HttpServer::handleClient(int clientSock)
 	}
 	else if (req.method == "POST" && req.path == "/api/wifi/connect")
 	{
-		sendApiWifiConnect(clientSock, req.body);
+		if (!isSameOrigin(req))
+		{
+			sendResponse(clientSock, 403, "Forbidden", "application/json",
+			             "{\"error\":\"cross-origin request rejected\"}");
+		}
+		else
+		{
+			sendApiWifiConnect(clientSock, req.body);
+		}
 	}
 	else
 	{
@@ -172,6 +228,22 @@ HttpServer::HttpRequest HttpServer::parseRequest(const std::string& raw)
 		req.path = req.path.substr(0, queryPos);
 	}
 
+	// Scan headers for Origin and Host
+	auto extractHeader = [&](const std::string& name) -> std::string {
+		std::string lower = raw;
+		std::transform(lower.begin(), lower.end(), lower.begin(),
+			[](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+		std::string needle = "\r\n" + name + ":";
+		size_t p = lower.find(needle);
+		if (p == std::string::npos) return {};
+		size_t vs = raw.find_first_not_of(" \t", p + needle.size());
+		size_t ve = raw.find("\r\n", vs);
+		if (vs == std::string::npos) return {};
+		return raw.substr(vs, ve == std::string::npos ? std::string::npos : ve - vs);
+	};
+	req.origin = extractHeader("origin");
+	req.host   = extractHeader("host");
+
 	// Find body (after \r\n\r\n)
 	size_t bodyStart = raw.find("\r\n\r\n");
 	if (bodyStart != std::string::npos)
@@ -189,7 +261,8 @@ void HttpServer::sendResponse(int sock, int statusCode, const std::string& statu
 	resp << "HTTP/1.1 " << statusCode << " " << statusText << "\r\n";
 	resp << "Content-Type: " << contentType << "\r\n";
 	resp << "Content-Length: " << body.size() << "\r\n";
-	resp << "Access-Control-Allow-Origin: *\r\n";
+	// No Access-Control-Allow-Origin header: wildcard CORS would allow any
+	// browser tab on the same AP to fire side-effecting POSTs without a preflight.
 	resp << "Connection: close\r\n";
 	resp << "\r\n";
 	resp << body;
@@ -309,6 +382,21 @@ void HttpServer::sendApiKill(int sock, const std::string& body)
 	_handler.forceDisconnect(ext);
 	sendResponse(sock, 200, "OK", "application/json",
 	             "{\"status\":\"ok\",\"disconnected\":\"" + jsonEscape(ext) + "\"}");
+}
+
+bool HttpServer::isSameOrigin(const HttpRequest& req) const
+{
+	// No Origin header means a direct request (browser nav, curl, etc.) — allow.
+	if (req.origin.empty()) return true;
+
+	// Strip the scheme from the Origin (e.g. "http://192.168.4.1:8080" → "192.168.4.1:8080")
+	std::string originHost = req.origin;
+	size_t schemeEnd = originHost.find("://");
+	if (schemeEnd != std::string::npos)
+		originHost = originHost.substr(schemeEnd + 3);
+
+	// Compare against the Host header the client sent.
+	return originHost == req.host;
 }
 
 void HttpServer::send404(int sock)

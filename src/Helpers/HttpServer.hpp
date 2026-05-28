@@ -39,6 +39,8 @@ private:
 		std::string method;
 		std::string path;
 		std::string body;
+		std::string origin;  // value of the Origin: header, if present
+		std::string host;    // value of the Host: header, if present
 	};
 	HttpRequest parseRequest(const std::string& raw);
 
@@ -51,6 +53,11 @@ private:
 	void sendApiWifiScan(int sock);
 	void sendApiWifiConnect(int sock, const std::string& body);
 	void send404(int sock);
+
+	// Returns true if the request has no Origin header (direct browser nav / curl)
+	// or if the Origin host matches the Host header (same-origin). Blocks CSRF from
+	// third-party pages on the same AP.
+	bool isSameOrigin(const HttpRequest& req) const;
 
 	// Close a client socket portably
 	void closeSocket(int sock);

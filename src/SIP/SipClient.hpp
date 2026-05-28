@@ -22,8 +22,6 @@ public:
 	const sockaddr_in& getAddress() const;
 
 	// ── Registration lease (RFC 3261 §10.2.1) ────────────────────────
-	// Refresh the binding so it lives for the next `expiresSeconds`.
-	void renew(int expiresSeconds);
 	// True once the lease deadline has passed.
 	bool isExpired(std::chrono::steady_clock::time_point now) const;
 	// Negotiated lease length echoed back to the client in the 200 OK.

@@ -137,7 +137,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	auto newSession = std::make_shared<Session>(data->getCallID(), caller.value(), message->getRtpPort());
+	auto newSession = std::make_shared<Session>(data->getCallID(), caller.value());
 	_sessions.emplace(data->getCallID(), newSession);
 
 	auto response = std::make_shared<SipMessage>(*data);
@@ -203,7 +203,7 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 				endCall(data->getCallID(), data->getFromNumber(), data->getToNumber(), "SDP parse error.");
 				return;
 			}
-			session->get()->setDest(client.value(), sdpMessage->getRtpPort());
+			session->get()->setDest(client.value());
 			session->get()->setState(Session::State::Connected);
 			auto response = std::make_shared<SipMessage>(*data);
 			response->setContact(buildContact(data->getToNumber()));
@@ -314,16 +314,36 @@ int RequestsHandler::parseRequestedExpires(const std::shared_ptr<SipMessage>& da
 		if (v >= 0) return v;
 	}
 
-	// 2. Standalone Expires header (case-insensitive line match).
-	const std::string raw = data->toString();
-	std::string lowered(raw.size(), '\0');
-	std::transform(raw.begin(), raw.end(), lowered.begin(),
-		[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-	size_t hpos = lowered.find("\nexpires:");
-	if (hpos != std::string::npos)
+	// 2. Standalone Expires header — scan only lines beginning with 'e'/'E' to
+	//    avoid copying and lowercasing the entire message (which includes the SDP body).
+	const std::string& raw = data->toString();
+	size_t pos = 0;
+	while (pos < raw.size())
 	{
-		int v = readInt(raw, hpos + 9); // offset past "\nexpires:"
-		if (v >= 0) return v;
+		size_t lineEnd = raw.find('\n', pos);
+		size_t next = (lineEnd == std::string::npos) ? raw.size() : lineEnd + 1;
+		char first = raw[pos];
+		if (first == 'e' || first == 'E')
+		{
+			// Check for "expires:" (case-insensitive, 8 chars + colon)
+			if (next - pos >= 9)
+			{
+				std::string name = raw.substr(pos, 8);
+				std::transform(name.begin(), name.end(), name.begin(),
+					[](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+				if (name == "expires:")
+				{
+					// Skip past any \r before \n in the offset calculation
+					int v = readInt(raw, pos + 8);
+					if (v >= 0) return v;
+				}
+			}
+		}
+		else if (first == '\r' || first == '\n')
+		{
+			break; // reached the header/body boundary blank line
+		}
+		pos = next;
 	}
 
 	// 3. No expiry specified — grant the default lease.
@@ -417,7 +437,9 @@ std::vector<std::pair<std::string, std::string>> RequestsHandler::getActiveClien
 	for (const auto& [number, client] : _clients)
 	{
 		const auto& addr = client->getAddress();
-		std::string ipPort = std::string(inet_ntoa(addr.sin_addr)) + ":" + std::to_string(ntohs(addr.sin_port));
+		char ipBuf[INET_ADDRSTRLEN]{};
+		inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf));
+		std::string ipPort = std::string(ipBuf) + ":" + std::to_string(ntohs(addr.sin_port));
 		result.emplace_back(number, ipPort);
 	}
 	return result;

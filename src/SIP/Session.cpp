@@ -1,7 +1,7 @@
 #include "Session.hpp"
 
-Session::Session(std::string callID, std::shared_ptr<SipClient> src, uint32_t srcRtpPort) :
-	_callID(std::move(callID)), _src(src), _state(State::Invited), _srcRtpPort(srcRtpPort), _destRtpPort(0)
+Session::Session(std::string callID, std::shared_ptr<SipClient> src) :
+	_callID(std::move(callID)), _src(src), _state(State::Invited)
 {
 }
 
@@ -21,10 +21,9 @@ void Session::setState(State state)
 	}
 }
 
-void Session::setDest(std::shared_ptr<SipClient> dest, uint32_t destRtpPort)
+void Session::setDest(std::shared_ptr<SipClient> dest)
 {
 	_dest = dest;
-	_destRtpPort = destRtpPort;
 }
 
 const std::string& Session::getCallID() const

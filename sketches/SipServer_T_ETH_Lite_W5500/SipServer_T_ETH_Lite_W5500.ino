@@ -22,6 +22,7 @@
 #include <SPI.h>
 #include <ETH.h>
 #include "src/SIP/SipServer.hpp"
+#include "src/Helpers/HttpServer.hpp"
 
 // ── W5500 SPI Pin Mapping (LilyGO T-ETH-Lite ESP32-S3) ────────────────────
 static constexpr int W5500_SCLK =  10;
@@ -46,7 +47,10 @@ static constexpr int SIP_PORT = 5060;
 static constexpr unsigned long DHCP_TIMEOUT_MS = 15000;
 
 // ── Globals ────────────────────────────────────────────────────────────────
-static SipServer* server = nullptr;
+static constexpr int HTTP_PORT = 80;
+
+static SipServer*  server     = nullptr;
+static HttpServer* httpServer = nullptr;
 static volatile bool ethConnected  = false;
 static volatile bool ethHasIP      = false;
 
@@ -179,8 +183,21 @@ void setup()
         while (true) { delay(1000); }
     }
 
+    // ── Start HTTP Dashboard ────────────────────────────────────────────
+    try
+    {
+        httpServer = new HttpServer(std::string(bindIP.c_str()), HTTP_PORT, server->getHandler());
+        httpServer->start();
+        Serial.printf("[HTTP] Dashboard RUNNING at http://%s:%d/\n", bindIP.c_str(), HTTP_PORT);
+    }
+    catch (const std::exception& e)
+    {
+        Serial.printf("[HTTP] FATAL: %s\n", e.what());
+    }
+
     Serial.println();
     Serial.printf("Ready.  Point softphones at %s:%d\n", bindIP.c_str(), SIP_PORT);
+    Serial.printf("Dashboard: http://%s:%d/\n", bindIP.c_str(), HTTP_PORT);
     Serial.println("──────────────────────────────────────────────────────────────");
 }
 
