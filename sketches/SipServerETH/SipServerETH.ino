@@ -98,6 +98,7 @@ void setup()
     Serial.println();
     Serial.println("╔══════════════════════════════════════════╗");
     Serial.println("║   ESP32-S3  SIP Server  (W5500 / PoE)   ║");
+    Serial.println("║         Retro-Console Edition        ║");
     Serial.println("╚══════════════════════════════════════════╝");
     Serial.println();
 

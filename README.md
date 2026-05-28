@@ -4,7 +4,7 @@
 > **TL;DR (Extra Super Lazy Quickstart)**
 > * **Windows**: Just double-click `quickstart.bat`
 > * **Linux / macOS**: Run `chmod +x quickstart.sh && ./quickstart.sh`
-> * **ESP32 / CYD (Arduino)**: Open `SipServer.ino` in Arduino IDE, hit **Upload**, connect to the `esp32-sipserver` AP, and open `http://192.168.4.1/`!
+> * **ESP32 / CYD (Arduino)**: Open `sketches/SipServer/SipServer.ino` in Arduino IDE, hit **Upload**, connect to the `esp32-sipserver` AP, and open `http://192.168.4.1/`!
 > 
 > That's it. This will automatically configure, compile, run the server, and open/show the retro CRT dashboard.
 
@@ -103,9 +103,9 @@ idf.py -D SIP_TRANSPORT=wifi build flash monitor
 ```
 
 ### Arduino IDE
-Two pre-configured sketches are available in the root directory:
-* `SipServerETH.ino` — Wired W5500 Ethernet variant (Requires ESP32 Arduino Core 3.x).
-* `SipServer.ino` — Wireless SoftAP variant.
+Two pre-configured sketches are available under the `sketches/` directory:
+* `sketches/SipServerETH/SipServerETH.ino` — Wired W5500 Ethernet variant (Requires ESP32 Arduino Core 3.x).
+* `sketches/SipServer/SipServer.ino` — Wireless SoftAP variant.
 
 To compile in the Arduino IDE, set the board to **ESP32S3 Dev Module** and import the source files located under `src/Helpers` and `src/SIP` to the sketch.
 
@@ -116,8 +116,11 @@ To compile in the Arduino IDE, set the board to **ESP32S3 Dev Module** and impor
 ```text
 pocket-dial/
 ├── CMakeLists.txt              # Multi-platform desktop CMake or ESP-IDF delegate
-├── SipServer.ino               # Arduino IDE entry — Wi-Fi SoftAP
-├── SipServerETH.ino            # Arduino IDE entry — W5500 Ethernet
+├── sketches/                   # Board-specific Arduino IDE sketches
+│   ├── SipServer/              # Wireless SoftAP variant (ESP32 Wi-Fi / CYD)
+│   │   └── SipServer.ino
+│   └── SipServerETH/           # Wired W5500 Ethernet variant (PoE)
+│       └── SipServerETH.ino
 ├── main.cpp                    # Desktop application entry point
 ├── main/
 │   ├── CMakeLists.txt          # ESP-IDF component manifest
