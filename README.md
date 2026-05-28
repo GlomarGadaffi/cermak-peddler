@@ -103,9 +103,11 @@ idf.py -D SIP_TRANSPORT=wifi build flash monitor
 ```
 
 ### Arduino IDE
-Two pre-configured sketches are available under the `sketches/` directory:
-* `sketches/SipServerETH/SipServerETH.ino` — Wired W5500 Ethernet variant (Requires ESP32 Arduino Core 3.x).
-* `sketches/SipServer/SipServer.ino` — Wireless SoftAP variant.
+Pre-configured sketches are available under the `sketches/` directory:
+* `sketches/SipServer/SipServer.ino` — Wireless SoftAP variant (ESP32 / CYD).
+* `sketches/SipServerETH/SipServerETH.ino` — Generic Wired W5500 SPI Ethernet variant (Waveshare S3-PoE).
+* `sketches/SipServer_T_ETH_Lite_W5500/SipServer_T_ETH_Lite_W5500.ino` — LilyGO T-ETH-Lite ESP32-S3 W5500 board.
+* `sketches/SipServer_T_POE_Pro_LAN8720/SipServer_T_POE_Pro_LAN8720.ino` — LilyGO T-POE-Pro LAN8720 board.
 
 To compile in the Arduino IDE, set the board to **ESP32S3 Dev Module** and import the source files located under `src/Helpers` and `src/SIP` to the sketch.
 
@@ -119,8 +121,12 @@ pocket-dial/
 ├── sketches/                   # Board-specific Arduino IDE sketches
 │   ├── SipServer/              # Wireless SoftAP variant (ESP32 Wi-Fi / CYD)
 │   │   └── SipServer.ino
-│   └── SipServerETH/           # Wired W5500 Ethernet variant (PoE)
-│       └── SipServerETH.ino
+│   ├── SipServerETH/           # Generic W5500 Ethernet variant (Waveshare PoE)
+│   │   └── SipServerETH.ino
+│   ├── SipServer_T_ETH_Lite_W5500/ # LilyGO T-ETH-Lite ESP32-S3 W5500
+│   │   └── SipServer_T_ETH_Lite_W5500.ino
+│   └── SipServer_T_POE_Pro_LAN8720/ # LilyGO T-POE-Pro LAN8720 (RMII)
+│       └── SipServer_T_POE_Pro_LAN8720.ino
 ├── main.cpp                    # Desktop application entry point
 ├── main/
 │   ├── CMakeLists.txt          # ESP-IDF component manifest
