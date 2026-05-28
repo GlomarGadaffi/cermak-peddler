@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Registration Lease Expiry / TTL Sweep (#4)**: the registrar now honours registration lifetimes per RFC 3261 §10.2.1. `onRegister` parses the requested expiry from the Contact `expires=` parameter or a standalone `Expires:` header (case-insensitive), clamps it to `[30, 3600]` seconds (default `3600` when unspecified), and echoes the granted value back in the 200 OK Contact. `SipClient` now carries a monotonic (`steady_clock`) lease deadline. Expired bindings are evicted by an opportunistic, throttled sweep (`maybeSweep`, at most once per second) that runs under the existing handler mutex on incoming traffic and on dashboard reads (`getActiveClients`, `getClientCount`) — no additional background thread/task is introduced. `expires=0` continues to de-register immediately.
+
 ### Fixed
 - **ESP32 UdpServer Shutdown Race (#5)**: `closeServer()` previously waited a fixed `vTaskDelay(10)` for the receive task to exit, which could return while `receiveLoop()` was still blocked in `recvfrom()` (500 ms `SO_RCVTIMEO`) and touching `UdpServer` members — a use-after-free. Now the receive task signals a binary semaphore on exit and `closeServer()` blocks on it (2 s backstop), mirroring `std::thread::join()` on desktop. Task/semaphore handles are value-initialized to `nullptr`.
 - **Dashboard Wi-Fi SSID XSS (#6)**: `renderWifiNetworks()` interpolated the scanned SSID into an inline `onclick="selectWifi('…')"` handler; `escapeHtml()` does not escape single quotes, so a crafted SSID could break out and execute on click. Rows are now built as DOM nodes with `textContent` and the click handler bound via `addEventListener` — the SSID never reaches markup as a string.

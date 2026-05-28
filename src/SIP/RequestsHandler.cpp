@@ -1,10 +1,24 @@
 #include "RequestsHandler.hpp"
 #include <atomic>
 #include <sstream>
+#include <cctype>
+#include <algorithm>
 #include "SipMessageTypes.h"
 #include "SipSdpMessage.hpp"
 #include "IDGen.hpp"
 #include "IPHelper.hpp"
+
+namespace
+{
+	// Default lease granted when a REGISTER does not request one (seconds).
+	constexpr int DEFAULT_EXPIRES = 3600;
+	// Upper bound we are willing to grant, regardless of what the client asks.
+	constexpr int MAX_EXPIRES = 3600;
+	// Minimum non-zero lease, to avoid pathologically short registrations.
+	constexpr int MIN_EXPIRES = 30;
+	// How often the opportunistic sweep is allowed to run.
+	constexpr auto SWEEP_INTERVAL = std::chrono::seconds(1);
+}
 
 RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	OnHandledEvent onHandledEvent) :
@@ -33,6 +47,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 {
 	_packetsProcessed.fetch_add(1, std::memory_order_relaxed);
 	std::lock_guard<std::mutex> lock(_mutex);
+	maybeSweep();
 	auto it = _handlers.find(request->getType());
 	if (it != _handlers.end())
 	{
@@ -52,17 +67,20 @@ std::optional<std::shared_ptr<Session>> RequestsHandler::getSession(const std::s
 
 void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 {
-	bool isUnregisterReq = data->getContact().find("expires=0") != std::string::npos;
 	auto fromNumber = data->getFromNumber();
+	int requestedExpires = parseRequestedExpires(data);
+	int grantedExpires = 0;
 
-	if (isUnregisterReq)
+	if (requestedExpires <= 0)
 	{
+		// expires=0 (or an explicit zero) is a de-registration request.
 		unregisterClient(fromNumber);
 	}
 	else
 	{
+		grantedExpires = std::max(MIN_EXPIRES, std::min(requestedExpires, MAX_EXPIRES));
 		// Always update address so re-REGISTER after a NAT rebind works correctly
-		auto newClient = std::make_shared<SipClient>(data->getFromNumber(), data->getSource());
+		auto newClient = std::make_shared<SipClient>(data->getFromNumber(), data->getSource(), grantedExpires);
 		registerClient(std::move(newClient));
 	}
 
@@ -71,7 +89,8 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
 	response->setVia(data->getVia() + ";received=" + activeIp);
 	response->setTo(data->getTo() + ";tag=" + IDGen::GenerateID(9));
-	response->setContact(buildContact(fromNumber));
+	// Echo the granted lease back in the Contact so the client knows when to refresh.
+	response->setContact(buildContact(fromNumber) + ";expires=" + std::to_string(grantedExpires));
 	endHandle(fromNumber, response);
 }
 
@@ -275,6 +294,70 @@ void RequestsHandler::unregisterClient(const std::string& number)
 	_clients.erase(number);
 }
 
+int RequestsHandler::parseRequestedExpires(const std::shared_ptr<SipMessage>& data) const
+{
+	// Helper: read a non-negative integer starting at `from`. Returns -1 if no digits.
+	auto readInt = [](const std::string& s, size_t from) -> int {
+		while (from < s.size() && std::isspace(static_cast<unsigned char>(s[from]))) ++from;
+		size_t end = from;
+		while (end < s.size() && std::isdigit(static_cast<unsigned char>(s[end]))) ++end;
+		if (end == from) return -1;
+		try { return std::stoi(s.substr(from, end - from)); } catch (...) { return -1; }
+	};
+
+	// 1. expires= parameter on the Contact header (most common form).
+	const std::string& contact = data->getContact();
+	auto cpos = contact.find("expires=");
+	if (cpos != std::string::npos)
+	{
+		int v = readInt(contact, cpos + 8);
+		if (v >= 0) return v;
+	}
+
+	// 2. Standalone Expires header (case-insensitive line match).
+	const std::string raw = data->toString();
+	std::string lowered(raw.size(), '\0');
+	std::transform(raw.begin(), raw.end(), lowered.begin(),
+		[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	size_t hpos = lowered.find("\nexpires:");
+	if (hpos != std::string::npos)
+	{
+		int v = readInt(raw, hpos + 9); // offset past "\nexpires:"
+		if (v >= 0) return v;
+	}
+
+	// 3. No expiry specified — grant the default lease.
+	return DEFAULT_EXPIRES;
+}
+
+void RequestsHandler::sweepExpired()
+{
+	auto now = std::chrono::steady_clock::now();
+	for (auto it = _clients.begin(); it != _clients.end(); )
+	{
+		if (it->second->isExpired(now))
+		{
+			std::cout << "Registration lease expired: " << it->first << '\n';
+			it = _clients.erase(it);
+		}
+		else
+		{
+			++it;
+		}
+	}
+}
+
+void RequestsHandler::maybeSweep()
+{
+	auto now = std::chrono::steady_clock::now();
+	if (now - _lastSweep < SWEEP_INTERVAL)
+	{
+		return;
+	}
+	_lastSweep = now;
+	sweepExpired();
+}
+
 std::optional<std::shared_ptr<SipClient>> RequestsHandler::findClient(const std::string& number)
 {
 	auto it = _clients.find(number);
@@ -328,6 +411,7 @@ static const char* sessionStateToString(Session::State s)
 std::vector<std::pair<std::string, std::string>> RequestsHandler::getActiveClients()
 {
 	std::lock_guard<std::mutex> lock(_mutex);
+	sweepExpired();
 	std::vector<std::pair<std::string, std::string>> result;
 	result.reserve(_clients.size());
 	for (const auto& [number, client] : _clients)
@@ -381,6 +465,7 @@ uint64_t RequestsHandler::getPacketsProcessed() const
 size_t RequestsHandler::getClientCount()
 {
 	std::lock_guard<std::mutex> lock(_mutex);
+	sweepExpired();
 	return _clients.size();
 }
 

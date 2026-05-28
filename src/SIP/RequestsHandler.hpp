@@ -9,6 +9,7 @@
 #include <tuple>
 #include <cstdint>
 #include <atomic>
+#include <chrono>
 #include "SipMessage.hpp"
 #include "SipClient.hpp"
 #include "Session.hpp"
@@ -56,6 +57,11 @@ private:
 	bool registerClient(std::shared_ptr<SipClient> client);
 	void unregisterClient(const std::string& number);
 
+	// Registration-lease handling (RFC 3261 §10.2.1)
+	int parseRequestedExpires(const std::shared_ptr<SipMessage>& data) const;
+	void sweepExpired();   // evict expired bindings; caller must hold _mutex
+	void maybeSweep();     // throttled sweep; caller must hold _mutex
+
 	std::optional<std::shared_ptr<SipClient>> findClient(const std::string& number);
 
 	void endHandle(const std::string& destNumber, std::shared_ptr<SipMessage> message);
@@ -72,6 +78,8 @@ private:
 	int         _serverPort;
 
 	std::atomic<uint64_t> _packetsProcessed{0};
+
+	std::chrono::steady_clock::time_point _lastSweep{};
 };
 
 #endif
