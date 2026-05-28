@@ -1,44 +1,125 @@
 # pocket-dial
 
-A premium, compact SIP registrar and stateless proxy in C++17 — small enough to run on an ESP32-S3, robust enough to handle extension-to-extension calling between real softphones on a local network, and packaged with a stunning, cross-platform **CGA CRT retro console web dashboard**.
+A C++17 SIP registrar and stateless proxy designed for flat, trusted local networks. It runs on desktop environments (Windows/Linux) and embedded targets (ESP32-S3 via Wi-Fi or W5500 PoE Ethernet) and includes a CGA CRT retro-styled web administration console.
 
-Forked and embedded-hardened from [BarGabriel/SipServer](https://github.com/BarGabriel/SipServer).
-
----
-
-## 🌟 Key Features
-
-* **Dual-Service Engine:** Standard SIP signaling server (UDP 5060) and self-contained TCP web administration dashboard (TCP 8080 or port 80).
-* **CGA CRT Retro Dashboard:** A gorgeous, authentic retro blue `#0000AA` console layout featuring:
-  * Twinkling starfield background with a **3D rotating wireframe tesseract (hypercube)**.
-  * Phosphor glow text-shadows, scanlines, curvature vignette, and subtle screen flicker animations.
-  * Interactive terminal shell (`C:/SipServer>`) with command history (↑↓) and classic commands (`help`, `dir`, `registered`, `sessions`, `uptime`, `oracle`, `ver`, `ascii`).
-  * Live system status monitoring (online extensions, call sessions, packet counters).
-  * WiFi Network Manager modal for scanning and connecting networks dynamically on embedded targets.
-* **System Oracle:** A rotating bar displaying witty, charming retro computing, compiler, silicon, and network routing quotes.
-* **Out-of-the-Box LAN Connectivity:** Binds to `0.0.0.0` by default to listen on all interfaces. It dynamically queries the host routing table to resolve the active LAN IP and automatically substitutes it in `Via` and `Contact` SIP headers so remote devices can register plug-and-play.
-* **Three Targets, One Codebase:**
-  * **ESP32-S3 + W5500 Ethernet (PoE)** — Single-cable PoE calling appliance.
-  * **ESP32-S3 + Wi-Fi SoftAP** — Broad-casts its own ad-hoc `esp32-sipserver` AP.
-  * **Desktop (Linux/Windows)** — For instant local server hosting and testing.
+Forked and extended from [BarGabriel/SipServer](https://github.com/BarGabriel/SipServer).
 
 ---
 
-## 🛠️ Visual & Retro Console Design
+## Features
 
-The web dashboard is fully embedded within the C++ binary inside [index_html.h](src/Helpers/index_html.h) as a raw string literal (split into chunks for maximum compiler compatibility). 
+### 1. SIP Signaling & Call Setup
+* **User Registration**: Supports the `REGISTER` transaction. Saves registered endpoints dynamically in memory. Unregistration is handled via `expires=0`. Bypasses password validation for simplicity in flat trusted LAN environments.
+* **Stateless Proxy Routing**: Routes standard call setups via `INVITE`, `TRYING`, `RINGING`, `OK`, `ACK`, `CANCEL`, `BYE`, and error states (`486 Busy Here`, `480 Temporarily Unavailable`, `404 Not Found`).
+* **Direct RTP Flow**: Media (audio) flows peer-to-peer directly between endpoints, keeping the signaling server lightweight and suitable for constrained hardware.
 
-* **The Tesseract Canvas:** Uses vanilla HTML5 Canvas to execute full 3D vector rotation, projecting a 4D hypercube tesseract inside a pulsing orbital halo, matching the geeky retro-hacker aesthetic perfectly.
-* **Interactive ASCII Art:** Typing `ascii` in the console prints a custom classic telephone bell matching the *pocket-dial* name.
-* **CGA Palette:** Adheres strictly to the classic 16-color IBM CGA/EGA graphics color palette.
+### 2. LAN & Auto-Routing Abstraction
+* Binds to `0.0.0.0` by default to listen on all local interfaces.
+* Resolves active LAN routes at startup to determine the primary host interface IP and automatically substitutes it within SIP headers (`Via` and `Contact`) for out-of-the-box local network communication.
+
+### 3. Web Administration Console
+* Hosted on port `8080` (desktop) or `80` (embedded).
+* Retro CGA-styled interface (`#0000AA` palette) featuring:
+  * **Interactive Terminal**: A CLI terminal supporting commands such as `help`, `dir`, `registered`, `sessions`, `uptime`, `oracle`, `ver`, and `ascii`.
+  * **Live Status Dashboard**: Grids displaying registered extensions, active session states, and diagnostic packet counters.
+  * **WiFi Manager**: Onboard Wi-Fi setup module to scan and connect the device to local networks (on embedded platforms).
 
 ---
 
-## 🚦 SIP Signaling & Architecture
+## Quickstart (Desktop)
 
-SIP signaling coordinates VoIP call setups. Once connected, audio (RTP media) flows peer-to-peer directly between phones. This design enables a constrained MCU to host the signaling registrar without getting bogged down in heavy audio packet relaying.
-
+### Windows (MSVC)
+Open a Visual Studio Developer Command Prompt:
+```bash
+mkdir build
+cd build
+cmake ..
+cmake --build . --config Release
+# Run executable
+.\Release\SipServer.exe
 ```
+
+### Linux / macOS
+```bash
+mkdir build
+cd build
+cmake ..
+make
+./SipServer
+```
+
+On boot, the server outputs local interface bindings and network details:
+```text
+SIP server started on 0.0.0.0:5060 (LAN IP: 192.168.12.116)
+CGA CRT Dashboard: http://localhost:8080/
+Remote LAN Access:  http://192.168.12.116:8080/
+Press ENTER to stop...
+```
+
+---
+
+## Embedded Targets (ESP32-S3)
+
+The project supports both ESP-IDF and Arduino IDE configurations.
+
+### ESP-IDF (W5500 Ethernet or Wi-Fi AP)
+Requires [ESP-IDF v5.x](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/get-started/).
+
+```bash
+idf.py set-target esp32s3
+# For Ethernet (PoE W5500)
+idf.py build flash monitor
+
+# For Wi-Fi Access Point (SoftAP)
+idf.py -D SIP_TRANSPORT=wifi build flash monitor
+```
+
+### Arduino IDE
+Two pre-configured sketches are available in the root directory:
+* `SipServerETH.ino` — Wired W5500 Ethernet variant (Requires ESP32 Arduino Core 3.x).
+* `SipServer.ino` — Wireless SoftAP variant.
+
+To compile in the Arduino IDE, set the board to **ESP32S3 Dev Module** and import the source files located under `src/Helpers` and `src/SIP` to the sketch.
+
+---
+
+## Project Structure
+
+```text
+pocket-dial/
+├── CMakeLists.txt              # Multi-platform desktop CMake or ESP-IDF delegate
+├── SipServer.ino               # Arduino IDE entry — Wi-Fi SoftAP
+├── SipServerETH.ino            # Arduino IDE entry — W5500 Ethernet
+├── main.cpp                    # Desktop application entry point
+├── main/
+│   ├── CMakeLists.txt          # ESP-IDF component manifest
+│   ├── esp_main.cpp            # ESP-IDF entry — Wi-Fi SoftAP
+│   └── esp_main_eth.cpp        # ESP-IDF entry — W5500 Ethernet
+├── src/
+│   ├── Helpers/
+│   │   ├── cxxopts.hpp         # Desktop command-line parser
+│   │   ├── IDGen.hpp           # Thread-safe random ID generator
+│   │   ├── IPHelper.hpp        # Dynamic LAN IP resolution utility
+│   │   ├── HttpServer.hpp/cpp  # Web administration TCP server and API endpoints
+│   │   ├── index_html.hpp      # Self-contained administration dashboard HTML carrier
+│   │   └── UdpServer.hpp/cpp   # Network socket wrapper (POSIX, Winsock, and lwIP)
+│   └── SIP/
+│       ├── SipServer.hpp/cpp   # Core server orchestrator
+│       ├── RequestsHandler.hpp/cpp # SIP transaction dispatcher and state controller
+│       ├── Session.hpp/cpp     # Call session state machine
+│       ├── SipClient.hpp/cpp   # Registered endpoint profiles
+│       ├── SipMessage.hpp/cpp  # Base SIP message parser
+│       ├── SipMessageHeaders.hpp # SIP standard header field name constants
+│       ├── SipMessageTypes.hpp   # SIP method and status line constants
+│       ├── SipSdpMessage.hpp/cpp # Derived SDP body parser
+│       └── SipMessageFactory.hpp/cpp # SIP message factory and classifier
+```
+
+---
+
+## System Architecture
+
+```text
                        ┌──────────────────────┐
                        │      SipServer       │
                        │ (top-level orchestr.)│
@@ -61,124 +142,16 @@ SIP signaling coordinates VoIP call setups. Once connected, audio (RTP media) fl
                                              └──────────────────────┘
 ```
 
-### Supported SIP Methods & Responses
+---
 
-| Method / Response | Constant | Description |
-|---|---|---|
-| `REGISTER` | `SipMessageTypes::REGISTER` | Adds/updates client in memory. Responds `200 OK`. `expires=0` unregisters. |
-| `INVITE` | `SipMessageTypes::INVITE` | Initiates call. Requires SDP body. Responds `404` if callee offline. |
-| `ACK` | `SipMessageTypes::ACK` | Confirms final transaction handshake. |
-| `BYE` | `SipMessageTypes::BYE` | Terminates active calling sessions. |
-| `CANCEL` | `SipMessageTypes::CANCEL` | Cancels pending/ringing INVITE setups. |
-| `SIP/2.0 100 Trying` | `SipMessageTypes::TRYING` | Sent to caller to acknowledge processing. |
-| `SIP/2.0 180 Ringing` | `SipMessageTypes::RINGING` | Sent to caller while callee's device is ringing. |
-| `SIP/2.0 200 OK` | `SipMessageTypes::OK` | Acknowledges transaction success (e.g. call accepted). |
+## Security Specifications
+
+The server is designed for flat, private networks:
+* **No Authentication**: The registrar does not validate user credentials. **Do not expose SIP (UDP 5060) or administration (TCP 8080/80) ports directly to the public Internet.**
+* **Decentralized Media**: Voice packets flow peer-to-peer, keeping memory footprint low.
 
 ---
 
-## ⚡ Quickstart (Desktop)
-
-Compile and run the server instantly on your local computer to test with softphones (e.g. MicroSIP, Linphone, Zoiper).
-
-### Windows (MSVC)
-From a Visual Studio Developer Command Prompt:
-```bash
-mkdir build && cd build
-cmake ..
-msbuild SipServer.sln
-# Run (defaults to bind 0.0.0.0, SIP port 5060, HTTP port 8080)
-.\Release\SipServer.exe
-```
-
-### Linux / macOS
-```bash
-mkdir build && cd build
-cmake ..
-make
-./SipServer
-```
-
-On boot, the server outputs local binding information and active LAN routes:
-```text
-SIP server started on 0.0.0.0:5060 (LAN IP: 192.168.12.116)
-CGA CRT Dashboard: http://localhost:8080/
-Remote LAN Access:  http://192.168.12.116:8080/
-Press ENTER to stop...
-```
-
-### Softphone Configuration:
-1. **SSID/LAN:** Ensure the softphones are on the same local network as the server.
-2. **SIP Domain/Proxy:** Specify the server's LAN IP (e.g. `192.168.12.116`).
-3. **Port:** `5060` (UDP).
-4. **Extension:** Any number (e.g., `101`, `102`).
-5. **Password:** Leave blank (authentication is bypassed for flat trusted LAN environments).
-6. **Open Dashboard:** Navigate to `http://192.168.12.116:8080/` in your browser.
-
----
-
-## 🔌 Embedded ESP32-S3 Targets
-
-The repository supports ESP-IDF and Arduino entry points.
-
-### ESP-IDF (PoE W5500 Ethernet or Wi-Fi AP)
-Requires [ESP-IDF v5.x](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/get-started/).
-
-```bash
-idf.py set-target esp32s3
-# For Ethernet (PoE) Target
-idf.py build flash monitor
-# For Wi-Fi Access Point Target
-idf.py -D SIP_TRANSPORT=wifi build flash monitor
-```
-
-### Arduino IDE
-Two Arduino sketches are provided in the root directory:
-* `SipServerETH.ino` — Native W5500 Ethernet variant. Requires ESP32 Arduino Core ≥ 3.0.
-* `SipServer.ino` — Wi-Fi SoftAP variant. Open, select **ESP32S3 Dev Module**, and upload.
-
----
-
-## 📁 Project Structure
-
-```
-pocket-dial/
-├── CMakeLists.txt              # Dual-mode desktop CMake or ESP-IDF build
-├── SipServer.ino               # Arduino sketch entry — Wi-Fi AP
-├── SipServerETH.ino            # Arduino sketch entry — PoE W5500 Ethernet
-├── main.cpp                    # Desktop entry point
-├── main/
-│   ├── CMakeLists.txt          # ESP-IDF component register
-│   ├── esp_main.cpp            # ESP-IDF Wi-Fi AP entry
-│   └── esp_main_eth.cpp        # ESP-IDF W5500 Ethernet entry
-├── src/
-│   ├── Helpers/
-│   │   ├── cxxopts.hpp         # Desktop CLI parser
-│   │   ├── IDGen.hpp           # Thread-safe ID generator
-│   │   ├── IPHelper.hpp        # Routing-table LAN IP auto-resolution [NEW]
-│   │   ├── HttpServer.{hpp,cpp}# TCP HTTP & JSON API server
-│   │   ├── index_html.h        # 48KB CGA CRT web console string literal [NEW]
-│   │   └── UdpServer.{hpp,cpp} # POSIX/Winsock/lwIP UDP abstraction
-│   └── SIP/
-│       ├── SipServer.{hpp,cpp} # Core controller
-│       ├── RequestsHandler.{hpp,cpp} # Method dispatcher & dynamic IP resolver
-│       ├── Session.{hpp,cpp}   # Call state machine
-│       ├── SipClient.{hpp,cpp} # Extensions list
-│       ├── SipMessage.{hpp,cpp} # SIP packet parser
-│       ├── SipSdpMessage.{hpp,cpp} # SDP body parser
-│       └── SipMessageFactory.{hpp,cpp} # Packet classifier
-```
-
----
-
-## 🔒 Security Specifications
-This signaling server is lightweight and designed exclusively for **flat, trusted LANs**:
-* **No Authentication:** It is designed for maximum speed and simplicity. It registers any extension without a password challenge. **Do not expose ports 5060 or 8080 to the public Internet.**
-* **Peer-to-Peer Media:** Audio packets flow directly between softphones, eliminating server load.
-
----
-
-## 📝 Credits & Licensing
-
-Special thanks to **Bar Gabriel** for creating the original [BarGabriel/SipServer](https://github.com/BarGabriel/SipServer) architecture. This fork incorporates cross-platform abstractions, robust Winsock/POSIX porting, dynamic LAN routing, the CGA CRT visual dashboard, and multi-core ESP32-S3 firmware targeting.
+## License
 
 Distributed under the **MIT License**. See [LICENSE](LICENSE) for details.
