@@ -4,8 +4,9 @@
 > **TL;DR (Extra Super Lazy Quickstart)**
 > * **Windows**: Just double-click `quickstart.bat`
 > * **Linux / macOS**: Run `chmod +x quickstart.sh && ./quickstart.sh`
+> * **ESP32 / CYD (Arduino)**: Open `SipServer.ino` in Arduino IDE, hit **Upload**, connect to the `esp32-sipserver` AP, and open `http://192.168.4.1/`!
 > 
-> That's it. This will automatically configure CMake, compile the code, launch the server, and open the dashboard in your browser.
+> That's it. This will automatically configure, compile, run the server, and open/show the retro CRT dashboard.
 
 A C++17 SIP registrar and stateless proxy designed for flat, trusted local networks. It runs on desktop environments (Windows/Linux) and embedded targets (ESP32-S3 via Wi-Fi or W5500 PoE Ethernet) and includes a CGA CRT retro-styled web administration console.
 
