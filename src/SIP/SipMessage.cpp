@@ -103,21 +103,30 @@ void SipMessage::setType(std::string value)
 void SipMessage::setHeader(std::string value)
 {
 	auto headerPos = _messageStr.find(_header);
-	_messageStr.replace(headerPos, _header.length(), value);
+	if (headerPos != std::string::npos)
+	{
+		_messageStr.replace(headerPos, _header.length(), value);
+	}
 	_header = std::move(value);
 }
 
 void SipMessage::setVia(std::string value)
 {
 	auto viaPos = _messageStr.find(_via);
-	_messageStr.replace(viaPos, _via.length(), value);
+	if (viaPos != std::string::npos)
+	{
+		_messageStr.replace(viaPos, _via.length(), value);
+	}
 	_via = std::move(value);
 }
 
 void SipMessage::setFrom(std::string value)
 {
 	auto fromPos = _messageStr.find(_from);
-	_messageStr.replace(fromPos, _from.length(), value);
+	if (fromPos != std::string::npos)
+	{
+		_messageStr.replace(fromPos, _from.length(), value);
+	}
 	_fromNumber = extractNumber(value);
 	_from = std::move(value);
 }
@@ -125,7 +134,10 @@ void SipMessage::setFrom(std::string value)
 void SipMessage::setTo(std::string value)
 {
 	auto toPos = _messageStr.find(_to);
-	_messageStr.replace(toPos, _to.length(), value);
+	if (toPos != std::string::npos)
+	{
+		_messageStr.replace(toPos, _to.length(), value);
+	}
 	_toNumber = extractNumber(value);
 	_to = std::move(value);
 }
@@ -133,14 +145,20 @@ void SipMessage::setTo(std::string value)
 void SipMessage::setCallID(std::string value)
 {
 	auto callIdPos = _messageStr.find(_callID);
-	_messageStr.replace(callIdPos, _callID.length(), value);
+	if (callIdPos != std::string::npos)
+	{
+		_messageStr.replace(callIdPos, _callID.length(), value);
+	}
 	_callID = std::move(value);
 }
 
 void SipMessage::setCSeq(std::string value)
 {
 	auto cSeqPos = _messageStr.find(_cSeq);
-	_messageStr.replace(cSeqPos, _cSeq.length(), value);
+	if (cSeqPos != std::string::npos)
+	{
+		_messageStr.replace(cSeqPos, _cSeq.length(), value);
+	}
 	_cSeq = std::move(value);
 }
 
@@ -166,7 +184,10 @@ void SipMessage::setContact(std::string value)
 void SipMessage::setContentLength(std::string value)
 {
 	auto contentLengthPos = _messageStr.find(_contentLength);
-	_messageStr.replace(contentLengthPos, _contentLength.length(), value);
+	if (contentLengthPos != std::string::npos)
+	{
+		_messageStr.replace(contentLengthPos, _contentLength.length(), value);
+	}
 	_contentLength = std::move(value);
 }
 

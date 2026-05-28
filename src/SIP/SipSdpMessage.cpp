@@ -12,15 +12,22 @@ SipSdpMessage::SipSdpMessage(std::string message, sockaddr_in src) : SipMessage(
 void SipSdpMessage::setMedia(std::string value)
 {
 	auto mPos = _messageStr.find(_media);
-	_messageStr.replace(mPos, _media.length(), value);
-	_media = value;
+	if (mPos != std::string::npos)
+	{
+		_messageStr.replace(mPos, _media.length(), value);
+	}
+	_media = std::move(value);
 }
 
 void SipSdpMessage::setRtpPort(int port)
 {
 	std::string currentRtpPort = std::to_string(_rtpPort);
 	std::string copyM = _media;
-	copyM.replace(_media.find(currentRtpPort), currentRtpPort.length(), std::to_string(port));
+	auto portPos = _media.find(currentRtpPort);
+	if (portPos != std::string::npos)
+	{
+		copyM.replace(portPos, currentRtpPort.length(), std::to_string(port));
+	}
 	_rtpPort = port;
 	setMedia(std::move(copyM));
 }

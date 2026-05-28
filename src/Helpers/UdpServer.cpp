@@ -17,6 +17,16 @@ UdpServer::UdpServer(std::string ip, int port, OnNewMessageEvent event) : _ip(st
 		throw std::runtime_error("socket creation failed");
 	}
 
+#if defined _WIN32 || defined _WIN64
+	DWORD timeout = 500; // 500ms timeout
+	setsockopt(_sockfd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+#else
+	struct timeval tv;
+	tv.tv_sec = 0;
+	tv.tv_usec = 500000; // 500ms timeout
+	setsockopt(_sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+
 	_servaddr = {};
 	_servaddr.sin_family = AF_INET;
 	_servaddr.sin_addr.s_addr = inet_addr(_ip.c_str());

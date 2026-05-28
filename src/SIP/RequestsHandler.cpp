@@ -111,6 +111,10 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	if (!message) 
 	{
 		std::cerr << "Couldn't get SDP from " << data->getFromNumber() << "'s INVITE request." << std::endl;
+		std::shared_ptr<SipMessage> responseObj = std::make_shared<SipMessage>(*data);
+		responseObj->setHeader(SipMessageTypes::BAD_REQUEST);
+		responseObj->setContact(buildContact(caller.value()->getNumber()));
+		endHandle(data->getFromNumber(), responseObj);
 		return;
 	}
 
@@ -173,6 +177,10 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 			if (!sdpMessage) 
 			{
 				std::cerr << "Couldn't get SDP from: " << client.value()->getNumber() << "'s OK message.\n";
+				std::shared_ptr<SipMessage> responseObj = std::make_shared<SipMessage>(*data);
+				responseObj->setHeader(SipMessageTypes::BAD_REQUEST);
+				responseObj->setContact(buildContact(data->getToNumber()));
+				endHandle(data->getToNumber(), responseObj);
 				endCall(data->getCallID(), data->getFromNumber(), data->getToNumber(), "SDP parse error.");
 				return;
 			}

@@ -18,6 +18,7 @@ public:
 	static constexpr auto ACK                = "ACK";
 	static constexpr auto BYE                = "BYE";
 	static constexpr auto NOT_FOUND          = "SIP/2.0 404 Not Found";
+	static constexpr auto BAD_REQUEST        = "SIP/2.0 400 Bad Request";
 };
 
 #endif
