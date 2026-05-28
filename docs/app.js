@@ -138,9 +138,9 @@ WiFi.softAP(ssid);`
 // ==========================================================================
 const QUICKSTART_OS = {
     'win': `> ONE-LINE INSTALLER PIPELINE (Recommended)
-Paste this in your Windows PowerShell terminal:
+Paste this in your Command Prompt, PowerShell, or Run dialog:
 -----------------------------------------------------------------
-irm https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.ps1 | iex
+powershell -c "irm https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.ps1 | iex"
 
 > LOCAL DEVELOPMENT ACTIONS (If cloned):
 -----------------------------------------------------------------

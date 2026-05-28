@@ -6,9 +6,9 @@
 >   ```bash
 >   curl -fsSL https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.sh | bash
 >   ```
-> * **Windows PowerShell**:
->   ```powershell
->   irm https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.ps1 | iex
+> * **Windows (CMD / PowerShell / Run Dialog)**:
+>   ```cmd
+>   powershell -c "irm https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.ps1 | iex"
 >   ```
 > * **ESP32 / CYD (Arduino)**: Open `sketches/SipServer/SipServer.ino` in Arduino IDE, hit **Upload**, connect to the `esp32-sipserver` AP, and open `http://192.168.4.1/`!
 > 
@@ -48,10 +48,10 @@ Open a terminal and run:
 curl -fsSL https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.sh | bash
 ```
 
-### Windows (PowerShell)
-Open a PowerShell terminal and run:
-```powershell
-irm https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.ps1 | iex
+### Windows (CMD / PowerShell / Run Dialog)
+Open a terminal or run dialog and paste:
+```cmd
+powershell -c "irm https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.ps1 | iex"
 ```
 
 ---
