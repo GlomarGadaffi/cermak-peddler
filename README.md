@@ -28,6 +28,26 @@ Forked and extended from [BarGabriel/SipServer](https://github.com/BarGabriel/Si
 
 ## Quickstart (Desktop)
 
+The repository provides zero-dependency automated quickstart scripts that configure CMake, compile the executable, launch the SIP server, and automatically open the retro console dashboard in your default browser.
+
+### Windows
+Double-click `quickstart.bat` or run it from the command line:
+```cmd
+quickstart.bat
+```
+
+### Linux / macOS
+Run the bash script:
+```bash
+./quickstart.sh
+```
+
+---
+
+## Manual Build (Desktop Fallback)
+
+If you prefer to compile manually, follow the standard CMake workflow:
+
 ### Windows (MSVC)
 Open a Visual Studio Developer Command Prompt:
 ```bash
@@ -101,7 +121,7 @@ pocket-dial/
 │   │   ├── IDGen.hpp           # Thread-safe random ID generator
 │   │   ├── IPHelper.hpp        # Dynamic LAN IP resolution utility
 │   │   ├── HttpServer.hpp/cpp  # Web administration TCP server and API endpoints
-│   │   ├── index_html.hpp      # Self-contained administration dashboard HTML carrier
+│   │   ├── index_html.h        # Self-contained administration dashboard HTML carrier
 │   │   └── UdpServer.hpp/cpp   # Network socket wrapper (POSIX, Winsock, and lwIP)
 │   └── SIP/
 │       ├── SipServer.hpp/cpp   # Core server orchestrator
@@ -109,8 +129,8 @@ pocket-dial/
 │       ├── Session.hpp/cpp     # Call session state machine
 │       ├── SipClient.hpp/cpp   # Registered endpoint profiles
 │       ├── SipMessage.hpp/cpp  # Base SIP message parser
-│       ├── SipMessageHeaders.hpp # SIP standard header field name constants
-│       ├── SipMessageTypes.hpp   # SIP method and status line constants
+│       ├── SipMessageHeaders.h # SIP standard header field name constants
+│       ├── SipMessageTypes.h   # SIP method and status line constants
 │       ├── SipSdpMessage.hpp/cpp # Derived SDP body parser
 │       └── SipMessageFactory.hpp/cpp # SIP message factory and classifier
 ```
