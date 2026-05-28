@@ -3,149 +3,179 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>pocket-dial | Retro C++17 SIP Server & CGA Console</title>
-    <meta name="description" content="A minimalist C++17 SIP registrar & stateless proxy for ESP32 & Desktop with a retro CGA CRT terminal dashboard. Bypasses password checks for flat trusted local networks.">
-    <meta name="keywords" content="SIP, VoIP, ESP32, ESP32-S3, C++17, TempleOS, CGA, CRT, SIP Registrar, PBX, LilyGO, W5500, LAN8720">
+    <title>pocket-dial | Minimalist C++17 SIP Server for ESP32 & Desktop</title>
+    <meta name="description" content="A lightweight C++17 SIP registrar & stateless proxy for ESP32 (WiFi/Ethernet) and Desktop. Bypasses credential checks for flat trusted local networks.">
+    <meta name="keywords" content="SIP, VoIP, ESP32, ESP32-S3, C++17, SIP Registrar, PBX, LilyGO, W5500, LAN8720, network engineering">
     
-    <!-- Retro Mono Fonts -->
+    <!-- Modern Readable Typography -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     
     <link rel="stylesheet" href="style.css">
 </head>
-<body class="crt-filter">
+<body>
 
-    <!-- Subtle Scanline & Flicker CRT Overlays -->
-    <div class="scanlines"></div>
-    <div class="screen-flicker"></div>
+    <!-- Minimal Header Navigation -->
+    <header class="nav-bar">
+        <div class="nav-container">
+            <div class="brand">
+                <span class="logo">pocket-dial</span>
+                <span class="version-badge">v1.0.0</span>
+            </div>
+            <nav class="nav-links">
+                <a href="#features" class="nav-link">Features</a>
+                <a href="#hardware" class="nav-link">Hardware Config</a>
+                <a href="#quickstart" class="nav-link">Quickstart</a>
+                <a href="https://github.com/GlomarGadaffi/pocket-dial" target="_blank" class="nav-btn">GitHub</a>
+            </nav>
+        </div>
+    </header>
 
     <div class="wrapper">
-        <!-- SYSTEM TOP LOGO & BIOS INFO -->
-        <header class="bios-header">
-            <pre class="ascii-logo">
- ▄▄▄·             ▄▄▄· ▄▄▄▄▄▄▄▄▄▄     ▄▄▄· ▄ .▄▄▄ ▄▄   ▄▄
-▐█ ▄█▪     ▪     ▐█ ▄█▪██   ▪██ *     ▐█ ▄█▪██▪▐█  ██  ██
- ██▀· ▄█▀▄  ▄█▀▄  ██▀· ▐█.▪  ▐█.▪ ▀▀   ██▀· ██▀▐█  ██  ██
-▐█▪·•▐█▌.▐█▐█▌.▐█▐█▪·• ▐█▌·  ▐█▌·     ▐█▪·• ██▌▐█  ██  ██
-.▀    ▀█▄▀▪ ▀█▄▀▪.▀    ▀▀▀   ▀▀▀      .▀    ▀▀ ▀▀  ▀▀  ▀▀
-            </pre>
-            <div class="bios-info-box">
-                <div class="line">POCKET-DIAL CORE BIOS V1.0.0 (C) 2026 GLOMAR GADAFFI</div>
-                <div class="line">TARGETS: XTENSA LX7 DUAL-CORE (ESP32-S3) / MSVC (WINDOWS) / GCC (LINUX)</div>
-                <div class="line">SYSTEM MEMORY: Hardened 8KB Stack Configured | lwIP Netif Binding Active</div>
-            </div>
-        </header>
-
-        <!-- MAIN LAYOUT INTERFACE -->
-        <main class="grid-container">
-            
-            <!-- LEFT COLUMN: INTERACTIVE CRT TERMINAL INTERFACE -->
-            <section class="cga-panel terminal-panel">
-                <div class="panel-header">
-                    <span>╔═ TERMINAL CORE TERMINATOR ════════════════════════════════════════════╗</span>
+        
+        <!-- HERO SECTION -->
+        <section class="hero-section">
+            <div class="hero-text-block">
+                <div class="status-indicator">
+                    <span class="pulse-dot"></span>
+                    <span>C++17 Core Hardened & Stable</span>
                 </div>
-                <div class="panel-content">
-                    <div class="terminal-body" id="terminal-screen">
-                        <div class="system-message">pocket-dial core initialized.</div>
-                        <div class="system-message">CGA console server listening on TCP/8080. SIP listening on UDP/5060.</div>
-                        <div class="system-message">Type <span class="highlight-yellow">help</span> to list active commands or <span class="highlight-cyan">dial &lt;extension&gt;</span> to initiate a SIP flow.</div>
+                <h1 class="hero-title">Minimalist SIP Server for Embedded & Desktop</h1>
+                <p class="hero-subtitle">
+                    A lightweight, robust SIP registrar and stateless proxy designed for flat trusted local networks. Point any SIP phone at the server to connect instantly—zero credential provisioning required.
+                </p>
+                <div class="hero-actions">
+                    <a href="#quickstart" class="btn btn-primary">Launch Quickstart</a>
+                    <a href="https://github.com/GlomarGadaffi/pocket-dial" target="_blank" class="btn btn-secondary">View GitHub Repository</a>
+                </div>
+            </div>
+
+            <!-- Sleek Screenshot Showcase Card -->
+            <div class="screenshot-showcase-container">
+                <div class="showcase-card">
+                    <div class="card-title-bar">
+                        <span class="dot red"></span>
+                        <span class="dot yellow"></span>
+                        <span class="dot green"></span>
+                        <span class="card-title-text">pocket-dial CGA CRT Console</span>
+                    </div>
+                    <img src="screenshot.png" alt="pocket-dial CGA CRT Dashboard Console Screenshot" class="showcase-img">
+                </div>
+            </div>
+        </section>
+
+        <!-- INTERACTIVE RETRO TERMINAL EMULATOR -->
+        <section class="terminal-section">
+            <div class="section-header-block">
+                <h2 class="section-title">Interactive Console Simulator</h2>
+                <p class="section-desc">
+                    Experience the retro CGA-styled console built directly into the server. Execute commands in-browser to interact with the mock SIP registry.
+                </p>
+            </div>
+
+            <div class="modern-terminal-wrapper">
+                <div class="terminal-header-bar">
+                    <div class="term-tabs">
+                        <span class="term-tab active">guest@pocket-dial: ~</span>
+                    </div>
+                    <span class="term-addr">TCP/8080 (Admin Portal)</span>
+                </div>
+                <div class="terminal-container-inner" id="terminal-screen">
+                    <div class="terminal-body-content">
+                        <div class="system-message">pocket-dial core server initialized.</div>
+                        <div class="system-message">CGA console server listening on port 8080. SIP listening on port 5060.</div>
+                        <div class="system-message">Type <span class="highlight-yellow">help</span> to list commands, or try <span class="highlight-cyan">dial 102</span> to view a SIP transaction simulation.</div>
                         <br>
                         <div class="terminal-output" id="terminal-output"></div>
                         <div class="terminal-input-line">
                             <span class="prompt">guest@pocket-dial:&gt;</span>
-                            <input type="text" id="terminal-input" autofocus autocomplete="off" spellcheck="false" placeholder="type a command...">
+                            <input type="text" id="terminal-input" autocomplete="off" spellcheck="false" placeholder="type help...">
                             <span class="blinking-cursor">█</span>
                         </div>
                     </div>
+                    <!-- Styled Scanline layer strictly inside terminal widget -->
+                    <div class="term-scanlines"></div>
                 </div>
-                <div class="panel-footer">
-                    <span>╚════════════════════════════════════════════════════════════════════════╝</span>
-                </div>
-            </section>
-
-            <!-- RIGHT COLUMN: SCREENSHOT MONITOR SHOWCASE -->
-            <section class="monitor-panel">
-                <div class="retro-monitor-bezel">
-                    <div class="monitor-inner-screen">
-                        <div class="crt-reflection"></div>
-                        <!-- Screenshot Display -->
-                        <img src="screenshot.png" alt="pocket-dial Dashboard Interface Screenshot" class="monitor-screenshot">
-                    </div>
-                    <!-- Physical Monitor Controls Bar -->
-                    <div class="monitor-controls">
-                        <div class="monitor-logo">CGA-CRT 5060</div>
-                        <div class="dial-group">
-                            <div class="dial-knob" title="BRIGHTNESS"></div>
-                            <div class="dial-knob" title="CONTRAST"></div>
-                        </div>
-                        <div class="power-group">
-                            <div class="power-led status-on"></div>
-                            <div class="power-button" id="monitor-power" title="POWER OFF/ON"></div>
-                        </div>
-                    </div>
-                </div>
-                
-                <!-- MINI DIAGNOSTICS STATS -->
-                <div class="cga-panel stats-panel">
-                    <div class="panel-header">
-                        <span>┌─ ACTIVE TRANS-RECEIVE STATUS ────────────────┐</span>
-                    </div>
-                    <div class="panel-content text-columns">
-                        <div class="stat-col">
-                            <div>STATIONS : <span class="highlight-green" id="stat-stations">4 REGISTERED</span></div>
-                            <div>SESSIONS : <span class="highlight-cyan" id="stat-sessions">1 ESTABLISHED</span></div>
-                        </div>
-                        <div class="stat-col">
-                            <div>UDP RECV : <span class="highlight-white" id="stat-recv">1,249 PKTS</span></div>
-                            <div>UDP SENT : <span class="highlight-white" id="stat-sent">1,245 PKTS</span></div>
-                        </div>
-                    </div>
-                    <div class="panel-footer">
-                        <span>└──────────────────────────────────────────────┘</span>
-                    </div>
-                </div>
-            </section>
-
-        </main>
-
-        <!-- HARDWARE MATRIX EXPLORER -->
-        <section class="cga-panel hardware-section">
-            <div class="panel-header">
-                <span>╔═ MULTI-BOARD CONFIGURATION ARCHIVE ═══════════════════════════════════════════════════════════════╗</span>
-            </div>
-            <div class="panel-content">
-                <div class="board-tabs-bar">
-                    <button class="board-tab active" data-board="t-eth-lite">1. LILYGO T-ETH-LITE S3 (W5500 SPI)</button>
-                    <button class="board-tab" data-board="t-poe-pro">2. LILYGO T-POE-PRO (LAN8720 RMII)</button>
-                    <button class="board-tab" data-board="waveshare-poe">3. WAVESHARE S3-ETH (W5500)</button>
-                    <button class="board-tab" data-board="standard-wifi">4. CYD / WIFI SOFTAP (WIRELESS)</button>
-                </div>
-
-                <div class="board-display-grid" id="board-info-container">
-                    <!-- Dynamic hardware details go here (populated by app.js) -->
-                </div>
-            </div>
-            <div class="panel-footer">
-                <span>╚═════════════════════════════════════════════════════════════════════════════════════════════════╝</span>
             </div>
         </section>
 
-        <!-- QUICKSTART & SPECIFICATIONS -->
-        <section class="cga-panel specs-section">
-            <div class="panel-header">
-                <span>╔═ CORE SYSTEM QUICKSTART ARCHITECTURE ═══════════════════════════════════════════════════════════════╗</span>
+        <!-- FEATURES SECTION -->
+        <section id="features" class="features-section">
+            <div class="section-header-block">
+                <h2 class="section-title">Core Performance Metrics</h2>
+                <p class="section-desc">
+                    High-efficiency engineering designed specifically to fit on resource-constrained microcontrollers and local host environments.
+                </p>
             </div>
-            <div class="panel-content specs-grid">
+
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="card-icon">🔑</div>
+                    <h3 class="feature-card-title">Zero-Friction Auth</h3>
+                    <p class="feature-card-text">
+                        Bypasses password validation by design. Just point any SIP endpoint or softphone at the registrar IP, register with any password, and establish calling instantly.
+                    </p>
+                </div>
+                <div class="feature-card">
+                    <div class="card-icon">🔊</div>
+                    <h3 class="feature-card-title">Direct RTP Media Flow</h3>
+                    <p class="feature-card-text">
+                        Voice data flows peer-to-peer directly between devices. The server handles only SIP signaling, ensuring minimal RAM consumption and low-latency audio transmission.
+                    </p>
+                </div>
+                <div class="feature-card">
+                    <div class="card-icon">⚡</div>
+                    <h3 class="feature-card-title">Hardened C++17 Core</h3>
+                    <p class="feature-card-text">
+                        Features memory-safe header parsing, bounded string modifications, and dynamic_cast failure handling to prevent Xtensa reboots or desktop crashes.
+                    </p>
+                </div>
+                <div class="feature-card">
+                    <div class="card-icon">🌐</div>
+                    <h3 class="feature-card-title">Multi-Platform Sockets</h3>
+                    <p class="feature-card-text">
+                        Utilizes standard POSIX socket abstractions on Linux, Winsock on Windows, and native lwIP wrappers on ESP32 (running in a dedicated FreeRTOS 8KB stack task).
+                    </p>
+                </div>
+            </div>
+        </section>
+
+        <!-- HARDWARE MATRIX EXPLORER -->
+        <section id="hardware" class="hardware-section">
+            <div class="section-header-block">
+                <h2 class="section-title">Multi-Board Spec Explorer</h2>
+                <p class="section-desc">
+                    Explore pre-configured physical pinouts and code initialization templates for the industry-leading ESP32 and Ethernet boards.
+                </p>
+            </div>
+
+            <div class="hardware-box">
+                <div class="board-tabs-bar">
+                    <button class="board-tab active" data-board="t-eth-lite">LilyGO T-ETH-Lite S3 (W5500 SPI)</button>
+                    <button class="board-tab" data-board="t-poe-pro">LilyGO T-POE-Pro (LAN8720 RMII)</button>
+                    <button class="board-tab" data-board="waveshare-poe">Waveshare S3-ETH (W5500)</button>
+                    <button class="board-tab" data-board="standard-wifi">ESP32 / CYD Wi-Fi AP (Wireless)</button>
+                </div>
+
+                <div class="board-display-grid" id="board-info-container">
+                    <!-- Dynamic hardware details populated by app.js -->
+                </div>
+            </div>
+        </section>
+
+        <!-- QUICKSTART & SECURITY ARCHITECTURE -->
+        <section id="quickstart" class="specs-section">
+            <div class="specs-grid">
                 
                 <!-- Quickstarts -->
                 <div class="spec-block">
-                    <div class="block-title">&gt; QUICKSTART BOOT (DESKTOP)</div>
-                    <p class="block-text">Automated compiler scripts configuration, execution, and web admin launching:</p>
+                    <h2 class="section-title">&gt;_ Quickstart Installation</h2>
+                    <p class="section-desc">Get the server running on your desktop with zero dependencies using our automated build scripts:</p>
                     
                     <div class="tab-group-os">
-                        <button class="os-tab active" data-os="win">WINDOWS</button>
-                        <button class="os-tab" data-os="nix">LINUX / MAC</button>
+                        <button class="os-tab active" data-os="win">Windows CMD</button>
+                        <button class="os-tab" data-os="nix">Linux / macOS Bash</button>
                     </div>
 
                     <div class="code-box-container" id="os-code-box">
@@ -153,37 +183,31 @@
                     </div>
                 </div>
 
-                <!-- Core Specs -->
+                <!-- Technical Notes -->
                 <div class="spec-block">
-                    <div class="block-title">&gt; CORE SECURITY ATTRIBUTES</div>
+                    <h2 class="section-title">🔐 Deployment Guidelines</h2>
+                    <p class="section-desc">Critical specifications for running in development and field deployments:</p>
+                    
                     <div class="security-list">
                         <div class="sec-item">
-                            <span class="highlight-yellow">[TRUST]</span>
-                            <strong>Zero-Friction Authentication:</strong> Bypasses credential check by design. Perfect for private lab testing, field deployments, or educational demos—point any phone at the IP, type any extension and *any password*, and register instantly.
+                            <span class="badge badge-trust">TRUST MODEL</span>
+                            <p><strong>Flat Trusted Networks:</strong> The zero-friction registrar trusts all local devices. This minimizes overhead, making it ideal for isolated labs, temporary networks, or rapid demonstrations.</p>
                         </div>
                         <div class="sec-item">
-                            <span class="highlight-cyan">[MEDIA]</span>
-                            <strong>Peer-to-Peer RTP Streams:</strong> Media/audio payloads are routed directly between the devices. The controller only handles SIP signaling, minimizing memory overhead and latency.
-                        </div>
-                        <div class="sec-item">
-                            <span class="highlight-red">[WARNING]</span>
-                            <strong>Isolated LAN Protection:</strong> Always run within local networks or secure VPN links. Do not bind or port-forward TCP 80/88/8080 or UDP 5060 to public WAN interfaces!
+                            <span class="badge badge-warning">SECURITY LIMIT</span>
+                            <p><strong>WAN Isolation:</strong> Do not bind or port-forward UDP port 5060 or TCP port 8080 to public internet interfaces. Always run within secure local subnets or isolated VPN segments.</p>
                         </div>
                     </div>
                 </div>
 
             </div>
-            <div class="panel-footer">
-                <span>╚═════════════════════════════════════════════════════════════════════════════════════════════════╝</span>
-            </div>
         </section>
 
-        <!-- FOOTER SYSTEM INFO -->
+        <!-- MINIMAL FOOTER -->
         <footer class="system-footer">
-            <div class="footer-line">════════════════════════════════════════════════════════════════════════════════════════════════════════════</div>
             <div class="footer-columns">
-                <div>SYSTEM STATUS: <span class="highlight-green">STABLE</span> | HOST: <span class="highlight-cyan">GITHUB-PAGES</span></div>
-                <div>PROJECT LICENSE: <span class="highlight-yellow">MIT</span> | SOURCE: <a href="https://github.com/GlomarGadaffi/pocket-dial" target="_blank" class="footer-link">GET CODE</a></div>
+                <div>pocket-dial project — v1.0.0. Licensed under <span class="highlight-white">MIT</span>.</div>
+                <div>Source code available on <a href="https://github.com/GlomarGadaffi/pocket-dial" target="_blank" class="footer-link">GitHub</a></div>
             </div>
         </footer>
 

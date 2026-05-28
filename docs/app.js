@@ -1,11 +1,11 @@
-// pocket-dial retro CGA CRT dashboard engine
+// pocket-dial modern minimal landing page engine
 
 // ==========================================================================
 // 1. HARDWARE PROFILES REGISTRY (ASCII & Pinouts)
 // ==========================================================================
 const HARDWARE_PROFILES = {
     't-eth-lite': {
-        title: "LILYGO T-ETH-Lite ESP32-S3 (W5500 via SPI)",
+        title: "LilyGO T-ETH-Lite S3 (W5500 via SPI)",
         desc: "Sleek ESP32-S3 board with onboard RJ45 wired SPI Ethernet. The hardware MAC is emulated in software via the W5500 driver over the SPI bus.",
         specs: {
             "Core CPU": "ESP32-S3 Xtensa LX7",
@@ -37,7 +37,7 @@ SPI.begin(ETH_SCLK_PIN, ETH_MISO_PIN, ETH_MOSI_PIN);
 ETH.begin(ETH_PHY_W5500, 1, ETH_CS_PIN, ETH_INT_PIN, ETH_RST_PIN, SPI);`
     },
     't-poe-pro': {
-        title: "LILYGO T-POE-Pro (LAN8720 via RMII)",
+        title: "LilyGO T-POE-Pro (LAN8720 via RMII)",
         desc: "High-performance ESP32 board with direct RMII PHY support and Power-over-Ethernet (PoE). Uses standard ESP32 hardware MAC for native speeds.",
         specs: {
             "Core CPU": "ESP32-WROVER-E LX6",
@@ -189,9 +189,6 @@ document.addEventListener("DOMContentLoaded", () => {
     // OS Tab Initialisation
     initQuickstartOSTabs();
 
-    // Monitor Power Toggle Button
-    initMonitorPower();
-
     // Terminal Emulator System
     initTerminalEmulator();
 });
@@ -215,12 +212,12 @@ function initHardwareExplorer() {
 
         container.innerHTML = `
             <div class="board-ascii-panel">
-                <div class="block-title">&gt; PHYSICAL PINOUT DESIGNATOR</div>
+                <div class="board-title">&gt; PHYSICAL PINOUT DESIGNATOR</div>
                 <pre class="ascii-frame">${board.ascii}</pre>
-                <p class="block-text" style="font-size:12px; margin-top:5px;">${board.desc}</p>
+                <p class="block-text" style="font-size:13px; margin-top:5px; color:var(--text-secondary);">${board.desc}</p>
             </div>
             <div class="board-details-panel">
-                <div class="block-title">&gt; TARGET ARCHIVE SPECIFICATIONS</div>
+                <div class="board-title">&gt; SPECIFICATIONS</div>
                 <div class="board-specs-table">
                     ${specsHtml}
                 </div>
@@ -253,8 +250,8 @@ window.copyCodeText = function(btn) {
     navigator.clipboard.writeText(codeBlock.innerText).then(() => {
         const origText = btn.innerText;
         btn.innerText = "COPIED!";
-        btn.style.borderColor = "var(--green)";
-        btn.style.color = "var(--green)";
+        btn.style.borderColor = "var(--primary)";
+        btn.style.color = "var(--primary)";
         setTimeout(() => {
             btn.innerText = origText;
             btn.style.borderColor = "";
@@ -284,8 +281,8 @@ function initQuickstartOSTabs() {
             const code = document.getElementById("os-code-content");
             navigator.clipboard.writeText(code.innerText).then(() => {
                 btn.innerText = "COPIED!";
-                btn.style.borderColor = "var(--green)";
-                btn.style.color = "var(--green)";
+                btn.style.borderColor = "var(--primary)";
+                btn.style.color = "var(--primary)";
                 setTimeout(() => {
                     btn.innerText = "COPY SCRIPT";
                     btn.style.borderColor = "";
@@ -304,29 +301,6 @@ function initQuickstartOSTabs() {
     });
 
     renderOS("win");
-}
-
-// --- MONITOR POWER CONTROL ---
-function initMonitorPower() {
-    const pButton = document.getElementById("monitor-power");
-    const pLed = document.querySelector(".power-led");
-    const screenshot = document.querySelector(".monitor-screenshot");
-
-    pButton.addEventListener("click", () => {
-        if (pLed.classList.contains("status-on")) {
-            // Power off
-            pLed.classList.remove("status-on");
-            screenshot.classList.add("power-off");
-            pButton.classList.add("off");
-            pButton.title = "POWER ON";
-        } else {
-            // Power on
-            pLed.classList.add("status-on");
-            screenshot.classList.remove("power-off");
-            pButton.classList.remove("off");
-            pButton.title = "POWER OFF";
-        }
-    });
 }
 
 // --- TERMINAL EMULATOR SHELL ---
@@ -371,7 +345,6 @@ function initTerminalEmulator() {
                 appendLine("--> SENDING BYE Transaction...", "highlight-red");
                 appendLine("<-- RECEIVING SIP/2.0 200 OK (Call Session Terminated)", "highlight-green");
                 appendLine("[MEDIA SESSION CLOSED]");
-                updateDiagnosticStats(4, 0);
             } else {
                 appendLine("Call session active. Type <span class='highlight-red'>bye</span> to terminate.", "highlight-yellow");
             }
@@ -384,7 +357,7 @@ function initTerminalEmulator() {
 
         switch (baseCmd) {
             case "help":
-                appendLine("┌── AVAILABLE MONOSPACE SHELL COMMANDS ──────────────────┐", "highlight-cyan");
+                appendLine("┌── AVAILABLE SIMULATED SHELL COMMANDS ────────────────┐", "highlight-cyan");
                 appendLine("  help        — Show this technical help directory");
                 appendLine("  registered  — Query registered local SIP endpoints");
                 appendLine("  sessions    — List status of all active call sessions");
@@ -394,7 +367,7 @@ function initTerminalEmulator() {
                 appendLine("  ver         — Output target firmware version credentials");
                 appendLine("  ascii       — Print physical phone ASCII graphic");
                 appendLine("  clear       — Wipe the buffer logs clean");
-                appendLine("└── Type dial 102 to initiate a simulated connection ────┘", "highlight-cyan");
+                appendLine("└── Try typing: dial 102 ──────────────────────────────┘", "highlight-cyan");
                 break;
 
             case "clear":
@@ -497,19 +470,6 @@ function initTerminalEmulator() {
             appendLine("[MEDIA SESSION ESTABLISHED: RTP Stream flowing peer-to-peer]", "highlight-yellow");
             appendLine("==========================================================", "highlight-yellow");
             appendLine("Simulated call active! Type <span class='highlight-red'>bye</span> to hang up.", "highlight-cyan");
-            updateDiagnosticStats(5, 2);
         }, 3600);
-    }
-
-    function updateDiagnosticStats(stations, sessions) {
-        document.getElementById("stat-stations").innerText = `${stations} REGISTERED`;
-        document.getElementById("stat-sessions").innerText = `${sessions} ACTIVE`;
-        
-        // Add random packet increments
-        const recv = parseInt(document.getElementById("stat-recv").innerText.replace(/,/g, "")) + Math.floor(Math.random() * 15 + 10);
-        const sent = parseInt(document.getElementById("stat-sent").innerText.replace(/,/g, "")) + Math.floor(Math.random() * 15 + 10);
-        
-        document.getElementById("stat-recv").innerText = recv.toLocaleString() + " PKTS";
-        document.getElementById("stat-sent").innerText = sent.toLocaleString() + " PKTS";
     }
 }
