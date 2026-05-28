@@ -1,18 +1,18 @@
 # pocket-dial
 
 > [!TIP]
-> **TL;DR (One-Line Curl Download & Run)**
-> * **Windows Command Prompt**:
->   ```cmd
->   curl -L https://github.com/GlomarGadaffi/pocket-dial/archive/refs/heads/main.zip -o pd.zip && tar -xf pd.zip && cd pocket-dial-main && quickstart.bat
->   ```
+> **TL;DR (Zero-Friction One-Line Installers)**
 > * **Linux / macOS Bash**:
 >   ```bash
->   curl -L https://github.com/GlomarGadaffi/pocket-dial/archive/refs/heads/main.zip -o pd.zip && tar -xf pd.zip && cd pocket-dial-main && chmod +x quickstart.sh && ./quickstart.sh
+>   curl -fsSL https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.sh | bash
+>   ```
+> * **Windows PowerShell**:
+>   ```powershell
+>   irm https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.ps1 | iex
 >   ```
 > * **ESP32 / CYD (Arduino)**: Open `sketches/SipServer/SipServer.ino` in Arduino IDE, hit **Upload**, connect to the `esp32-sipserver` AP, and open `http://192.168.4.1/`!
 > 
-> That's it! Running the one-liner automatically downloads the project, extracts the zip, runs the CMake configuration, compiles the binary, boots the SIP server, and opens the retro console dashboard in your browser.
+> That's it! Running the one-liner installer automatically downloads, extracts, compiles the C++17 core, launches the server, and fires up the dashboard in your default browser.
 
 A C++17 SIP registrar and stateless proxy designed for flat, trusted local networks. It runs on desktop environments (Windows/Linux) and embedded targets (ESP32-S3 via Wi-Fi or W5500 PoE Ethernet) and includes a CGA CRT retro-styled web administration console.
 
@@ -40,18 +40,18 @@ Forked and extended from [BarGabriel/SipServer](https://github.com/BarGabriel/Si
 
 ## Quickstart (Desktop)
 
-You can download, configure, build, and run the server with a **single, zero-dependency one-liner** using `curl` and `tar` (pre-installed natively on modern Windows, Linux, and macOS).
-
-### Windows (CMD)
-Open a standard Command Prompt and paste:
-```cmd
-curl -L https://github.com/GlomarGadaffi/pocket-dial/archive/refs/heads/main.zip -o pd.zip && tar -xf pd.zip && cd pocket-dial-main && quickstart.bat
-```
+You can download, configure, build, and run the server with a **single, zero-dependency one-liner installer**:
 
 ### Linux / macOS (Bash)
-Open a terminal and paste:
+Open a terminal and run:
 ```bash
-curl -L https://github.com/GlomarGadaffi/pocket-dial/archive/refs/heads/main.zip -o pd.zip && tar -xf pd.zip && cd pocket-dial-main && chmod +x quickstart.sh && ./quickstart.sh
+curl -fsSL https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.sh | bash
+```
+
+### Windows (PowerShell)
+Open a PowerShell terminal and run:
+```powershell
+irm https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.ps1 | iex
 ```
 
 ---

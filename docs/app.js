@@ -137,18 +137,18 @@ WiFi.softAP(ssid);`
 // 2. QUICKSTART OS INSTRUCTIONS REGISTRY
 // ==========================================================================
 const QUICKSTART_OS = {
-    'win': `> ONE-LINE DOWNLOAD & BOOT PIPELINE (Recommended)
-Paste this in a standard Windows Command Prompt (CMD):
+    'win': `> ONE-LINE INSTALLER PIPELINE (Recommended)
+Paste this in your Windows PowerShell terminal:
 -----------------------------------------------------------------
-curl -L https://github.com/GlomarGadaffi/pocket-dial/archive/refs/heads/main.zip -o pd.zip && tar -xf pd.zip && cd pocket-dial-main && quickstart.bat
+irm https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.ps1 | iex
 
 > LOCAL DEVELOPMENT ACTIONS (If cloned):
 -----------------------------------------------------------------
 C:\\pocket-dial> quickstart.bat`,
-    'nix': `> ONE-LINE DOWNLOAD & BOOT PIPELINE (Recommended)
+    'nix': `> ONE-LINE INSTALLER PIPELINE (Recommended)
 Paste this in your Linux / macOS Terminal (Bash):
 -----------------------------------------------------------------
-curl -L https://github.com/GlomarGadaffi/pocket-dial/archive/refs/heads/main.zip -o pd.zip && tar -xf pd.zip && cd pocket-dial-main && chmod +x quickstart.sh && ./quickstart.sh
+curl -fsSL https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.sh | bash
 
 > LOCAL DEVELOPMENT ACTIONS (If cloned):
 -----------------------------------------------------------------
