@@ -7,7 +7,9 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#elif defined _WIN32 || defined _WIN64
+#endif
+
+#if defined _WIN32 || defined _WIN64
 #include <WinSock2.h>
 #endif
 
@@ -16,6 +18,11 @@
 #include <atomic>
 #include <functional>
 #include <thread>
+
+#if defined(ESP_PLATFORM)
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#endif
 
 class UdpServer
 {
@@ -31,6 +38,7 @@ public:
 
 private:
 	void closeServer();
+	void receiveLoop();
 
 	std::string _ip;
 	int _port;
@@ -38,7 +46,12 @@ private:
 	sockaddr_in _servaddr;
 	OnNewMessageEvent _onNewMessageEvent;
 	std::atomic<bool> _keepRunning;
+
+#if defined(ESP_PLATFORM)
+	TaskHandle_t _receiverTaskHandle;
+#else
 	std::thread _receiverThread;
+#endif
 };
 
 #endif

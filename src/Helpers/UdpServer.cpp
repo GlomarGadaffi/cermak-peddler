@@ -46,28 +46,45 @@ UdpServer::~UdpServer()
 void UdpServer::startReceive()
 {
 	_keepRunning = true;
-	_receiverThread = std::thread([=]()
+#if defined(ESP_PLATFORM)
+	xTaskCreatePinnedToCore([](void* arg)
 		{
-			char buffer[BUFFER_SIZE];
-			sockaddr_in senderEndPoint;
-			senderEndPoint = {};
-			int len = sizeof(senderEndPoint);
-
-			while (_keepRunning)
-			{
-				senderEndPoint = {};
-				int bytesReceived;
-#if defined(__linux__) || defined(ESP_PLATFORM)
-				bytesReceived = static_cast<int>(recvfrom(_sockfd, buffer, BUFFER_SIZE, 0,
-					reinterpret_cast<struct sockaddr*>(&senderEndPoint), reinterpret_cast<socklen_t*>(&len)));
-#elif defined _WIN32 || defined _WIN64
-				bytesReceived = recvfrom(_sockfd, buffer, BUFFER_SIZE, 0,
-					reinterpret_cast<struct sockaddr*>(&senderEndPoint), &len);
+			static_cast<UdpServer*>(arg)->receiveLoop();
+			vTaskDelete(NULL);
+		},
+		"udp_receiver_task",
+		8192, // 8KB stack size to prevent C++ SIP parser overflows
+		this,
+		5,    // Priority
+		&_receiverTaskHandle,
+		0     // Pinned to Core 0
+	);
+#else
+	_receiverThread = std::thread([=]() { receiveLoop(); });
 #endif
-				if (!_keepRunning || bytesReceived <= 0) continue;
-				_onNewMessageEvent(std::string(buffer, static_cast<size_t>(bytesReceived)), senderEndPoint);
-			}
-		});
+}
+
+void UdpServer::receiveLoop()
+{
+	char buffer[BUFFER_SIZE];
+	sockaddr_in senderEndPoint;
+	senderEndPoint = {};
+	int len = sizeof(senderEndPoint);
+
+	while (_keepRunning)
+	{
+		senderEndPoint = {};
+		int bytesReceived;
+#if defined(__linux__) || defined(ESP_PLATFORM)
+		bytesReceived = static_cast<int>(recvfrom(_sockfd, buffer, BUFFER_SIZE, 0,
+			reinterpret_cast<struct sockaddr*>(&senderEndPoint), reinterpret_cast<socklen_t*>(&len)));
+#elif defined _WIN32 || defined _WIN64
+		bytesReceived = recvfrom(_sockfd, buffer, BUFFER_SIZE, 0,
+			reinterpret_cast<struct sockaddr*>(&senderEndPoint), &len);
+#endif
+		if (!_keepRunning || bytesReceived <= 0) continue;
+		_onNewMessageEvent(std::string(buffer, static_cast<size_t>(bytesReceived)), senderEndPoint);
+	}
 }
 
 int UdpServer::send(const struct sockaddr_in& address, const std::string& buffer)
@@ -85,7 +102,14 @@ void UdpServer::closeServer()
 #elif defined _WIN32 || defined _WIN64
 	closesocket(_sockfd);
 #endif
+
+#if defined(ESP_PLATFORM)
+	// Task deletes itself when _keepRunning becomes false and receiveLoop() exits.
+	// Give it a brief delay to terminate cleanly before UdpServer object is destroyed.
+	vTaskDelay(pdMS_TO_TICKS(10));
+#else
 	if (_receiverThread.joinable()) {
 		_receiverThread.join();
 	}
+#endif
 }
