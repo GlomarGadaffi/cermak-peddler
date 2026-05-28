@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **ESP32 UdpServer Shutdown Race (#5)**: `closeServer()` previously waited a fixed `vTaskDelay(10)` for the receive task to exit, which could return while `receiveLoop()` was still blocked in `recvfrom()` (500 ms `SO_RCVTIMEO`) and touching `UdpServer` members — a use-after-free. Now the receive task signals a binary semaphore on exit and `closeServer()` blocks on it (2 s backstop), mirroring `std::thread::join()` on desktop. Task/semaphore handles are value-initialized to `nullptr`.
+- **Dashboard Wi-Fi SSID XSS (#6)**: `renderWifiNetworks()` interpolated the scanned SSID into an inline `onclick="selectWifi('…')"` handler; `escapeHtml()` does not escape single quotes, so a crafted SSID could break out and execute on click. Rows are now built as DOM nodes with `textContent` and the click handler bound via `addEventListener` — the SSID never reaches markup as a string.
+- **Docs Terminal Self-XSS (#7)**: the simulated terminal in `docs/app.js` echoed raw user input into `innerHTML`. Added an `escapeHtml` helper and applied it to all user-controlled sinks (command echo, unknown-command name, dialed extension).
+- **Build Fix**: added missing `#include <atomic>` to `RequestsHandler.hpp` (used `std::atomic<uint64_t>` without the include; broke clean desktop builds).
+
+### Changed
+- **README Security Framing (#8)**: reverted the "Zero-Friction Authentication" copy that presented the no-auth design as a feature back to neutral, factual language, and added a prominent warning against exposing SIP/admin ports to the public Internet.
+
 ### Added
 - **W5500 Ethernet / PoE Server Support**:
     - Added `SipServerETH.ino` Arduino sketch for Waveshare ESP32-S3-ETH + PoE board. Initialises W5500 via `ETH.begin()` on ESP32 Arduino Core 3.x native W5500 support, DHCP with configurable static IP fallback, link status and speed monitoring.
