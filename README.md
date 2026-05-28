@@ -17,7 +17,7 @@ Forked and extended from [BarGabriel/SipServer](https://github.com/BarGabriel/Si
 ## Features
 
 ### 1. SIP Signaling & Call Setup
-* **User Registration**: Supports the `REGISTER` transaction. Saves registered endpoints dynamically in memory. Unregistration is handled via `expires=0`. Bypasses password validation for simplicity in flat trusted LAN environments.
+* **User Registration**: Supports the `REGISTER` transaction. Saves registered endpoints dynamically in memory. Unregistration is handled via `expires=0`. In private local networks, password validation is bypassed by design—your softphones will register successfully using *any* username and password combination you configure, making setup exceptionally simple and zero-friction.
 * **Stateless Proxy Routing**: Routes standard call setups via `INVITE`, `TRYING`, `RINGING`, `OK`, `ACK`, `CANCEL`, `BYE`, and error states (`486 Busy Here`, `480 Temporarily Unavailable`, `404 Not Found`).
 * **Direct RTP Flow**: Media (audio) flows peer-to-peer directly between endpoints, keeping the signaling server lightweight and suitable for constrained hardware.
 
@@ -184,7 +184,7 @@ pocket-dial/
 ## Security Specifications
 
 The server is designed for flat, private networks:
-* **No Authentication**: The registrar does not validate user credentials. **Do not expose SIP (UDP 5060) or administration (TCP 8080/80) ports directly to the public Internet.**
+* **Zero-Friction Authentication**: By design, the registrar does not validate user passwords. You can enter absolutely *anything* in your softphone's password field—pocket-dial is built to trust and accept your device immediately. This eliminates provisioning headaches on local networks while keeping the code highly performant and lightweight within your trusted LAN. (Just remember: **do not expose SIP (UDP 5060) or administration (TCP 8080/80) ports directly to the public Internet!**)
 * **Decentralized Media**: Voice packets flow peer-to-peer, keeping memory footprint low.
 
 ---
