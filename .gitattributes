@@ -1,0 +1,5 @@
+install.sh export-ignore
+install.ps1 export-ignore
+README.md export-ignore
+.gitattributes export-ignore
+.gitignore export-ignore
