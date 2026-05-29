@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **mDNS / Bonjour Broadcast (.local domain)**: Added native multicast DNS (mDNS) responder support (`pocketdial.local`). Integrates natively with `<ESPmDNS.h>` in Arduino environments and the built-in `mdns` component in ESP-IDF environments, while compiling out completely on desktop builds to keep them lightweight. Automatically registers `_sip._udp` (port 5060) and `_http._tcp` (port 80/8080) services.
+- **Active OPTIONS Keepalives & Aggressive Pruning**: The server now actively dispatches a standard, lightweight `OPTIONS` ping to each registered client every 5 seconds. If a client fails to send any traffic for 15 seconds, it is aggressively pruned from the registry, automatically tearing down any active call sessions involving that client.
+- **Throttled Tick Loop**: Introduced a public, thread-safe, throttled `tick()` method (throttled to at most once per second). On desktop, it is managed by a low-overhead background thread inside `SipServer`. On ESP32 (ESP-IDF and Arduino), it is integrated directly into existing Core 1 execution loops to conserve memory, consuming zero new FreeRTOS threads or stack RAM.
+- **Client-to-Server OPTIONS Handling**: Added support for incoming OPTIONS queries from clients, replying with a standard `200 OK` carrying the server's Contact header.
+
+### Fixed
+- **Raspberry Pi Shebang Execution (Issue #39)**: Normalized all shell scripts (`quickstart.sh`, `install.sh`) to Unix LF line endings without any UTF-8 BOM. Added `*.sh text eol=lf` to `.gitattributes` to permanently prevent line-ending corruption and shebang failures on Linux and Raspberry Pi environments.
+
+### Changed
+- **Simplified One-Line Installers**: Removed the cumbersome, rigid SHA-256 validation checks and hash variables from all installation pipelines (`install.sh`, `install.ps1`, `README.md`, and `docs/app.js`), allowing friction-free updates and easier copy-paste installations.
 - **HTTP Dashboard for Wired-Ethernet Arduino Sketches (#20)**: All three wired-Ethernet Arduino sketches (`SipServerETH`, `SipServer_T_ETH_Lite_W5500`, `SipServer_T_POE_Pro_LAN8720`) now instantiate and start `HttpServer` on port 80, bringing them to feature parity with the WiFi sketch. The dashboard URL is printed to Serial after startup.
 
 ### Fixed
