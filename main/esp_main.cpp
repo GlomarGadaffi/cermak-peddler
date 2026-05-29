@@ -80,6 +80,9 @@ void sip_server_task(void *pvParameters)
     try {
         g_sipServer = new SipServer(ip, port);
         while (1) {
+            if (g_sipServer) {
+                g_sipServer->getHandler().tick();
+            }
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
     } catch (const std::exception& e) {

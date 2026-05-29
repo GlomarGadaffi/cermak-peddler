@@ -179,12 +179,20 @@ static void sip_server_task(void* pvParameters)
         ESP_LOGI(TAG, "SIP server is RUNNING.  Point softphones at %s:%d",
                  s_ip_addr.c_str(), SIP_PORT);
 
+        unsigned long lastHeartbeat = 0;
         while (true)
         {
-            vTaskDelay(pdMS_TO_TICKS(30000));
-            ESP_LOGI(TAG, "Heartbeat — IP: %s  Uptime: %lus",
-                     s_ip_addr.c_str(),
-                     (unsigned long)(esp_timer_get_time() / 1000000));
+            if (g_sipServer) {
+                g_sipServer->getHandler().tick();
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            unsigned long nowSec = (unsigned long)(esp_timer_get_time() / 1000000);
+            if (nowSec - lastHeartbeat >= 30)
+            {
+                lastHeartbeat = nowSec;
+                ESP_LOGI(TAG, "Heartbeat — IP: %s  Uptime: %lus",
+                         s_ip_addr.c_str(), nowSec);
+            }
         }
     }
     catch (const std::exception& e)

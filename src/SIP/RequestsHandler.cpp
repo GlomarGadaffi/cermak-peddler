@@ -32,6 +32,7 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 void RequestsHandler::initHandlers()
 {
 	_handlers.emplace(SipMessageTypes::REGISTER,          std::bind(&RequestsHandler::onRegister,       this, std::placeholders::_1));
+	_handlers.emplace(SipMessageTypes::OPTIONS,           std::bind(&RequestsHandler::onOptions,        this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::CANCEL,            std::bind(&RequestsHandler::onCancel,         this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::INVITE,            std::bind(&RequestsHandler::onInvite,         this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::TRYING,            std::bind(&RequestsHandler::onTrying,         this, std::placeholders::_1));
@@ -51,6 +52,13 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		_outbox.clear();
+
+		auto client = findClientByAddress(request->getSource());
+		if (client.has_value())
+		{
+			client.value()->markActive();
+		}
+
 		maybeSweep();
 		auto it = _handlers.find(request->getType());
 		if (it != _handlers.end())
@@ -105,6 +113,17 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	// Echo the granted lease back in the Contact so the client knows when to refresh.
 	response->setContact(buildContact(fromNumber) + ";expires=" + std::to_string(grantedExpires));
 	endHandle(fromNumber, response);
+}
+
+void RequestsHandler::onOptions(std::shared_ptr<SipMessage> data)
+{
+	auto response = std::make_shared<SipMessage>(*data);
+	response->setHeader(SipMessageTypes::OK);
+	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	response->setVia(data->getVia() + ";received=" + activeIp);
+	response->setTo(data->getTo() + ";tag=" + IDGen::GenerateID(9));
+	response->setContact(buildContact(data->getFromNumber()));
+	_outbox.emplace_back(data->getSource(), std::move(response));
 }
 
 void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
@@ -188,6 +207,11 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 
 void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 {
+	if (data->getCSeq().find("OPTIONS") != std::string::npos)
+	{
+		return;
+	}
+
 	auto session = getSession(data->getCallID());
 	if (session.has_value())
 	{
@@ -368,9 +392,35 @@ void RequestsHandler::sweepExpired()
 	auto now = std::chrono::steady_clock::now();
 	for (auto it = _clients.begin(); it != _clients.end(); )
 	{
-		if (it->second->isExpired(now))
+		bool keepAliveTimedOut = (now - it->second->getLastActiveTime() > std::chrono::seconds(15));
+		bool leaseExpired = it->second->isExpired(now);
+
+		if (keepAliveTimedOut || leaseExpired)
 		{
-			std::cout << "Registration lease expired: " << it->first << '\n';
+			if (keepAliveTimedOut)
+			{
+				std::cout << "Pruning client due to missed OPTIONS keepalive pings: " << it->first << '\n';
+			}
+			else
+			{
+				std::cout << "Registration lease expired: " << it->first << '\n';
+			}
+
+			// Clean up sessions involving this client
+			std::string extension = it->first;
+			for (auto sit = _sessions.begin(); sit != _sessions.end(); )
+			{
+				bool involved = false;
+				if (sit->second->getSrc() && sit->second->getSrc()->getNumber() == extension)
+					involved = true;
+				if (sit->second->getDest() && sit->second->getDest()->getNumber() == extension)
+					involved = true;
+				if (involved)
+					sit = _sessions.erase(sit);
+				else
+					++sit;
+			}
+
 			it = _clients.erase(it);
 		}
 		else
@@ -516,4 +566,82 @@ size_t RequestsHandler::getSessionCount()
 {
 	std::lock_guard<std::mutex> lock(_mutex);
 	return _sessions.size();
+}
+
+void RequestsHandler::tick()
+{
+	auto now = std::chrono::steady_clock::now();
+	if (now - _lastTick < std::chrono::seconds(1))
+	{
+		return;
+	}
+	_lastTick = now;
+
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> localOutbox;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+		_outbox.clear();
+
+		sweepExpired();
+
+		for (auto& [number, client] : _clients)
+		{
+			if (now - client->getLastPingTime() >= std::chrono::seconds(5))
+			{
+				client->setLastPingTime(now);
+				auto ping = buildOptionsPing(client);
+				_outbox.emplace_back(client->getAddress(), std::move(ping));
+			}
+		}
+
+		localOutbox = std::move(_outbox);
+		_outbox.clear();
+	}
+
+	for (auto& event : localOutbox)
+	{
+		_onHandled(event.first, std::move(event.second));
+	}
+}
+
+std::optional<std::shared_ptr<SipClient>> RequestsHandler::findClientByAddress(const sockaddr_in& addr)
+{
+	for (auto& [num, client] : _clients)
+	{
+		if (client->getAddress().sin_addr.s_addr == addr.sin_addr.s_addr &&
+			client->getAddress().sin_port == addr.sin_port)
+		{
+			return client;
+		}
+	}
+	return {};
+}
+
+std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_ptr<SipClient>& client)
+{
+	std::string clientNum = client->getNumber();
+
+	char ipBuf[INET_ADDRSTRLEN]{};
+	inet_ntop(AF_INET, &client->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
+	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(client->getAddress().sin_port));
+
+	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
+
+	std::string callId = IDGen::GenerateID(16) + "@" + activeIp;
+	std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
+	std::string fromTag = IDGen::GenerateID(9);
+
+	std::ostringstream ss;
+	ss << "OPTIONS sip:" << clientNum << "@" << destIpPort << " SIP/2.0\r\n"
+	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
+	   << "To: <sip:" << clientNum << "@" << destIpPort << ">\r\n"
+	   << "From: <sip:server@" << srcIpPort << ">;tag=" << fromTag << "\r\n"
+	   << "Call-ID: " << callId << "\r\n"
+	   << "CSeq: 1 OPTIONS\r\n"
+	   << "Max-Forwards: 70\r\n"
+	   << "User-Agent: pocket-dial\r\n"
+	   << "Content-Length: 0\r\n\r\n";
+
+	return std::make_shared<SipMessage>(ss.str(), client->getAddress());
 }

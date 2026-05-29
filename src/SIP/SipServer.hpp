@@ -6,10 +6,16 @@
 #include "Session.hpp"
 #include "SipMessageFactory.hpp"
 
+#if !defined(ESP_PLATFORM) && !defined(ARDUINO)
+#include <thread>
+#include <atomic>
+#endif
+
 class SipServer
 {
 public:
-	SipServer(std::string ip, int port = 5060);
+	SipServer(std::string ip, int port = 5060, int httpPort = 80);
+	~SipServer();
 
 	// Dashboard access to the SIP engine state
 	RequestsHandler& getHandler() { return _handler; }
@@ -21,5 +27,11 @@ private:
 	UdpServer _socket;
 	RequestsHandler _handler;
 	SipMessageFactory _messagesFactory;
+
+#if !defined(ESP_PLATFORM) && !defined(ARDUINO)
+	std::thread _tickThread;
+	std::atomic<bool> _tickRunning{false};
+	void tickLoop();
+#endif
 };
 #endif

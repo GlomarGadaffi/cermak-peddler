@@ -24,6 +24,7 @@ public:
 		OnHandledEvent onHandledEvent);
 
 	void handle(std::shared_ptr<SipMessage> request);
+	void tick();
 
 	std::optional<std::shared_ptr<Session>> getSession(const std::string& callID);
 
@@ -40,6 +41,7 @@ private:
 
 	// SIP request handlers (camelCase to match C++ convention)
 	void onRegister(std::shared_ptr<SipMessage> data);
+	void onOptions(std::shared_ptr<SipMessage> data);
 	void onCancel(std::shared_ptr<SipMessage> data);
 	void onReqTerminated(std::shared_ptr<SipMessage> data);
 	void onInvite(std::shared_ptr<SipMessage> data);
@@ -63,6 +65,8 @@ private:
 	void maybeSweep();     // throttled sweep; caller must hold _mutex
 
 	std::optional<std::shared_ptr<SipClient>> findClient(const std::string& number);
+	std::optional<std::shared_ptr<SipClient>> findClientByAddress(const sockaddr_in& addr);
+	std::shared_ptr<SipMessage> buildOptionsPing(const std::shared_ptr<SipClient>& client);
 
 	void endHandle(const std::string& destNumber, std::shared_ptr<SipMessage> message);
 	std::string buildContact(const std::string& number) const;
@@ -82,6 +86,7 @@ private:
 	std::atomic<uint64_t> _packetsProcessed{0};
 
 	std::chrono::steady_clock::time_point _lastSweep{};
+	std::chrono::steady_clock::time_point _lastTick{};
 };
 
 #endif

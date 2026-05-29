@@ -27,11 +27,21 @@ public:
 	// Negotiated lease length echoed back to the client in the 200 OK.
 	int getExpiresSeconds() const;
 
+	// ── OPTIONS Keepalive tracking ───────────────────────────────────
+	void markActive();
+	std::chrono::steady_clock::time_point getLastActiveTime() const;
+
+	void setLastPingTime(std::chrono::steady_clock::time_point t);
+	std::chrono::steady_clock::time_point getLastPingTime() const;
+
 private:
 	std::string _number;
 	sockaddr_in _address;
 	int _expiresSeconds;
 	std::chrono::steady_clock::time_point _expiresAt;
+
+	std::chrono::steady_clock::time_point _lastActiveTime;
+	std::chrono::steady_clock::time_point _lastPingTime;
 };
 
 #endif

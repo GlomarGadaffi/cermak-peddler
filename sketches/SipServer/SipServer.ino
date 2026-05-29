@@ -93,6 +93,10 @@ void setup()
 
 void loop()
 {
+    if (server) {
+        server->getHandler().tick();
+    }
+
     // Print station count every 30 seconds for visibility
     static unsigned long lastPrint = 0;
     unsigned long now = millis();

@@ -199,6 +199,11 @@ void setup()
 // ── Loop ───────────────────────────────────────────────────────────────────
 void loop()
 {
+    if (server)
+    {
+        server->getHandler().tick();
+    }
+
     // Periodic heartbeat — link status + uptime
     static unsigned long lastPrint = 0;
     unsigned long now = millis();

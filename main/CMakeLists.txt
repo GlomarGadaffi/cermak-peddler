@@ -25,4 +25,4 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/SipSdpMessage.cpp"
                             "../src/SIP/SipServer.cpp"
                     INCLUDE_DIRS "../src/Helpers" "../src/SIP"
-                    REQUIRES nvs_flash lwip esp_netif esp_event freertos ${EXTRA_REQUIRES})
+                    REQUIRES nvs_flash lwip esp_netif esp_event freertos mdns ${EXTRA_REQUIRES})
