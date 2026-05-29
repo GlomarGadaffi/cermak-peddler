@@ -141,7 +141,11 @@ const QUICKSTART_OS = {
     'win': `> ONE-LINE INSTALLER PIPELINE (Recommended)
 Paste this in your Command Prompt, PowerShell, or Run dialog:
 -----------------------------------------------------------------
-powershell -c "& { $ErrorActionPreference='Stop'; $tag='v1.0.0'; $url=\\"https://github.com/GlomarGadaffi/pocket-dial/releases/download/$tag/pocket-dial-$tag.zip\\"; $tmp=Join-Path $env:TEMP ([guid]::NewGuid()); New-Item -ItemType Directory $tmp | Out-Null; $zip=Join-Path $tmp 'pd.zip'; Invoke-WebRequest $url -OutFile $zip; Expand-Archive $zip -DestinationPath $tmp; Set-Location (Join-Path $tmp 'pocket-dial-1.0.0'); .\\quickstart.bat }"
+# For Latest Stable Release:
+powershell -c "irm https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.ps1 | iex"
+
+# For Bleeding Edge (Most Recent Unreleased):
+powershell -c "$env:POCKET_DIAL_BRANCH='main'; irm https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.ps1 | iex"
 
 > LOCAL DEVELOPMENT ACTIONS (If cloned):
 -----------------------------------------------------------------
@@ -149,7 +153,11 @@ C:\\pocket-dial> quickstart.bat`,
     'nix': `> ONE-LINE INSTALLER PIPELINE (Recommended)
 Paste this in your Linux / macOS Terminal (Bash):
 -----------------------------------------------------------------
-sh -c 'set -eu; TAG=v1.0.0; URL="https://github.com/GlomarGadaffi/pocket-dial/releases/download/$TAG/pocket-dial-$TAG.zip"; T=$(mktemp -d); trap "rm -rf $T" EXIT; curl -fsSL "$URL" -o "$T/pd.zip"; unzip -q "$T/pd.zip" -d "$T"; cd "$T/pocket-dial-1.0.0" && chmod +x quickstart.sh && ./quickstart.sh'
+# For Latest Stable Release:
+curl -fsSL https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.sh | sh
+
+# For Bleeding Edge (Most Recent Unreleased):
+curl -fsSL https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.sh | sh -s main
 
 > LOCAL DEVELOPMENT ACTIONS (If cloned):
 -----------------------------------------------------------------

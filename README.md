@@ -4,13 +4,23 @@
 > [!TIP]
 > **TL;DR (Zero-Friction One-Line Installers)**
 > * **Linux / macOS Bash**:
->   ```bash
->   sh -c 'set -eu; TAG=v1.0.0; URL="https://github.com/GlomarGadaffi/pocket-dial/releases/download/$TAG/pocket-dial-$TAG.zip"; T=$(mktemp -d); trap "rm -rf $T" EXIT; curl -fsSL "$URL" -o "$T/pd.zip"; unzip -q "$T/pd.zip" -d "$T"; cd "$T/pocket-dial-1.0.0" && chmod +x quickstart.sh && ./quickstart.sh'
->   ```
+>   - **Latest Stable Release**:
+>     ```bash
+>     curl -fsSL https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.sh | sh
+>     ```
+>   - **Bleeding Edge (Unreleased)**:
+>     ```bash
+>     curl -fsSL https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.sh | sh -s main
+>     ```
 > * **Windows (CMD / PowerShell / Run Dialog)**:
->   ```cmd
->   powershell -c "& { $ErrorActionPreference='Stop'; $tag='v1.0.0'; $url=\"https://github.com/GlomarGadaffi/pocket-dial/releases/download/$tag/pocket-dial-$tag.zip\"; $tmp=Join-Path $env:TEMP ([guid]::NewGuid()); New-Item -ItemType Directory $tmp | Out-Null; $zip=Join-Path $tmp 'pd.zip'; Invoke-WebRequest $url -OutFile $zip; Expand-Archive $zip -DestinationPath $tmp; Set-Location (Join-Path $tmp 'pocket-dial-1.0.0'); .\quickstart.bat }"
->   ```
+>   - **Latest Stable Release**:
+>     ```cmd
+>     powershell -c "irm https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.ps1 | iex"
+>     ```
+>   - **Bleeding Edge (Unreleased)**:
+>     ```cmd
+>     powershell -c "$env:POCKET_DIAL_BRANCH='main'; irm https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.ps1 | iex"
+>     ```
 > * **ESP32 / CYD (Arduino)**: Open `sketches/SipServer/SipServer.ino` in Arduino IDE, hit **Upload**, connect to the `esp32-sipserver` AP, and open `http://192.168.4.1/`!
 > 
 > That's it! Running the one-liner installer automatically downloads, extracts, compiles the C++17 core, launches the server, and fires up the dashboard in your default browser.
@@ -44,16 +54,24 @@ Forked and extended from [BarGabriel/SipServer](https://github.com/BarGabriel/Si
 You can download, configure, build, and run the server with a **single, zero-dependency one-liner installer**:
 
 ### Linux / macOS (Bash)
-Open a terminal and run:
-```bash
-sh -c 'set -eu; TAG=v1.0.0; URL="https://github.com/GlomarGadaffi/pocket-dial/releases/download/$TAG/pocket-dial-$TAG.zip"; T=$(mktemp -d); trap "rm -rf $T" EXIT; curl -fsSL "$URL" -o "$T/pd.zip"; unzip -q "$T/pd.zip" -d "$T"; cd "$T/pocket-dial-1.0.0" && chmod +x quickstart.sh && ./quickstart.sh'
-```
+- **Latest Stable Release**:
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.sh | sh
+  ```
+- **Bleeding Edge (Most Recent Unreleased)**:
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.sh | sh -s main
+  ```
 
 ### Windows (CMD / PowerShell / Run Dialog)
-Open a terminal or run dialog and paste:
-```cmd
-powershell -c "& { $ErrorActionPreference='Stop'; $tag='v1.0.0'; $url=\"https://github.com/GlomarGadaffi/pocket-dial/releases/download/$tag/pocket-dial-$tag.zip\"; $tmp=Join-Path $env:TEMP ([guid]::NewGuid()); New-Item -ItemType Directory $tmp | Out-Null; $zip=Join-Path $tmp 'pd.zip'; Invoke-WebRequest $url -OutFile $zip; Expand-Archive $zip -DestinationPath $tmp; Set-Location (Join-Path $tmp 'pocket-dial-1.0.0'); .\quickstart.bat }"
-```
+- **Latest Stable Release**:
+  ```cmd
+  powershell -c "irm https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.ps1 | iex"
+  ```
+- **Bleeding Edge (Most Recent Unreleased)**:
+  ```cmd
+  powershell -c "$env:POCKET_DIAL_BRANCH='main'; irm https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.ps1 | iex"
+  ```
 
 ---
 
