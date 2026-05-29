@@ -6,7 +6,7 @@ $ErrorActionPreference = 'Stop'
 # Do NOT pipe this from a remote URL — that defeats the point.
 
 $tag      = 'v1.0.0'
-$expected = 'fbb2be731c2f61c42ea8287fa6da2958235851f05b91c61356ac834240d8d3ba'
+$expected = '423411c556378ab0725011a16df3d3fc8bb6f798af3bdc8263e48aee77ec3f5c'
 $url      = "https://github.com/GlomarGadaffi/pocket-dial/releases/download/$tag/pocket-dial-$tag.zip"
 
 $tmp = Join-Path $env:TEMP ([guid]::NewGuid())

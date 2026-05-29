@@ -9,7 +9,7 @@ set -eu
 # Read it, then run it locally, or use the one-liner in the README.
 
 TAG="v1.0.0"
-EXPECTED_SHA256="fbb2be731c2f61c42ea8287fa6da2958235851f05b91c61356ac834240d8d3ba"
+EXPECTED_SHA256="423411c556378ab0725011a16df3d3fc8bb6f798af3bdc8263e48aee77ec3f5c"
 URL="https://github.com/GlomarGadaffi/pocket-dial/releases/download/${TAG}/pocket-dial-${TAG}.zip"
 
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
