@@ -141,7 +141,7 @@ const QUICKSTART_OS = {
     'win': `> ONE-LINE INSTALLER PIPELINE (Recommended)
 Paste this in your Command Prompt, PowerShell, or Run dialog:
 -----------------------------------------------------------------
-powershell -c "& { $ErrorActionPreference='Stop'; $tag='v1.0.0'; $sha='423411c556378ab0725011a16df3d3fc8bb6f798af3bdc8263e48aee77ec3f5c'; $url=\\"https://github.com/GlomarGadaffi/pocket-dial/releases/download/$tag/pocket-dial-$tag.zip\\"; $tmp=Join-Path $env:TEMP ([guid]::NewGuid()); New-Item -ItemType Directory $tmp | Out-Null; $zip=Join-Path $tmp 'pd.zip'; Invoke-WebRequest $url -OutFile $zip; if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $sha) { throw 'checksum mismatch' }; Expand-Archive $zip -DestinationPath $tmp; Set-Location (Join-Path $tmp 'pocket-dial-1.0.0'); .\\quickstart.bat }"
+powershell -c "& { $ErrorActionPreference='Stop'; $tag='v1.0.0'; $url=\\"https://github.com/GlomarGadaffi/pocket-dial/releases/download/$tag/pocket-dial-$tag.zip\\"; $tmp=Join-Path $env:TEMP ([guid]::NewGuid()); New-Item -ItemType Directory $tmp | Out-Null; $zip=Join-Path $tmp 'pd.zip'; Invoke-WebRequest $url -OutFile $zip; Expand-Archive $zip -DestinationPath $tmp; Set-Location (Join-Path $tmp 'pocket-dial-1.0.0'); .\\quickstart.bat }"
 
 > LOCAL DEVELOPMENT ACTIONS (If cloned):
 -----------------------------------------------------------------
@@ -149,7 +149,7 @@ C:\\pocket-dial> quickstart.bat`,
     'nix': `> ONE-LINE INSTALLER PIPELINE (Recommended)
 Paste this in your Linux / macOS Terminal (Bash):
 -----------------------------------------------------------------
-sh -c 'set -eu; TAG=v1.0.0; SHA=423411c556378ab0725011a16df3d3fc8bb6f798af3bdc8263e48aee77ec3f5c; URL="https://github.com/GlomarGadaffi/pocket-dial/releases/download/$TAG/pocket-dial-$TAG.zip"; T=$(mktemp -d); trap "rm -rf $T" EXIT; curl -fsSL "$URL" -o "$T/pd.zip"; (command -v sha256sum >/dev/null && echo "$SHA  $T/pd.zip" | sha256sum -c -) || (command -v shasum >/dev/null && echo "$SHA  $T/pd.zip" | shasum -a 256 -c -) || { echo "checksum FAILED"; exit 1; }; unzip -q "$T/pd.zip" -d "$T"; cd "$T/pocket-dial-1.0.0" && chmod +x quickstart.sh && ./quickstart.sh'
+sh -c 'set -eu; TAG=v1.0.0; URL="https://github.com/GlomarGadaffi/pocket-dial/releases/download/$TAG/pocket-dial-$TAG.zip"; T=$(mktemp -d); trap "rm -rf $T" EXIT; curl -fsSL "$URL" -o "$T/pd.zip"; unzip -q "$T/pd.zip" -d "$T"; cd "$T/pocket-dial-1.0.0" && chmod +x quickstart.sh && ./quickstart.sh'
 
 > LOCAL DEVELOPMENT ACTIONS (If cloned):
 -----------------------------------------------------------------
