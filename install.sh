@@ -4,7 +4,7 @@ set -eu
 # default to latest stable release tag
 TAG="v1.1.0"
 ZIP_DIR="pocket-dial-1.1.0"
-URL="https://github.com/GlomarGadaffi/pocket-dial/releases/download/${TAG}/pocket-dial-${TAG}.zip"
+URL="https://github.com/GlomarGadaffi/pocket-dial/archive/refs/tags/${TAG}.zip"
 
 # check if we requested bleeding edge / unreleased
 REQ_BRANCH="${1:-${POCKET_DIAL_BRANCH:-}}"
