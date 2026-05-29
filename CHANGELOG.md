@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v1.1.0] - 2026-05-29
+
 ### Added
 - **mDNS / Bonjour Broadcast (.local domain)**: Added native multicast DNS (mDNS) responder support (`pocketdial.local`). Integrates natively with `<ESPmDNS.h>` in Arduino environments and the built-in `mdns` component in ESP-IDF environments, while compiling out completely on desktop builds to keep them lightweight. Automatically registers `_sip._udp` (port 5060) and `_http._tcp` (port 80/8080) services.
 - **Active OPTIONS Keepalives & Aggressive Pruning**: The server now actively dispatches a standard, lightweight `OPTIONS` ping to each registered client every 5 seconds. If a client fails to send any traffic for 15 seconds, it is aggressively pruned from the registry, automatically tearing down any active call sessions involving that client.
