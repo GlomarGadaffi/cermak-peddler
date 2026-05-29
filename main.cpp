@@ -1,4 +1,6 @@
 #include <iostream>
+#include <thread>
+#include <chrono>
 #include "SipServer.hpp"
 #include "HttpServer.hpp"
 #include "IPHelper.hpp"
@@ -48,6 +50,15 @@ int main(int argc, char** argv)
 
 		std::cout << "Press ENTER to stop...\n";
 		std::cin.get();
+
+		if (std::cin.eof())
+		{
+			std::cout << "Piped/non-interactive stdin detected. Running in daemon mode. Press Ctrl+C to stop...\n";
+			while (true)
+			{
+				std::this_thread::sleep_for(std::chrono::seconds(1));
+			}
+		}
 	}
 	catch (const cxxopts::OptionException& e)
 	{
