@@ -1,3 +1,4 @@
+// RequestsHandler.cpp: Issues #24 and #28 resolved.
 #include "RequestsHandler.hpp"
 #include <atomic>
 #include <sstream>
@@ -46,12 +47,24 @@ void RequestsHandler::initHandlers()
 void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 {
 	_packetsProcessed.fetch_add(1, std::memory_order_relaxed);
-	std::lock_guard<std::mutex> lock(_mutex);
-	maybeSweep();
-	auto it = _handlers.find(request->getType());
-	if (it != _handlers.end())
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> localOutbox;
 	{
-		it->second(std::move(request));
+		std::lock_guard<std::mutex> lock(_mutex);
+		_outbox.clear();
+		maybeSweep();
+		auto it = _handlers.find(request->getType());
+		if (it != _handlers.end())
+		{
+			it->second(std::move(request));
+		}
+		localOutbox = std::move(_outbox);
+		_outbox.clear();
+	}
+
+	// Issue #24 resolved: UDP socket syscall sendto is now executed outside the locked section to prevent lock contention.
+	for (auto& event : localOutbox)
+	{
+		_onHandled(event.first, std::move(event.second));
 	}
 }
 
@@ -78,7 +91,7 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	}
 	else
 	{
-		grantedExpires = std::max(MIN_EXPIRES, std::min(requestedExpires, MAX_EXPIRES));
+		grantedExpires = (std::max)(MIN_EXPIRES, (std::min)(requestedExpires, MAX_EXPIRES));
 		// Always update address so re-REGISTER after a NAT rebind works correctly
 		auto newClient = std::make_shared<SipClient>(data->getFromNumber(), data->getSource(), grantedExpires);
 		registerClient(std::move(newClient));
@@ -394,7 +407,7 @@ void RequestsHandler::endHandle(const std::string& destNumber, std::shared_ptr<S
 	auto destClient = findClient(destNumber);
 	if (destClient.has_value())
 	{
-		_onHandled(destClient.value()->getAddress(), std::move(message));
+		_outbox.emplace_back(destClient.value()->getAddress(), std::move(message));
 	}
 	else
 	{
@@ -402,7 +415,7 @@ void RequestsHandler::endHandle(const std::string& destNumber, std::shared_ptr<S
 		auto notFound = std::make_shared<SipMessage>(*message);
 		notFound->setHeader(SipMessageTypes::NOT_FOUND);
 		auto src = message->getSource();
-		_onHandled(src, std::move(notFound));
+		_outbox.emplace_back(src, std::move(notFound));
 	}
 }
 
@@ -445,16 +458,24 @@ std::vector<std::pair<std::string, std::string>> RequestsHandler::getActiveClien
 	return result;
 }
 
-std::vector<std::tuple<std::string, std::string, std::string>> RequestsHandler::getActiveSessions()
+std::vector<std::tuple<std::string, std::string, std::string, int>> RequestsHandler::getActiveSessions()
 {
 	std::lock_guard<std::mutex> lock(_mutex);
-	std::vector<std::tuple<std::string, std::string, std::string>> result;
+	std::vector<std::tuple<std::string, std::string, std::string, int>> result;
 	result.reserve(_sessions.size());
+	auto now = std::chrono::steady_clock::now();
 	for (const auto& [callID, session] : _sessions)
 	{
 		std::string caller = session->getSrc() ? session->getSrc()->getNumber() : "?";
 		std::string callee = session->getDest() ? session->getDest()->getNumber() : "?";
-		result.emplace_back(caller, callee, sessionStateToString(session->getState()));
+
+		int durationSec = 0;
+		if (session->getState() == Session::State::Connected)
+		{
+			durationSec = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
+				now - session->getStartTime()).count());
+		}
+		result.emplace_back(caller, callee, sessionStateToString(session->getState()), durationSec);
 	}
 	return result;
 }

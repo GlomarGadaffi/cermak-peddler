@@ -1,3 +1,4 @@
+// SipMessage.cpp: Issue #25 resolved.
 #include "SipMessage.hpp"
 #include "SipMessageTypes.h"
 #include <cstring>
@@ -179,6 +180,11 @@ void SipMessage::setHeader(std::string value)
 		_messageStr.replace(headerPos, _header.length(), value);
 	}
 	_header = std::move(value);
+	_type = _header.substr(0, _header.find(" "));
+	if (_type == "SIP/2.0")
+	{
+		_type = _header;
+	}
 }
 
 void SipMessage::setVia(std::string value)

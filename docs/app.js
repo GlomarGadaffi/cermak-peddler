@@ -136,11 +136,12 @@ WiFi.softAP(ssid);`
 // ==========================================================================
 // 2. QUICKSTART OS INSTRUCTIONS REGISTRY
 // ==========================================================================
+// docs/app.js: Issues #21 and #27 resolved.
 const QUICKSTART_OS = {
     'win': `> ONE-LINE INSTALLER PIPELINE (Recommended)
 Paste this in your Command Prompt, PowerShell, or Run dialog:
 -----------------------------------------------------------------
-powershell -c "irm https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.ps1 | iex"
+powershell -c "& { $ErrorActionPreference='Stop'; $tag='v1.0.0'; $sha='fbb2be731c2f61c42ea8287fa6da2958235851f05b91c61356ac834240d8d3ba'; $url=\\"https://github.com/GlomarGadaffi/pocket-dial/releases/download/$tag/pocket-dial-$tag.zip\\"; $tmp=Join-Path $env:TEMP ([guid]::NewGuid()); New-Item -ItemType Directory $tmp | Out-Null; $zip=Join-Path $tmp 'pd.zip'; Invoke-WebRequest $url -OutFile $zip; if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $sha) { throw 'checksum mismatch' }; Expand-Archive $zip -DestinationPath $tmp; Set-Location (Join-Path $tmp 'pocket-dial-1.0.0'); .\\quickstart.bat }"
 
 > LOCAL DEVELOPMENT ACTIONS (If cloned):
 -----------------------------------------------------------------
@@ -148,7 +149,7 @@ C:\\pocket-dial> quickstart.bat`,
     'nix': `> ONE-LINE INSTALLER PIPELINE (Recommended)
 Paste this in your Linux / macOS Terminal (Bash):
 -----------------------------------------------------------------
-curl -fsSL https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.sh | bash
+sh -c 'set -eu; TAG=v1.0.0; SHA=fbb2be731c2f61c42ea8287fa6da2958235851f05b91c61356ac834240d8d3ba; URL="https://github.com/GlomarGadaffi/pocket-dial/releases/download/$TAG/pocket-dial-$TAG.zip"; T=$(mktemp -d); trap "rm -rf $T" EXIT; curl -fsSL "$URL" -o "$T/pd.zip"; (command -v sha256sum >/dev/null && echo "$SHA  $T/pd.zip" | sha256sum -c -) || (command -v shasum >/dev/null && echo "$SHA  $T/pd.zip" | shasum -a 256 -c -) || { echo "checksum FAILED"; exit 1; }; unzip -q "$T/pd.zip" -d "$T"; cd "$T/pocket-dial-1.0.0" && chmod +x quickstart.sh && ./quickstart.sh'
 
 > LOCAL DEVELOPMENT ACTIONS (If cloned):
 -----------------------------------------------------------------
@@ -160,7 +161,7 @@ $ chmod +x quickstart.sh && ./quickstart.sh`
 // ==========================================================================
 const ORACLE_WORDS = [
     "God says the ethernet clock must be output on GPIO17.",
-    "Bypassing credentials prevents digital provisioning sins.",
+    "Accepting any credential prevents provisioning friction on trusted LANs.",
     "A 3KB stack is a pathway to load prohibited Xtensa reboots.",
     "We use double-line box drawings because standard borders lack soul.",
     "The W5500 SPI bus is pure, untainted by software handshakes.",

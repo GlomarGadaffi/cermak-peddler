@@ -998,8 +998,14 @@ R"rawhtml(
   }
 }
 
+// index_html.h: Issue #22 resolved. Ensure single quote is escaped as &#39; to match docs/app.js.
 function escapeHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 // Terminal input handling

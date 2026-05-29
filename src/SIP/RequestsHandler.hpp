@@ -29,7 +29,7 @@ public:
 
 	// ── Dashboard query API (thread-safe) ────────────────────────────
 	std::vector<std::pair<std::string, std::string>> getActiveClients();
-	std::vector<std::tuple<std::string, std::string, std::string>> getActiveSessions();
+	std::vector<std::tuple<std::string, std::string, std::string, int>> getActiveSessions();
 	void forceDisconnect(const std::string& extension);
 	uint64_t getPacketsProcessed() const;
 	size_t getClientCount();
@@ -67,12 +67,14 @@ private:
 	void endHandle(const std::string& destNumber, std::shared_ptr<SipMessage> message);
 	std::string buildContact(const std::string& number) const;
 
+	// RequestsHandler.hpp: Issues #24 and #28 resolved.
 	std::unordered_map<std::string, std::function<void(std::shared_ptr<SipMessage> request)>> _handlers;
 	std::unordered_map<std::string, std::shared_ptr<Session>>   _sessions;
 	std::unordered_map<std::string, std::shared_ptr<SipClient>> _clients;
 
 	std::mutex _mutex;
 	OnHandledEvent _onHandled;
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> _outbox;
 
 	std::string _serverIp;
 	int         _serverPort;

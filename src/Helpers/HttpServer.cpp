@@ -1,3 +1,4 @@
+// HttpServer.cpp: Issues #23 and #28 resolved.
 #include "HttpServer.hpp"
 #include "RequestsHandler.hpp"
 #include "index_html.h"
@@ -104,6 +105,15 @@ void HttpServer::acceptLoop()
 
 void HttpServer::handleClient(int clientSock)
 {
+	// Issue #23 resolved: Added SO_RCVTIMEO per-client socket timeout and capped Content-Length to 16KB to prevent Accept thread DoS
+#if defined _WIN32 || defined _WIN64
+	DWORD tv = 5000; // 5 seconds timeout
+	setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+#else
+	struct timeval tv{ .tv_sec = 5, .tv_usec = 0 };
+	setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+
 	// Heap-allocate the read buffer. On ESP32 the accept loop runs on a std::thread
 	// whose default pthread stack is ~3 KB; a 4 KB stack-local buffer would overflow
 	// on the first request. Using std::vector keeps the data on the heap.
@@ -139,6 +149,17 @@ void HttpServer::handleClient(int clientSock)
 			size_t contentLength = 0;
 			try { contentLength = static_cast<size_t>(std::stoul(raw.substr(valStart, valEnd - valStart))); }
 			catch (...) {}
+
+			// Cap total body we are willing to read (16 KB is generous for wifi passwords)
+			constexpr size_t MAX_BODY_BYTES = 16384;
+			if (contentLength > MAX_BODY_BYTES)
+			{
+				sendResponse(clientSock, 413, "Payload Too Large", "application/json",
+				             "{\"error\":\"request body exceeds 16 KB limit\"}");
+				closeSocket(clientSock);
+				return;
+			}
+
 			size_t headerEnd = raw.find("\r\n\r\n");
 			if (headerEnd != std::string::npos)
 			{
@@ -347,9 +368,24 @@ void HttpServer::sendApiStatus(int sock)
 	for (size_t i = 0; i < sessions.size(); i++)
 	{
 		if (i > 0) json << ",";
+		int durationSec = std::get<3>(sessions[i]);
+		int hrs = durationSec / 3600;
+		int mins = (durationSec % 3600) / 60;
+		int secs = durationSec % 60;
+		char durationBuf[32]{};
+		if (hrs > 0)
+		{
+			snprintf(durationBuf, sizeof(durationBuf), "%02d:%02d:%02d", hrs, mins, secs);
+		}
+		else
+		{
+			snprintf(durationBuf, sizeof(durationBuf), "%02d:%02d", mins, secs);
+		}
+
 		json << "{\"caller\":\"" << jsonEscape(std::get<0>(sessions[i]))
 		     << "\",\"callee\":\"" << jsonEscape(std::get<1>(sessions[i]))
-		     << "\",\"state\":\"" << jsonEscape(std::get<2>(sessions[i])) << "\"}";
+		     << "\",\"state\":\"" << jsonEscape(std::get<2>(sessions[i]))
+		     << "\",\"duration\":\"" << durationBuf << "\"}";
 	}
 	json << "]";
 

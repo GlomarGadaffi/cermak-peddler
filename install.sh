@@ -1,26 +1,38 @@
-#!/bin/bash
-set -e
+#!/bin/sh
+set -eu
 
 # pocket-dial Linux/macOS One-Line Installer
-# Pinned to the v1.0.0 release tag so this script always builds a known-good
-# version and is not affected by subsequent commits to main.
-RELEASE_TAG="v1.0.0"
-ARCHIVE_DIR="pocket-dial-1.0.0"
+# install.sh: Issue #21 resolved.
+# Trust root: the SHA-256 below.
+# The release asset is hashed BEFORE any code from it runs. Mismatch aborts.
+# Do NOT pipe this from a remote URL — that defeats the point.
+# Read it, then run it locally, or use the one-liner in the README.
 
-echo "==================================================="
-echo "          pocket-dial Installer Pipeline"
-echo "          Release: ${RELEASE_TAG}"
-echo "==================================================="
-echo "Downloading pocket-dial ${RELEASE_TAG} from GitHub..."
-curl -L "https://github.com/GlomarGadaffi/pocket-dial/archive/refs/tags/${RELEASE_TAG}.zip" -o pd_temp.zip
+TAG="v1.0.0"
+EXPECTED_SHA256="fbb2be731c2f61c42ea8287fa6da2958235851f05b91c61356ac834240d8d3ba"
+URL="https://github.com/GlomarGadaffi/pocket-dial/releases/download/${TAG}/pocket-dial-${TAG}.zip"
 
-echo "Extracting repository archive..."
-tar -xf pd_temp.zip
-rm pd_temp.zip
+T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+echo "Downloading pocket-dial ${TAG} ..."
+curl -fsSL "$URL" -o "$T/pd.zip"
 
-echo "Entering ${ARCHIVE_DIR} directory..."
-cd "${ARCHIVE_DIR}"
+echo "Verifying SHA-256 ..."
+if command -v sha256sum >/dev/null 2>&1; then
+    ACTUAL="$(sha256sum "$T/pd.zip" | cut -d' ' -f1)"
+elif command -v shasum >/dev/null 2>&1; then
+    ACTUAL="$(shasum -a 256 "$T/pd.zip" | cut -d' ' -f1)"
+else
+    echo "ERROR: no sha256sum/shasum available; cannot verify." >&2; exit 1
+fi
 
-echo "Configuring permissions and executing quickstart..."
-chmod +x quickstart.sh
-./quickstart.sh
+if [ "$ACTUAL" != "$EXPECTED_SHA256" ]; then
+    echo "ERROR: checksum mismatch — refusing to run." >&2
+    echo "  expected: $EXPECTED_SHA256" >&2
+    echo "  actual:   $ACTUAL"          >&2
+    exit 1
+fi
+
+echo "Checksum OK."
+unzip -q "$T/pd.zip" -d "$T"
+cd "$T/pocket-dial-1.0.0"
+chmod +x quickstart.sh && ./quickstart.sh

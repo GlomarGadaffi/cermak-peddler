@@ -1,7 +1,9 @@
+// Session.cpp: Issue #28 resolved.
 #include "Session.hpp"
 
 Session::Session(std::string callID, std::shared_ptr<SipClient> src) :
-	_callID(std::move(callID)), _src(src), _state(State::Invited)
+	_callID(std::move(callID)), _src(src), _state(State::Invited),
+	_startTime(std::chrono::steady_clock::now())
 {
 }
 
@@ -12,6 +14,7 @@ void Session::setState(State state)
 	_state = state;
 	if (state == State::Connected)
 	{
+		_startTime = std::chrono::steady_clock::now(); // Reset start time to when talk time begins
 		if (!_dest)
 		{
 			std::cerr << "Session::setState(Connected): destination not set for call " << _callID << '\n';
@@ -44,4 +47,9 @@ std::shared_ptr<SipClient> Session::getDest() const
 Session::State Session::getState() const
 {
 	return _state;
+}
+
+std::chrono::steady_clock::time_point Session::getStartTime() const
+{
+	return _startTime;
 }
