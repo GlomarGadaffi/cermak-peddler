@@ -14,10 +14,24 @@ if [ "$REQ_BRANCH" = "main" ] || [ "$REQ_BRANCH" = "unreleased" ]; then
     ZIP_DIR="pocket-dial-main"
 fi
 
+# check if --service flag is present
+INSTALL_SERVICE=false
+for arg in "$@"; do
+    if [ "$arg" = "--service" ]; then
+        INSTALL_SERVICE=true
+    fi
+done
+
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 echo "Downloading pocket-dial..."
 curl -fsSL "$URL" -o "$T/pd.zip"
 
 unzip -q "$T/pd.zip" -d "$T"
 cd "$T/$ZIP_DIR"
-chmod +x quickstart.sh && ./quickstart.sh
+chmod +x quickstart.sh
+
+if [ "$INSTALL_SERVICE" = true ]; then
+    ./quickstart.sh --service
+else
+    ./quickstart.sh
+fi

@@ -58,9 +58,17 @@ You can download, configure, build, and run the server with a **single, zero-dep
   ```bash
   curl -fsSL https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.sh | sh
   ```
+- **Latest Stable Release (Install as Systemd Service)**:
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.sh | sh -s --service
+  ```
 - **Bleeding Edge (Most Recent Unreleased)**:
   ```bash
   curl -fsSL https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.sh | sh -s main
+  ```
+- **Bleeding Edge (Install as Systemd Service)**:
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/GlomarGadaffi/pocket-dial/main/install.sh | sh -s main --service
   ```
 
 ### Windows (CMD / PowerShell / Run Dialog)
@@ -86,9 +94,14 @@ quickstart.bat
 ```
 
 ### Linux / macOS (Bash)
-```bash
-chmod +x quickstart.sh && ./quickstart.sh
-```
+- **Run Interactive Application**:
+  ```bash
+  chmod +x quickstart.sh && ./quickstart.sh
+  ```
+- **Install Natively as Systemd Service**:
+  ```bash
+  chmod +x quickstart.sh && ./quickstart.sh --service
+  ```
 ```bash
 mkdir build
 cd build
