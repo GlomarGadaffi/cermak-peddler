@@ -15,21 +15,115 @@
  *   - Live scrolling console terminal on the bottom of the screen showing system logs
  *
  * Board Settings:
- *   - Board: ESP32S3 Dev Module
- *   - PSRAM: OPI PSRAM (Mandatory for AXS15231B display)
- *   - Flash Size: 16MB (128Mb)
+ *   - Board:           ESP32S3 Dev Module
+ *   - PSRAM:           OPI PSRAM  (MANDATORY — the 320x480x16 canvas needs ~307 KB)
+ *   - Flash Size:      16MB (128Mb)
+ *   - Flash Mode:      QIO 80MHz
  *   - USB CDC On Boot: Enabled
- *   - Flash Mode: QIO 80MHz
  *
  * Required Libraries:
- *   - JC3248W535EN-Touch-LCD (by AudunKodehode)
- *   - Arduino_GFX_Library (by Moon On Our Nation - dependency)
+ *   - GFX Library for Arduino  (Arduino_GFX, by moononournation) >= 1.4.x
+ *   - QRCode  (by ricmoo)  — for the Wi-Fi QR screen
+ *
+ * Display stack (Issue #40 fix):
+ *   The previous JC3248W535EN-Touch-LCD library wraps Arduino_GFX internally but
+ *   exposes no flush(). Replacing it with the raw Arduino_GFX + Arduino_Canvas +
+ *   gfx->flush() pattern (proven in AXS15231B_CanvasTest) fixes the blank screen.
+ *   Touch is replaced with a direct CST816S I2C poll (SDA 4, SCL 8, addr 0x15).
  */
 
+#include <Arduino_GFX_Library.h>
+#include <Wire.h>
+#include <qrcode.h>       // ricmoo/QRCode
 #include <WiFi.h>
-#include <JC3248W535EN-Touch-LCD.h>
 #include "SipServer.hpp"
 #include "HttpServer.hpp"
+
+// ── JC3248W535EN QSPI pin map ────────────────────────────────────────────────
+#define TFT_CS   45
+#define TFT_SCK  47
+#define TFT_D0   21
+#define TFT_D1   48
+#define TFT_D2   40
+#define TFT_D3   39
+#define TFT_BL    1   // backlight; some revisions also use GPIO 19
+
+// ── Proven display stack (Issue #40) ─────────────────────────────────────────
+Arduino_DataBus *bus       = new Arduino_ESP32QSPI(TFT_CS, TFT_SCK, TFT_D0, TFT_D1, TFT_D2, TFT_D3);
+Arduino_GFX    *raw_panel  = new Arduino_AXS15231B(bus, GFX_NOT_DEFINED /*RST*/, 0 /*rotation*/, true /*IPS*/, 320, 480);
+Arduino_GFX    *gfx        = new Arduino_Canvas(320, 480, raw_panel, 0, 0);
+
+// ── CST816S capacitive touch (I2C) ───────────────────────────────────────────
+#define TOUCH_SDA  4
+#define TOUCH_SCL  8
+#define CST816S_ADDR 0x15
+
+static bool cst816s_read(uint16_t& tx, uint16_t& ty)
+{
+    Wire.beginTransmission(CST816S_ADDR);
+    Wire.write(0x01);  // start at GestureID register
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom((uint8_t)CST816S_ADDR, (uint8_t)6) < 6) return false;
+    Wire.read();                         // gesture ID
+    uint8_t fingers = Wire.read();       // finger count
+    uint8_t xh = Wire.read();
+    uint8_t xl = Wire.read();
+    uint8_t yh = Wire.read();
+    uint8_t yl = Wire.read();
+    if (fingers == 0 || fingers > 5) return false;
+    tx = ((uint16_t)(xh & 0x0F) << 8) | xl;
+    ty = ((uint16_t)(yh & 0x0F) << 8) | yl;
+    return true;
+}
+
+// ── GfxWrapper — drop-in replacement for JC3248W535EN screen.* calls ─────────
+// Keeps every draw-function call site identical; only this wrapper changes.
+struct GfxWrapper {
+    uint16_t _color = 0xFFFF;
+
+    bool begin() { return gfx->begin(); }
+
+    void clear(uint8_t r, uint8_t g, uint8_t b) {
+        gfx->fillScreen(gfx->color565(r, g, b));
+    }
+    void setColor(uint8_t r, uint8_t g, uint8_t b) {
+        _color = gfx->color565(r, g, b);
+    }
+    void drawFillRect(int16_t x, int16_t y, int16_t w, int16_t h) {
+        gfx->fillRect(x, y, w, h, _color);
+    }
+    void drawRect(int16_t x, int16_t y, int16_t w, int16_t h) {
+        gfx->drawRect(x, y, w, h, _color);
+    }
+    void prt(const char* s, int16_t x, int16_t y, uint8_t scale) {
+        gfx->setTextSize(scale);
+        gfx->setTextColor(_color);
+        gfx->setCursor(x, y);
+        gfx->print(s);
+    }
+    void prt(const String& s, int16_t x, int16_t y, uint8_t scale) {
+        prt(s.c_str(), x, y, scale);
+    }
+    bool getTouchPoint(uint16_t& x, uint16_t& y) {
+        return cst816s_read(x, y);
+    }
+    // drawQRCode: compatible signature with JC3248W535EN library
+    void drawQRCode(const char* text, int16_t x, int16_t y, uint8_t scale,
+                    uint8_t bgR, uint8_t bgG, uint8_t bgB,
+                    uint8_t fgR, uint8_t fgG, uint8_t fgB)
+    {
+        QRCode qrcode;
+        uint8_t qrcodeData[qrcode_getBufferSize(5)];  // version 5 — fits 64 byte strings
+        qrcode_initText(&qrcode, qrcodeData, 5, ECC_LOW, text);
+        uint16_t bg = gfx->color565(bgR, bgG, bgB);
+        uint16_t fg = gfx->color565(fgR, fgG, fgB);
+        gfx->fillRect(x, y, qrcode.size * scale, qrcode.size * scale, bg);
+        for (uint8_t qy = 0; qy < qrcode.size; qy++)
+            for (uint8_t qx = 0; qx < qrcode.size; qx++)
+                if (qrcode_getModule(&qrcode, qx, qy))
+                    gfx->fillRect(x + qx * scale, y + qy * scale, scale, scale, fg);
+    }
+};
 
 // ── Wi-Fi AP Configuration ──────────────────────────────────────────────────
 static constexpr const char* AP_SSID        = "esp32-sipserver";
@@ -42,12 +136,7 @@ static constexpr const char* SIP_BIND_IP    = "192.168.4.1";
 static constexpr int         SIP_PORT       = 5060;
 static constexpr int         HTTP_PORT      = 80;
 
-// ── Battery monitor (Issue #46) ───────────────────────────────────────────────
-// The JC3248W535EN exposes battery voltage on GPIO 5 through an on-board divider.
-// BATTERY_DIVIDER is the divider ratio (Vbat / Vadc); 2.0 assumes a 1:1 (e.g.
-// 100k/100k) divider — verify against your board revision and adjust.
-// analogReadMilliVolts() uses the ESP32-S3 eFuse ADC calibration, so it already
-// returns the pin voltage in mV; we only multiply by the divider ratio.
+// ── Battery monitor (Issue #46) ──────────────────────────────────────────────
 static constexpr int    BATTERY_ADC_PIN  = 5;
 static constexpr float  BATTERY_DIVIDER  = 2.0f;
 static constexpr unsigned long BATTERY_READ_INTERVAL_MS = 10000;
@@ -55,11 +144,11 @@ static float         batteryVolts   = 0.0f;
 static int           batteryPercent = -1;
 static unsigned long lastBatteryRead = 0;
 
-// ── Globals ─────────────────────────────────────────────────────────────────
+// ── Globals ──────────────────────────────────────────────────────────────────
 static SipServer*  server     = nullptr;
 static HttpServer* httpServer = nullptr;
-static JC3248W535EN* screenPtr = nullptr;
-#define screen (*screenPtr)
+static GfxWrapper  screenObj;
+static GfxWrapper& screen = screenObj;
 static bool displayActive = false;
 
 // ── Themes and UI State ─────────────────────────────────────────────────────
@@ -72,12 +161,8 @@ enum Theme {
 
 static Theme currentTheme = THEME_CGA_BLUE;
 
-// RGB Color Struct (using the library's setColor RGB args)
-struct RGBColor {
-    uint8_t r, g, b;
-};
+struct RGBColor { uint8_t r, g, b; };
 
-// Color palettes for the themes
 struct Palette {
     RGBColor bg;
     RGBColor text;
@@ -147,44 +232,36 @@ void drawRebootConfirm();
 void handleTouch(uint16_t x, uint16_t y);
 void readBattery();
 
-// ── Log Handler Helper ──────────────────────────────────────────────────────
+// ── Log Handler Helper ───────────────────────────────────────────────────────
 void addLogLine(const String& line) {
     Serial.println("[LOG] " + line);
-    
-    // Add to circular buffer
+
     logHistory[logIndex] = line;
     logIndex = (logIndex + 1) % MAX_LOG_LINES;
-    if (totalLogLines < MAX_LOG_LINES) {
-        totalLogLines++;
-    }
-    
-    // If we are currently displaying the dashboard, update only the terminal area
-    if (currentViewState == VIEW_DASHBOARD) {
-        // Redraw console terminal frame and lines
+    if (totalLogLines < MAX_LOG_LINES) totalLogLines++;
+
+    if (currentViewState == VIEW_DASHBOARD && displayActive) {
         const Palette& p = PALETTES[currentTheme];
-        
-        // Terminal background clear
+
+        // Redraw only the console terminal area (no full-screen flush needed)
         screen.setColor(p.bg.r, p.bg.g, p.bg.b);
         screen.drawFillRect(12, 321, 296, 148);
-        
-        // Draw logs text
+
         screen.setColor(p.text.r, p.text.g, p.text.b);
         int printIdx = (logIndex - totalLogLines + MAX_LOG_LINES) % MAX_LOG_LINES;
         for (int i = 0; i < totalLogLines; i++) {
             screen.prt(logHistory[printIdx].c_str(), 18, 326 + (i * 20), 1);
             printIdx = (printIdx + 1) % MAX_LOG_LINES;
         }
+        gfx->flush();  // push log-area update to panel
     }
 }
 
-// ── Battery monitor (Issue #46) ───────────────────────────────────────────────
+// ── Battery monitor (Issue #46) ──────────────────────────────────────────────
 void readBattery() {
-    // analogReadMilliVolts() applies the chip's eFuse ADC calibration and returns
-    // the pin voltage in mV; scale by the divider ratio to recover Vbat.
     uint32_t mv = analogReadMilliVolts(BATTERY_ADC_PIN);
     batteryVolts = (mv * BATTERY_DIVIDER) / 1000.0f;
 
-    // Rough single-cell Li-ion mapping (4.20 V full … 3.30 V empty), clamped.
     float pct = (batteryVolts - 3.30f) / (4.20f - 3.30f) * 100.0f;
     if (pct < 0)   pct = 0;
     if (pct > 100) pct = 100;
@@ -193,9 +270,6 @@ void readBattery() {
     Serial.printf("[BATT] %.2f V (%d%%)\n", batteryVolts, batteryPercent);
 }
 
-// Battery readout in the top-right of the header bar. The header is filled with
-// the border colour, so we clear our small corner to that colour then print the
-// value in the background colour to match the rest of the header text.
 void drawBatteryHeader() {
     if (!displayActive || batteryPercent < 0) return;
     const Palette& p = PALETTES[currentTheme];
@@ -207,50 +281,43 @@ void drawBatteryHeader() {
     screen.prt(b, 234, 10, 1);
 }
 
-// ── UI Drawing Orchestrator ─────────────────────────────────────────────────
+// ── UI Drawing Orchestrator ──────────────────────────────────────────────────
 void redrawUI() {
     const Palette& p = PALETTES[currentTheme];
     screen.clear(p.bg.r, p.bg.g, p.bg.b);
-    
+
     switch (currentViewState) {
-        case VIEW_DASHBOARD:
-            drawDashboard();
-            break;
-        case VIEW_WIFI_QR:
-            drawWiFiQR();
-            break;
-        case VIEW_REBOOT_CONFIRM:
-            drawRebootConfirm();
-            break;
+        case VIEW_DASHBOARD:    drawDashboard();    break;
+        case VIEW_WIFI_QR:      drawWiFiQR();       break;
+        case VIEW_REBOOT_CONFIRM: drawRebootConfirm(); break;
     }
+
+    gfx->flush();  // push the completed frame to the panel
 }
 
 // Draw Dashboard Screen
 void drawDashboard() {
     const Palette& p = PALETTES[currentTheme];
-    
+
     // 1. Header Bar
     screen.setColor(p.border.r, p.border.g, p.border.b);
     screen.drawFillRect(0, 0, 320, 32);
-    screen.setColor(p.bg.r, p.bg.g, p.bg.b); // Text stands out against block header
+    screen.setColor(p.bg.r, p.bg.g, p.bg.b);
     screen.prt("══ POCKET-DIAL SWITCHBOARD ══", 10, 10, 1);
-    drawBatteryHeader(); // Issue #46: battery readout, top-right of the header
+    drawBatteryHeader();
 
     // 2. Status Box
     screen.setColor(p.border.r, p.border.g, p.border.b);
-    // Draw Box Borders (Double line effect via offset)
     screen.drawRect(10, 42, 300, 150);
     screen.drawRect(11, 43, 298, 148);
-    
+
     screen.setColor(p.highlight.r, p.highlight.g, p.highlight.b);
     screen.prt("☼ SYSTEM STATUS", 20, 50, 1);
-    
-    // Status text values will be updated by active loop, draw labels now
+
     screen.setColor(p.text.r, p.text.g, p.text.b);
     screen.prt("Server IP : 192.168.4.1", 20, 72, 1);
     screen.prt("SIP Port  : 5060", 20, 92, 1);
-    
-    // Interactive state lines (drawn dynamically)
+
     char buf[64];
     unsigned long uptimeMs = millis();
     unsigned long hrs = uptimeMs / 3600000;
@@ -258,38 +325,35 @@ void drawDashboard() {
     unsigned long secs = (uptimeMs % 60000) / 1000;
     sprintf(buf, "Uptime    : %02lu:%02lu:%02lu", hrs, mins, secs);
     screen.prt(buf, 20, 112, 1);
-    
+
     int stations = WiFi.softAPgetStationNum();
     sprintf(buf, "Stations  : %d connected", stations);
     screen.prt(buf, 20, 132, 1);
-    
+
     int clients = server ? server->getHandler().getClientCount() : 0;
     sprintf(buf, "Extensions: %d active", clients);
     screen.prt(buf, 20, 152, 1);
-    
+
     int sessions = server ? server->getHandler().getSessionCount() : 0;
     sprintf(buf, "Sessions  : %d active", sessions);
     screen.prt(buf, 20, 172, 1);
-    
+
     // 3. Interactive Buttons Area
-    // Button 1: [ SHOW WI-FI QR ]
     screen.setColor(p.btnActive.r, p.btnActive.g, p.btnActive.b);
     screen.drawFillRect(15, 202, 290, 36);
-    screen.setColor(0, 0, 0); // High contrast dark text on active green btn
+    screen.setColor(0, 0, 0);
     screen.prt("[ TAP FOR WI-FI QR CODE ]", 45, 212, 1);
-    
-    // Button 2: [ COLOR ]
+
     screen.setColor(p.highlight.r, p.highlight.g, p.highlight.b);
     screen.drawFillRect(15, 248, 140, 32);
     screen.setColor(0, 0, 0);
     screen.prt("[ COLOR ]", 45, 258, 1);
-    
-    // Button 3: [ REBOOT ]
+
     screen.setColor(p.alert.r, p.alert.g, p.alert.b);
     screen.drawFillRect(165, 248, 140, 32);
     screen.setColor(255, 255, 255);
     screen.prt("[ REBOOT ]", 195, 258, 1);
-    
+
     // 4. Console Logs Box
     screen.setColor(p.border.r, p.border.g, p.border.b);
     screen.drawRect(10, 295, 300, 178);
@@ -297,8 +361,7 @@ void drawDashboard() {
     screen.drawFillRect(15, 298, 290, 20);
     screen.setColor(p.bg.r, p.bg.g, p.bg.b);
     screen.prt("═══ Live Console Logs ═══", 45, 302, 1);
-    
-    // Draw logs text lines
+
     screen.setColor(p.text.r, p.text.g, p.text.b);
     int printIdx = (logIndex - totalLogLines + MAX_LOG_LINES) % MAX_LOG_LINES;
     for (int i = 0; i < totalLogLines; i++) {
@@ -310,34 +373,26 @@ void drawDashboard() {
 // Draw Wi-Fi AP QR Code Screen
 void drawWiFiQR() {
     const Palette& p = PALETTES[currentTheme];
-    
-    // Header
+
     screen.setColor(p.border.r, p.border.g, p.border.b);
     screen.drawFillRect(0, 0, 320, 32);
     screen.setColor(p.bg.r, p.bg.g, p.bg.b);
     screen.prt("═══ Wi-Fi Quick Join QR ═══", 20, 10, 1);
-    
-    // Draw QR code background wrapper
+
     screen.setColor(255, 255, 255);
     screen.drawFillRect(30, 60, 260, 260);
-    
-    // Generate and draw the QR code for open network connection
-    // WIFI:S:<SSID>;T:<nopass>;P:<PASSWORD>;;
+
     String qrString = "WIFI:S:" + String(AP_SSID) + ";T:nopass;;";
-    
-    // drawQRCode(text, x, y, scale, bgR, bgG, bgB, fgR, fgG, fgB)
     screen.drawQRCode(qrString.c_str(), 45, 75, 5, 255, 255, 255, 0, 0, 0);
-    
-    // Helper Text
+
     screen.setColor(p.highlight.r, p.highlight.g, p.highlight.b);
     screen.prt("Scan with your phone to", 35, 340, 1);
     screen.prt("connect to SoftAP automatically.", 12, 360, 1);
-    
+
     screen.setColor(p.text.r, p.text.g, p.text.b);
     screen.prt("SSID: " + String(AP_SSID), 30, 395, 1);
     screen.prt("Pass: (None - Open)", 30, 415, 1);
-    
-    // Close Button Tap Indicator
+
     screen.setColor(p.btnActive.r, p.btnActive.g, p.btnActive.b);
     screen.drawFillRect(15, 440, 290, 32);
     screen.setColor(0, 0, 0);
@@ -347,83 +402,74 @@ void drawWiFiQR() {
 // Draw Hardware Reboot Confirmation Screen
 void drawRebootConfirm() {
     const Palette& p = PALETTES[currentTheme];
-    
-    // Draw Box
+
     screen.setColor(p.alert.r, p.alert.g, p.alert.b);
     screen.drawRect(20, 120, 280, 220);
     screen.drawRect(21, 121, 278, 218);
     screen.drawFillRect(25, 123, 270, 40);
-    
-    // Header Text
+
     screen.setColor(255, 255, 255);
     screen.prt("☣ SYSTEM WARNING ☣", 45, 133, 1);
-    
+
     screen.setColor(p.text.r, p.text.g, p.text.b);
     screen.prt("Are you sure you want to", 35, 190, 1);
     screen.prt("reboot the SIP PBX board?", 35, 210, 1);
-    
-    // YES Button
+
     screen.setColor(p.alert.r, p.alert.g, p.alert.b);
     screen.drawFillRect(40, 260, 100, 40);
     screen.setColor(255, 255, 255);
     screen.prt("YES", 75, 272, 1);
-    
-    // NO Button
+
     screen.setColor(p.border.r, p.border.g, p.border.b);
     screen.drawFillRect(180, 260, 100, 40);
     screen.setColor(0, 0, 0);
     screen.prt("NO", 215, 272, 1);
 }
 
-// ── Capacitive Touch Coordinator ───────────────────────────────────────────
+// ── Capacitive Touch Coordinator ─────────────────────────────────────────────
 void handleTouch(uint16_t x, uint16_t y) {
     Serial.printf("[TOUCH] Pressed at X: %d, Y: %d\n", x, y);
-    
+
     if (currentViewState == VIEW_WIFI_QR) {
-        // Any tap closes the QR overlay
         currentViewState = VIEW_DASHBOARD;
         redrawUI();
-        delay(200); // Debounce
+        delay(200);
         return;
     }
-    
+
     if (currentViewState == VIEW_REBOOT_CONFIRM) {
-        // YES Button: X: 40..140, Y: 260..300
         if (x >= 40 && x <= 140 && y >= 260 && y <= 300) {
             screen.clear(0, 0, 0);
             screen.setColor(255, 50, 50);
             screen.prt("Rebooting PBX...", 65, 220, 2);
+            gfx->flush();
             Serial.println("[SYSTEM] Hard resetting board!");
             delay(1000);
             ESP.restart();
-        }
-        // NO Button: X: 180..280, Y: 260..300
-        else if (x >= 180 && x <= 280 && y >= 260 && y <= 300) {
+        } else if (x >= 180 && x <= 280 && y >= 260 && y <= 300) {
             currentViewState = VIEW_DASHBOARD;
             redrawUI();
-            delay(200); // Debounce
+            delay(200);
         }
         return;
     }
-    
+
     if (currentViewState == VIEW_DASHBOARD) {
-        // Button 1: [ SHOW WI-FI QR ] -> X: 15..305, Y: 202..238
+        // [ SHOW WI-FI QR ] — Y: 202..238
         if (x >= 15 && x <= 305 && y >= 202 && y <= 238) {
             currentViewState = VIEW_WIFI_QR;
             redrawUI();
             delay(200);
             return;
         }
-        
-        // Button 2: [ COLOR ] -> X: 15..155, Y: 248..280
+        // [ COLOR ] — X: 15..155, Y: 248..280
         if (x >= 15 && x <= 155 && y >= 248 && y <= 280) {
             currentTheme = (Theme)((currentTheme + 1) % THEME_COUNT);
             redrawUI();
             delay(200);
             return;
         }
-        
-        // Button 3: [ REBOOT ] -> X: 165..305, Y: 248..280
+        // [ REBOOT ] — X: 165..305, Y: 248..280
         if (x >= 165 && x <= 305 && y >= 248 && y <= 280) {
             currentViewState = VIEW_REBOOT_CONFIRM;
             redrawUI();
@@ -433,12 +479,10 @@ void handleTouch(uint16_t x, uint16_t y) {
     }
 }
 
-// ── Setup ──────────────────────────────────────────────────────────────────
+// ── Setup ─────────────────────────────────────────────────────────────────────
 void setup()
 {
     Serial.begin(115200);
-    
-    // Give CDC JTAG a small delay to connect
     delay(1000);
 
     Serial.println();
@@ -448,62 +492,55 @@ void setup()
     Serial.println("╚══════════════════════════════════════╝");
     Serial.println();
 
-    // Initialize Backlight pins (Pin 1 and Pin 19 for different board revisions)
-    pinMode(1, OUTPUT);
-    digitalWrite(1, HIGH);
-    pinMode(19, OUTPUT);
-    digitalWrite(19, HIGH);
+    // Backlight — drive both pins; different board revisions use one or the other
+    pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, HIGH);
+    pinMode(19, OUTPUT);     digitalWrite(19, HIGH);
 
-    // Print PSRAM diagnostics
     Serial.printf("[SYSTEM] PSRAM found: %s\n", psramFound() ? "YES" : "NO");
-    Serial.printf("[SYSTEM] Free PSRAM: %d KB\n", ESP.getFreePsram() / 1024);
-    Serial.printf("[SYSTEM] Free Heap: %d KB\n", ESP.getFreeHeap() / 1024);
+    Serial.printf("[SYSTEM] Free PSRAM: %d KB\n", (int)(ESP.getFreePsram() / 1024));
+    Serial.printf("[SYSTEM] Free Heap: %d KB\n",  (int)(ESP.getFreeHeap() / 1024));
+    if (!psramFound())
+        Serial.println("[SYSTEM] WARNING: OPI PSRAM not detected. "
+                       "The 307 KB canvas will fail. Set Tools > PSRAM = OPI PSRAM.");
 
-    // ── 1. Initialise the JC3248W535 Smart Display ──────────────────────────
-    Serial.println("[GFX] Instantiating screen in safe setup context...");
-    screenPtr = new JC3248W535EN();
+    // ── 1. Initialise Touch I2C ─────────────────────────────────────────────
+    Wire.begin(TOUCH_SDA, TOUCH_SCL);
+    Serial.println("[TOUCH] CST816S I2C initialised (SDA=4, SCL=8, addr=0x15).");
 
-    Serial.println("[GFX] Initialising screen...");
+    // ── 2. Initialise Display (Arduino_GFX stack) ───────────────────────────
+    Serial.println("[GFX] Starting Arduino_GFX + Canvas stack (Issue #40 fix)...");
     displayActive = screen.begin();
     if (!displayActive) {
-        Serial.println("[GFX] WARNING: Smart display initialization failed! Proceeding with headless operation.");
-        // Re-force backlight HIGH in case library cleared it
-        pinMode(1, OUTPUT);
-        digitalWrite(1, HIGH);
-        pinMode(19, OUTPUT);
+        Serial.println("[GFX] WARNING: gfx->begin() returned false! "
+                       "Check OPI PSRAM setting and QSPI pin map. Running headless.");
+        // Re-assert backlight in case begin() toggled it
+        digitalWrite(TFT_BL, HIGH);
         digitalWrite(19, HIGH);
+    } else {
+        Serial.println("[GFX] begin() OK.");
     }
-    
-    // Initialize circular logs buffer
-    for (int i = 0; i < MAX_LOG_LINES; i++) {
-        logHistory[i] = "";
-    }
-    
+
+    for (int i = 0; i < MAX_LOG_LINES; i++) logHistory[i] = "";
     currentViewState = VIEW_DASHBOARD;
-    if (displayActive) {
-        redrawUI();
-    }
-    
+    if (displayActive) redrawUI();
+
     addLogLine("Display Initialized.");
     addLogLine("AXS15231B LCD Active.");
     addLogLine("CST816S Touch Polling.");
-    
-    // ── 2. Start Wi-Fi Access Point ─────────────────────────────────────────
+
+    // ── 3. Start Wi-Fi Access Point ─────────────────────────────────────────
     addLogLine("Starting WiFi SoftAP...");
     WiFi.mode(WIFI_AP);
     WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL, 0, AP_MAX_CLIENTS);
-
     delay(500);
 
-    IPAddress apIP = WiFi.softAPIP();
     char wifiLog[64];
-    sprintf(wifiLog, "AP Ready. IP: %s", apIP.toString().c_str());
-    addLogLine(wifiLog);
-    
-    // ── 3. Start SIP PBX Server ─────────────────────────────────────────────
-    sprintf(wifiLog, "Binding SIP to %s:%d...", SIP_BIND_IP, SIP_PORT);
+    sprintf(wifiLog, "AP Ready. IP: %s", WiFi.softAPIP().toString().c_str());
     addLogLine(wifiLog);
 
+    // ── 4. Start SIP PBX Server ─────────────────────────────────────────────
+    sprintf(wifiLog, "Binding SIP to %s:%d...", SIP_BIND_IP, SIP_PORT);
+    addLogLine(wifiLog);
     try {
         server = new SipServer(std::string(SIP_BIND_IP), SIP_PORT);
         addLogLine("SIP PBX Server is RUNNING.");
@@ -512,7 +549,7 @@ void setup()
         while (true) { delay(1000); }
     }
 
-    // ── 4. Start HTTP Web Dashboard ─────────────────────────────────────────
+    // ── 5. Start HTTP Web Dashboard ─────────────────────────────────────────
     addLogLine("Starting Web server...");
     try {
         httpServer = new HttpServer(std::string(SIP_BIND_IP), HTTP_PORT, server->getHandler());
@@ -523,113 +560,92 @@ void setup()
     }
 
     addLogLine("System ready for calls.");
-    Serial.println("────────────────────────────────────────────────────────────────────");
+    Serial.println("──────────────────────────────────────────────────────────");
 }
 
-// ── Main Loop ──────────────────────────────────────────────────────────────
+// ── Main Loop ─────────────────────────────────────────────────────────────────
 void loop()
 {
     // 1. Tick SIP Server logic
-    if (server) {
-        server->getHandler().tick();
-    }
+    if (server) server->getHandler().tick();
 
-    // 2. Poll Capacitive Touch Screen
+    // 2. Poll Capacitive Touch
     uint16_t touchX = 0, touchY = 0;
-    if (screen.getTouchPoint(touchX, touchY)) {
-        // Touch detected
+    if (screen.getTouchPoint(touchX, touchY))
         handleTouch(touchX, touchY);
-    }
 
-    // 3. Status updates, change detection, and periodic logs
+    // 3. Periodic battery sample
     unsigned long now = millis();
-
-    // Battery monitor (Issue #46): sample on an interval; first pass fires at boot.
     if (lastBatteryRead == 0 || now - lastBatteryRead >= BATTERY_READ_INTERVAL_MS) {
         lastBatteryRead = now;
         readBattery();
     }
 
-    // Check Wi-Fi Client connections
+    // 4. Wi-Fi station change detection
     int currentStations = WiFi.softAPgetStationNum();
     if (currentStations != prevStations) {
         if (prevStations != -1) {
-            if (currentStations > prevStations) {
+            if (currentStations > prevStations)
                 addLogLine("Station connected! Total: " + String(currentStations));
-            } else {
+            else
                 addLogLine("Station disconnected! Total: " + String(currentStations));
-            }
         }
         prevStations = currentStations;
     }
 
-    // Check Registered SIP extensions
-        int currentExtensions = server->getHandler().getClientCount();
-        if (currentExtensions != prevExtensions) {
-            if (prevExtensions != -1) {
-                if (currentExtensions > prevExtensions) {
-                    addLogLine("SIP extension registered!");
-                } else {
-                    addLogLine("SIP extension de-registered!");
-                }
-            }
-            prevExtensions = currentExtensions;
+    // 5. SIP extension / session change detection
+    int currentExtensions = server->getHandler().getClientCount();
+    if (currentExtensions != prevExtensions) {
+        if (prevExtensions != -1) {
+            addLogLine(currentExtensions > prevExtensions
+                       ? "SIP extension registered!" : "SIP extension de-registered!");
         }
+        prevExtensions = currentExtensions;
+    }
 
-        // Check active call sessions
-        int currentSessions = server->getHandler().getSessionCount();
-        if (currentSessions != prevSessions) {
-            if (prevSessions != -1) {
-                if (currentSessions > prevSessions) {
-                    addLogLine("VoIP Session established!");
-                } else {
-                    addLogLine("VoIP Session terminated.");
-                }
-            }
-            prevSessions = currentSessions;
+    int currentSessions = server->getHandler().getSessionCount();
+    if (currentSessions != prevSessions) {
+        if (prevSessions != -1) {
+            addLogLine(currentSessions > prevSessions
+                       ? "VoIP Session established!" : "VoIP Session terminated.");
         }
+        prevSessions = currentSessions;
+    }
 
-    // Dynamic partial screen updates for status values
-    if (currentViewState == VIEW_DASHBOARD) {
-        const Palette& p = PALETTES[currentTheme];
-        
-        // Update Uptime every second
+    // 6. Partial status-area update every second
+    if (currentViewState == VIEW_DASHBOARD && displayActive) {
         unsigned long uptimeSec = now / 1000;
         if (uptimeSec != prevUptimeSec) {
             prevUptimeSec = uptimeSec;
-            
-            // Clear only the values column area
+            const Palette& p = PALETTES[currentTheme];
+
             screen.setColor(p.bg.r, p.bg.g, p.bg.b);
-            screen.drawFillRect(110, 105, 185, 80); // Clear values area
-            
+            screen.drawFillRect(110, 105, 185, 80);
+
             screen.setColor(p.text.r, p.text.g, p.text.b);
             char buf[64];
-            
-            // Redraw Uptime
-            unsigned long hrs = uptimeSec / 3600;
+
+            unsigned long hrs  = uptimeSec / 3600;
             unsigned long mins = (uptimeSec % 3600) / 60;
             unsigned long secs = uptimeSec % 60;
             sprintf(buf, "%02lu:%02lu:%02lu", hrs, mins, secs);
             screen.prt(buf, 110, 112, 1);
-            
-            // Redraw Stations
+
             sprintf(buf, "%d connected", currentStations);
             screen.prt(buf, 110, 132, 1);
-            
-            // Redraw Extensions
+
             int clients = server ? server->getHandler().getClientCount() : 0;
             sprintf(buf, "%d active", clients);
             screen.prt(buf, 110, 152, 1);
-            
-            // Redraw Sessions
+
             int sessions = server ? server->getHandler().getSessionCount() : 0;
             sprintf(buf, "%d active", sessions);
             screen.prt(buf, 110, 172, 1);
 
-            drawBatteryHeader(); // Issue #46: keep the header readout current
+            drawBatteryHeader();
+            gfx->flush();  // push status-area partial update to panel
         }
     }
 
-    // Yield control / Small loop delay
     delay(30);
 }
