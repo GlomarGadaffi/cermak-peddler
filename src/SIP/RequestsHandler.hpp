@@ -69,6 +69,14 @@ private:
 	std::optional<std::shared_ptr<SipClient>> findClientByAddress(const sockaddr_in& addr);
 	std::shared_ptr<SipMessage> buildOptionsPing(const std::shared_ptr<SipClient>& client);
 
+	// Broadcast / all-page extension (Issue #37). All assume the caller holds _mutex.
+	void startPaging(std::shared_ptr<SipMessage> invite, std::shared_ptr<SipClient> caller);
+	void handlePagingAnswer(const std::shared_ptr<Session>& session, std::shared_ptr<SipMessage> data);
+	std::shared_ptr<SipMessage> buildCancel(const std::shared_ptr<SipMessage>& invite,
+		const std::shared_ptr<SipClient>& target);
+	std::shared_ptr<SipMessage> buildPagingBye(const std::shared_ptr<SipMessage>& ok,
+		const std::shared_ptr<SipClient>& answerer);
+
 	// Issue #38: per-source-IP token bucket + optional allowlist. Both helpers
 	// assume the caller already holds _mutex.
 	bool ipAllowed(const sockaddr_in& src) const;

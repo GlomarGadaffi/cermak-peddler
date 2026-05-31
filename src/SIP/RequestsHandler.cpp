@@ -31,6 +31,13 @@
 // Optional allowlist, e.g. -DPOCKETDIAL_ALLOW_CIDR=\"192.168.1.0/24\". Undefined =
 // accept every source (rate limiting still applies).
 
+// Issue #37: virtual broadcast / all-page extension. An INVITE addressed here is
+// forked to every other registered endpoint; the first to answer wins. Reserve
+// this number — do not register a real client under it. Override with -D.
+#ifndef POCKETDIAL_PAGE_EXTENSION
+#define POCKETDIAL_PAGE_EXTENSION "999"
+#endif
+
 namespace
 {
 	// Default lease granted when a REGISTER does not request one (seconds).
@@ -54,6 +61,12 @@ namespace
 	bool isLiveCall(Session::State s)
 	{
 		return s == Session::State::Connected;
+	}
+
+	// True if two endpoints are the same IPv4 socket (address + port).
+	bool addrEqual(const sockaddr_in& a, const sockaddr_in& b)
+	{
+		return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
 	}
 }
 
@@ -250,6 +263,13 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// Issue #37: an INVITE to the virtual page extension fans out to everyone.
+	if (data->getToNumber() == POCKETDIAL_PAGE_EXTENSION)
+	{
+		startPaging(std::move(data), caller.value());
+		return;
+	}
+
 	// Check if the called is registered
 	auto called = findClient(data->getToNumber());
 	if (!called.has_value())
@@ -281,6 +301,54 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	endHandle(data->getToNumber(), response);
 }
 
+// Issue #37: fork the caller's INVITE to every other registered endpoint.
+void RequestsHandler::startPaging(std::shared_ptr<SipMessage> data, std::shared_ptr<SipClient> caller)
+{
+	// A page is still a call — require SDP, same as a normal INVITE.
+	if (!data->hasSdp())
+	{
+		auto bad = std::make_shared<SipMessage>(*data);
+		bad->setHeader(SipMessageTypes::BAD_REQUEST);
+		bad->setContact(buildContact(caller->getNumber()));
+		endHandle(caller->getNumber(), bad);
+		return;
+	}
+
+	auto session = std::make_shared<Session>(data->getCallID(), caller);
+	session->setPaging(true);
+	session->setPagingInvite(data);   // retained so we can CANCEL losers later
+
+	int targets = 0;
+	for (auto& [number, client] : _clients)
+	{
+		if (number == caller->getNumber())
+		{
+			continue;   // don't page the caller back to themselves
+		}
+		session->addPagedTarget(client);
+
+		// Forward the caller's INVITE verbatim (SDP intact) to this endpoint.
+		auto fork = std::make_shared<SipMessage>(*data);
+		fork->setContact(buildContact(caller->getNumber()));
+		_outbox.emplace_back(client->getAddress(), std::move(fork));
+		++targets;
+	}
+
+	if (targets == 0)
+	{
+		// Nobody else is registered — tell the caller there's no one to reach.
+		auto nf = std::make_shared<SipMessage>(*data);
+		nf->setHeader(SipMessageTypes::NOT_FOUND);
+		nf->setContact(buildContact(caller->getNumber()));
+		endHandle(caller->getNumber(), nf);
+		return;
+	}
+
+	_sessions.emplace(data->getCallID(), std::move(session));
+	std::cout << "Paging " << targets << " endpoint(s) on behalf of "
+	          << caller->getNumber() << " via extension " << POCKETDIAL_PAGE_EXTENSION << '\n';
+}
+
 void RequestsHandler::onTrying(std::shared_ptr<SipMessage> data)
 {
 	endHandle(data->getFromNumber(), data);
@@ -305,6 +373,23 @@ void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 
 void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 {
+	// Issue #37: a paging call's dialog uses the virtual page extension, so route
+	// the BYE to whichever connected party did NOT send it (by source address).
+	auto session = getSession(data->getCallID());
+	if (session.has_value() && session.value()->isPaging())
+	{
+		session.value()->setState(Session::State::Bye);
+		auto src = session.value()->getSrc();
+		auto dst = session.value()->getDest();
+		std::shared_ptr<SipClient> other =
+			(src && addrEqual(src->getAddress(), data->getSource())) ? dst : src;
+		if (other)
+		{
+			_outbox.emplace_back(other->getAddress(), std::move(data));
+		}
+		return;
+	}
+
 	setCallState(data->getCallID(), Session::State::Bye);
 	endHandle(data->getToNumber(), data);
 }
@@ -325,8 +410,16 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 			return;
 		}
 
-		if (data->getCSeq().find(SipMessageTypes::INVITE) != std::string::npos) 
+		if (data->getCSeq().find(SipMessageTypes::INVITE) != std::string::npos)
 		{
+			// Issue #37: in a paging call the answerer can't be found by To-number
+			// (it's the virtual page extension) — resolve by source and fork-cancel.
+			if (session.value()->isPaging())
+			{
+				handlePagingAnswer(session.value(), std::move(data));
+				return;
+			}
+
 			auto client = findClient(data->getToNumber());
 			if (!client.has_value())
 			{
@@ -360,11 +453,75 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 	}
 }
 
+// Issue #37: first 200 OK to a page wins. Identify the answerer by source
+// address, connect it to the caller, and CANCEL every other paged endpoint.
+void RequestsHandler::handlePagingAnswer(const std::shared_ptr<Session>& session,
+	std::shared_ptr<SipMessage> data)
+{
+	auto answerer = findClientByAddress(data->getSource());
+
+	// A later endpoint answered after we already connected one: tell it to hang up.
+	if (session->getState() == Session::State::Connected)
+	{
+		if (answerer.has_value())
+		{
+			auto bye = buildPagingBye(data, answerer.value());
+			_outbox.emplace_back(answerer.value()->getAddress(), std::move(bye));
+		}
+		return;
+	}
+
+	if (!answerer.has_value() || !data->hasSdp())
+	{
+		return;   // can't attribute this 200 OK, or it carries no media
+	}
+
+	// Connect caller <-> first answerer.
+	session->setDest(answerer.value());
+	session->setState(Session::State::Connected);
+
+	// Relay the 200 OK back to the caller so their dialog completes.
+	auto response = std::make_shared<SipMessage>(*data);
+	response->setContact(buildContact(answerer.value()->getNumber()));
+	endHandle(data->getFromNumber(), std::move(response));
+
+	// CANCEL the endpoints that lost the race.
+	auto invite = session->getPagingInvite();
+	for (const auto& target : session->getPagedTargets())
+	{
+		if (addrEqual(target->getAddress(), answerer.value()->getAddress()))
+		{
+			continue;   // the winner
+		}
+		if (invite)
+		{
+			auto cancel = buildCancel(invite, target);
+			_outbox.emplace_back(target->getAddress(), std::move(cancel));
+		}
+	}
+
+	std::cout << "Page answered by " << answerer.value()->getNumber()
+	          << "; cancelling " << (session->getPagedTargets().size() - 1)
+	          << " other endpoint(s).\n";
+}
+
 void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 {
 	auto session = getSession(data->getCallID());
 	if (!session.has_value())
 	{
+		return;
+	}
+
+	// Issue #37: the ACK in a paging call is addressed to the page extension;
+	// route it to the endpoint that actually answered.
+	if (session.value()->isPaging())
+	{
+		auto dest = session.value()->getDest();
+		if (dest)
+		{
+			_outbox.emplace_back(dest->getAddress(), std::move(data));
+		}
 		return;
 	}
 
@@ -608,6 +765,64 @@ std::string RequestsHandler::buildContact(const std::string& number) const
 {
 	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
 	return "Contact: <sip:" + number + "@" + activeIp + ":" + std::to_string(_serverPort) + ";transport=UDP>";
+}
+
+// Issue #37: build a CANCEL that matches a forked INVITE. The header accessors
+// already include their field name ("Via: …", "From: …", …), so we reuse those
+// lines verbatim and only rewrite the request line's method and the CSeq method.
+std::shared_ptr<SipMessage> RequestsHandler::buildCancel(const std::shared_ptr<SipMessage>& invite,
+	const std::shared_ptr<SipClient>& target)
+{
+	// Request line: same Request-URI as the INVITE, method swapped to CANCEL.
+	const std::string& start = invite->getHeader();   // "INVITE <ruri> SIP/2.0"
+	auto sp = start.find(' ');
+	std::string cancelStart = (sp == std::string::npos) ? std::string("CANCEL")
+	                                                    : ("CANCEL" + start.substr(sp));
+
+	// CSeq: same sequence number as the INVITE, method CANCEL (RFC 3261 §9.1).
+	std::string cseqNum = "1";
+	{
+		const std::string& cseq = invite->getCSeq();   // "CSeq: 1 INVITE"
+		size_t i = cseq.find(':');
+		i = (i == std::string::npos) ? 0 : i + 1;
+		while (i < cseq.size() && std::isspace(static_cast<unsigned char>(cseq[i]))) ++i;
+		size_t j = i;
+		while (j < cseq.size() && std::isdigit(static_cast<unsigned char>(cseq[j]))) ++j;
+		if (j > i) cseqNum = cseq.substr(i, j - i);
+	}
+
+	std::ostringstream ss;
+	ss << cancelStart << "\r\n"
+	   << invite->getVia() << "\r\n"
+	   << invite->getFrom() << "\r\n"
+	   << invite->getTo() << "\r\n"
+	   << invite->getCallID() << "\r\n"
+	   << "CSeq: " << cseqNum << " CANCEL\r\n"
+	   << "Max-Forwards: 70\r\n"
+	   << "Content-Length: 0\r\n\r\n";
+	return std::make_shared<SipMessage>(ss.str(), target->getAddress());
+}
+
+// Issue #37: best-effort BYE to an endpoint that answered a page too late (after
+// another endpoint already won), so it doesn't sit off-hook waiting for an ACK.
+std::shared_ptr<SipMessage> RequestsHandler::buildPagingBye(const std::shared_ptr<SipMessage>& ok,
+	const std::shared_ptr<SipClient>& answerer)
+{
+	char ipBuf[INET_ADDRSTRLEN]{};
+	inet_ntop(AF_INET, &answerer->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
+	std::string ruri = "sip:" + answerer->getNumber() + "@" + ipBuf + ":"
+	                 + std::to_string(ntohs(answerer->getAddress().sin_port));
+
+	std::ostringstream ss;
+	ss << "BYE " << ruri << " SIP/2.0\r\n"
+	   << ok->getVia() << "\r\n"
+	   << ok->getFrom() << "\r\n"
+	   << ok->getTo() << "\r\n"
+	   << ok->getCallID() << "\r\n"
+	   << "CSeq: 2 BYE\r\n"
+	   << "Max-Forwards: 70\r\n"
+	   << "Content-Length: 0\r\n\r\n";
+	return std::make_shared<SipMessage>(ss.str(), answerer->getAddress());
 }
 
 // ── Dashboard query API ──────────────────────────────────────────────────────

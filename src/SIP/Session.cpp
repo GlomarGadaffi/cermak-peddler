@@ -53,3 +53,34 @@ std::chrono::steady_clock::time_point Session::getStartTime() const
 {
 	return _startTime;
 }
+
+// ── Broadcast / all-page support (Issue #37) ─────────────────────────────────
+void Session::setPaging(bool paging)
+{
+	_isPaging = paging;
+}
+
+bool Session::isPaging() const
+{
+	return _isPaging;
+}
+
+void Session::addPagedTarget(std::shared_ptr<SipClient> target)
+{
+	_pagedTargets.push_back(std::move(target));
+}
+
+const std::vector<std::shared_ptr<SipClient>>& Session::getPagedTargets() const
+{
+	return _pagedTargets;
+}
+
+void Session::setPagingInvite(std::shared_ptr<SipMessage> invite)
+{
+	_pagingInvite = std::move(invite);
+}
+
+std::shared_ptr<SipMessage> Session::getPagingInvite() const
+{
+	return _pagingInvite;
+}
