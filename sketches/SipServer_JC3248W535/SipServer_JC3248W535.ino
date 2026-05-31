@@ -29,7 +29,7 @@
  *   The previous JC3248W535EN-Touch-LCD library wraps Arduino_GFX internally but
  *   exposes no flush(). Replacing it with the raw Arduino_GFX + Arduino_Canvas +
  *   gfx->flush() pattern (proven in AXS15231B_CanvasTest) fixes the blank screen.
- *   Touch is replaced with a direct CST816S I2C poll (SDA 4, SCL 8, addr 0x15).
+ *   Touch uses the AXS15231B's integrated touch engine via I2C (SDA 4, SCL 8, addr 0x3B).
  */
 
 #include <Arduino_GFX_Library.h>
@@ -595,7 +595,7 @@ void setup()
 
     addLogLine("Display Initialized.");
     addLogLine("AXS15231B LCD Active.");
-    addLogLine("CST816S Touch Polling.");
+    addLogLine("AXS15231B Touch Polling.");
 
 #if ENABLE_NETWORK
     // ── 3. Start Wi-Fi Access Point ─────────────────────────────────────────
