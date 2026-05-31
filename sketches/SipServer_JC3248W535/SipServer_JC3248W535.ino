@@ -39,6 +39,29 @@
 #include "SipServer.hpp"
 #include "HttpServer.hpp"
 
+// ── Bring-up diagnostics (Issue #40) ─────────────────────────────────────────
+// The full app bootlooped with no serial output after the display migration,
+// while the display-only bring-up sketch ran fine. These switches bisect the
+// cause without re-architecting the sketch:
+//   ENABLE_NETWORK 0       -> run display + touch ONLY (no WiFi/SIP/HTTP). If
+//                             this renders & prints, the fault is in the network
+//                             stack now running alongside an actively-DMAing panel.
+//   DIAG_DISABLE_BROWNOUT 1-> turn off the brownout detector. If the bootloop
+//                             stops, the reset is power-related (WiFi TX spikes +
+//                             backlight + framebuffer DMA sagging the 3V3 rail).
+// Default build is the normal full app with both diagnostics off.
+#ifndef ENABLE_NETWORK
+#define ENABLE_NETWORK 1
+#endif
+#ifndef DIAG_DISABLE_BROWNOUT
+#define DIAG_DISABLE_BROWNOUT 0
+#endif
+
+#if DIAG_DISABLE_BROWNOUT
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#endif
+
 // ── JC3248W535EN QSPI pin map ────────────────────────────────────────────────
 #define TFT_CS   45
 #define TFT_SCK  47
@@ -482,14 +505,30 @@ void handleTouch(uint16_t x, uint16_t y) {
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup()
 {
+#if DIAG_DISABLE_BROWNOUT
+    // Must be the very first thing: kill the brownout detector before the
+    // display/WiFi current spikes can trip it. Diagnostic only — if this
+    // "fixes" the bootloop, the real problem is power, not code.
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+#endif
+
     Serial.begin(115200);
-    delay(1000);
+    // Native USB CDC takes ~1-2s to enumerate; in a fast bootloop the banner
+    // is printed before the host opens the port and is lost. Wait for the host
+    // (bounded) so early diagnostics actually reach the monitor.
+    unsigned long t0 = millis();
+    while (!Serial && (millis() - t0) < 3000) { delay(10); }
+    delay(200);
 
     Serial.println();
     Serial.println("╔══════════════════════════════════════╗");
     Serial.println("║    JC3248W535 Smart SIP Switchboard  ║");
     Serial.println("║        Retro-Console Edition         ║");
     Serial.println("╚══════════════════════════════════════╝");
+    Serial.printf("[BOOT] reset reason: %d  (1=POWERON 8=TG1WDT 12=SW_CPU 15=BROWNOUT)\n",
+                  (int)esp_reset_reason());
+    Serial.printf("[BUILD] ENABLE_NETWORK=%d DIAG_DISABLE_BROWNOUT=%d\n",
+                  ENABLE_NETWORK, DIAG_DISABLE_BROWNOUT);
     Serial.println();
 
     // Backlight — drive both pins; different board revisions use one or the other
@@ -528,10 +567,14 @@ void setup()
     addLogLine("AXS15231B LCD Active.");
     addLogLine("CST816S Touch Polling.");
 
+#if ENABLE_NETWORK
     // ── 3. Start Wi-Fi Access Point ─────────────────────────────────────────
     addLogLine("Starting WiFi SoftAP...");
     WiFi.mode(WIFI_AP);
     WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL, 0, AP_MAX_CLIENTS);
+    // Cap TX power: lowers the current spikes that can sag the 3V3 rail while
+    // the panel is actively DMA-ing a framebuffer (a likely bootloop cause).
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
     delay(500);
 
     char wifiLog[64];
@@ -560,6 +603,10 @@ void setup()
     }
 
     addLogLine("System ready for calls.");
+#else
+    addLogLine("NETWORK DISABLED (diag build).");
+    addLogLine("Display + touch only.");
+#endif
     Serial.println("──────────────────────────────────────────────────────────");
 }
 
@@ -582,7 +629,9 @@ void loop()
     }
 
     // 4. Wi-Fi station change detection
-    int currentStations = WiFi.softAPgetStationNum();
+    int currentStations = 0;
+#if ENABLE_NETWORK
+    currentStations = WiFi.softAPgetStationNum();
     if (currentStations != prevStations) {
         if (prevStations != -1) {
             if (currentStations > prevStations)
@@ -594,23 +643,26 @@ void loop()
     }
 
     // 5. SIP extension / session change detection
-    int currentExtensions = server->getHandler().getClientCount();
-    if (currentExtensions != prevExtensions) {
-        if (prevExtensions != -1) {
-            addLogLine(currentExtensions > prevExtensions
-                       ? "SIP extension registered!" : "SIP extension de-registered!");
+    if (server) {
+        int currentExtensions = server->getHandler().getClientCount();
+        if (currentExtensions != prevExtensions) {
+            if (prevExtensions != -1) {
+                addLogLine(currentExtensions > prevExtensions
+                           ? "SIP extension registered!" : "SIP extension de-registered!");
+            }
+            prevExtensions = currentExtensions;
         }
-        prevExtensions = currentExtensions;
-    }
 
-    int currentSessions = server->getHandler().getSessionCount();
-    if (currentSessions != prevSessions) {
-        if (prevSessions != -1) {
-            addLogLine(currentSessions > prevSessions
-                       ? "VoIP Session established!" : "VoIP Session terminated.");
+        int currentSessions = server->getHandler().getSessionCount();
+        if (currentSessions != prevSessions) {
+            if (prevSessions != -1) {
+                addLogLine(currentSessions > prevSessions
+                           ? "VoIP Session established!" : "VoIP Session terminated.");
+            }
+            prevSessions = currentSessions;
         }
-        prevSessions = currentSessions;
     }
+#endif
 
     // 6. Partial status-area update every second
     if (currentViewState == VIEW_DASHBOARD && displayActive) {
