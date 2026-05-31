@@ -192,7 +192,8 @@ static SipServer*  server     = nullptr;
 static HttpServer* httpServer = nullptr;
 static GfxWrapper  screenObj;
 static GfxWrapper& screen = screenObj;
-static bool displayActive = false;
+static bool displayActive  = false;
+static bool setupComplete  = false;  // flush suppressed until network init is done
 
 // ── Themes and UI State ─────────────────────────────────────────────────────
 enum Theme {
@@ -286,7 +287,7 @@ void addLogLine(const String& line) {
     if (currentViewState == VIEW_DASHBOARD && displayActive) {
         const Palette& p = PALETTES[currentTheme];
 
-        // Redraw only the console terminal area (no full-screen flush needed)
+        // Redraw only the console terminal area into the canvas.
         screen.setColor(p.bg.r, p.bg.g, p.bg.b);
         screen.drawFillRect(12, 321, 296, 148);
 
@@ -296,7 +297,11 @@ void addLogLine(const String& line) {
             screen.prt(logHistory[printIdx].c_str(), 18, 326 + (i * 20), 1);
             printIdx = (printIdx + 1) % MAX_LOG_LINES;
         }
-        gfx->flush();  // push log-area update to panel
+        // During setup() the network stack is being initialised on the same task.
+        // Blocking 307 KB QSPI flushes for every log line (6+ during boot) starves
+        // the task watchdog and causes a software reset. Suppress individual flushes
+        // until setup() completes; a single flush fires at the very end of setup().
+        if (setupComplete) gfx->flush();
     }
 }
 
@@ -591,7 +596,8 @@ void setup()
 
     for (int i = 0; i < MAX_LOG_LINES; i++) logHistory[i] = "";
     currentViewState = VIEW_DASHBOARD;
-    if (displayActive) redrawUI();
+    // Do NOT flush here — network init happens next and the blocking 307 KB QSPI
+    // transfers would starve the task watchdog. A single flush fires at end of setup().
 
     addLogLine("Display Initialized.");
     addLogLine("AXS15231B LCD Active.");
@@ -638,6 +644,10 @@ void setup()
     addLogLine("Display + touch only.");
 #endif
     Serial.println("──────────────────────────────────────────────────────────");
+
+    // Network init done. Unlock per-log flushes and push the boot log to the panel.
+    setupComplete = true;
+    if (displayActive) redrawUI();
 }
 
 // ── Main Loop ─────────────────────────────────────────────────────────────────
