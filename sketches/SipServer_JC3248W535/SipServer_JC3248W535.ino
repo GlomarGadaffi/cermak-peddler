@@ -76,26 +76,46 @@ Arduino_DataBus *bus       = new Arduino_ESP32QSPI(TFT_CS, TFT_SCK, TFT_D0, TFT_
 Arduino_GFX    *raw_panel  = new Arduino_AXS15231B(bus, GFX_NOT_DEFINED /*RST*/, 0 /*rotation*/, true /*IPS*/, 320, 480);
 Arduino_GFX    *gfx        = new Arduino_Canvas(320, 480, raw_panel, 0, 0);
 
-// ── CST816S capacitive touch (I2C) ───────────────────────────────────────────
-#define TOUCH_SDA  4
-#define TOUCH_SCL  8
-#define CST816S_ADDR 0x15
+// ── AXS15231B integrated capacitive touch (I2C) ──────────────────────────────
+// The JC3248W535 uses the AXS15231B, a combo display+touch (TDDI) controller.
+// Touch is NOT a separate CST816S — it's the AXS's own touch engine at I2C 0x3B,
+// read via a fixed command sequence rather than register reads.
+#define TOUCH_SDA   4
+#define TOUCH_SCL   8
+#define AXS_TOUCH_ADDR 0x3B
 
-static bool cst816s_read(uint16_t& tx, uint16_t& ty)
+// Set 1 to dump raw touch bytes (rate-limited) so we can verify parsing/orientation.
+#ifndef DIAG_TOUCH_RAW
+#define DIAG_TOUCH_RAW 1
+#endif
+
+static bool axs_touch_read(uint16_t& tx, uint16_t& ty)
 {
-    Wire.beginTransmission(CST816S_ADDR);
-    Wire.write(0x01);  // start at GestureID register
-    if (Wire.endTransmission(false) != 0) return false;
-    if (Wire.requestFrom((uint8_t)CST816S_ADDR, (uint8_t)6) < 6) return false;
-    Wire.read();                         // gesture ID
-    uint8_t fingers = Wire.read();       // finger count
-    uint8_t xh = Wire.read();
-    uint8_t xl = Wire.read();
-    uint8_t yh = Wire.read();
-    uint8_t yl = Wire.read();
+    // AXS15231B touch read: write the 8-byte "read touchpad" command, then read
+    // 8 bytes back. buf[1]=touch count, x=buf[2..3], y=buf[4..5] (12-bit each).
+    static const uint8_t read_cmd[8] = {0xb5, 0xab, 0xa5, 0x5a, 0x00, 0x00, 0x00, 0x08};
+    Wire.beginTransmission(AXS_TOUCH_ADDR);
+    Wire.write(read_cmd, sizeof(read_cmd));
+    if (Wire.endTransmission() != 0) return false;
+
+    uint8_t buf[8] = {0};
+    if (Wire.requestFrom((uint8_t)AXS_TOUCH_ADDR, (uint8_t)8) < 8) return false;
+    for (int i = 0; i < 8; i++) buf[i] = Wire.read();
+
+    uint8_t fingers = buf[1];
     if (fingers == 0 || fingers > 5) return false;
-    tx = ((uint16_t)(xh & 0x0F) << 8) | xl;
-    ty = ((uint16_t)(yh & 0x0F) << 8) | yl;
+
+    tx = ((uint16_t)(buf[2] & 0x0F) << 8) | buf[3];
+    ty = ((uint16_t)(buf[4] & 0x0F) << 8) | buf[5];
+
+#if DIAG_TOUCH_RAW
+    static unsigned long lastDump = 0;
+    if (millis() - lastDump > 150) {
+        lastDump = millis();
+        Serial.printf("[TOUCH raw] cnt=%u  x=%u y=%u  bytes=%02X %02X %02X %02X %02X %02X %02X %02X\n",
+                      fingers, tx, ty, buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7]);
+    }
+#endif
     return true;
 }
 
@@ -128,7 +148,7 @@ struct GfxWrapper {
         prt(s.c_str(), x, y, scale);
     }
     bool getTouchPoint(uint16_t& x, uint16_t& y) {
-        return cst816s_read(x, y);
+        return axs_touch_read(x, y);
     }
     // drawQRCode: compatible signature with JC3248W535EN library
     void drawQRCode(const char* text, int16_t x, int16_t y, uint8_t scale,
@@ -544,7 +564,17 @@ void setup()
 
     // ── 1. Initialise Touch I2C ─────────────────────────────────────────────
     Wire.begin(TOUCH_SDA, TOUCH_SCL);
-    Serial.println("[TOUCH] CST816S I2C initialised (SDA=4, SCL=8, addr=0x15).");
+    Serial.println("[TOUCH] I2C init (SDA=4, SCL=8). Expecting AXS15231B touch @ 0x3B.");
+
+    // I2C scan — ground truth on the touch controller address. AXS15231B touch
+    // normally ACKs at 0x3B; a CST816S would show at 0x15. Confirms which we have.
+    Serial.print("[I2C] scanning:");
+    int found = 0;
+    for (uint8_t a = 1; a < 127; a++) {
+        Wire.beginTransmission(a);
+        if (Wire.endTransmission() == 0) { Serial.printf(" 0x%02X", a); found++; }
+    }
+    Serial.printf("   (%d device%s)\n", found, found == 1 ? "" : "s");
 
     // ── 2. Initialise Display (Arduino_GFX stack) ───────────────────────────
     Serial.println("[GFX] Starting Arduino_GFX + Canvas stack (Issue #40 fix)...");
