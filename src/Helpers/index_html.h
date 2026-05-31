@@ -724,6 +724,10 @@ R"rawhtml(
         <button class="btn-retro btn-danger" onclick="cancelWifiConnect()">Cancel</button>
       </div>
     </div>
+    <div style="margin-top:12px; border-top:1px dashed var(--dk-cyan); padding-top:8px;">
+      <div style="font-size:14px; color:var(--dk-yellow); margin-bottom:4px;">Standalone AP Mode:</div>
+      <button class="btn-retro" onclick="startApMode()">⚡ Host Standalone AP</button>
+    </div>
   </div>
 </div>
 
@@ -1242,6 +1246,25 @@ function connectWifi() {
     termPrint(' WiFi: Connected to "' + selectedSSID + '"', 'var(--green)');
   }).catch(e => {
     statusEl.textContent = 'Connection failed: ' + e.message;
+    statusEl.style.color = 'var(--red)';
+    termPrint(' WiFi ERROR: ' + e.message, 'var(--red)');
+  });
+}
+
+function startApMode() {
+  const statusEl = document.getElementById('wifi-status');
+  statusEl.textContent = 'Enabling AP Mode...';
+  statusEl.style.color = 'var(--yellow)';
+
+  fetch('/api/wifi/mode_ap', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+  }).then(r => r.json()).then(data => {
+    statusEl.textContent = 'Mode AP set! Rebooting...';
+    statusEl.style.color = 'var(--green)';
+    termPrint(' WiFi: Operational mode set to Standalone AP. Rebooting...', 'var(--green)');
+  }).catch(e => {
+    statusEl.textContent = 'Failed to set AP mode: ' + e.message;
     statusEl.style.color = 'var(--red)';
     termPrint(' WiFi ERROR: ' + e.message, 'var(--red)');
   });

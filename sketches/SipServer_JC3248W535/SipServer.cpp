@@ -16,13 +16,16 @@ SipServer::SipServer(std::string ip, int port, int httpPort) :
 
 	// ── Multicast DNS (mDNS) responder broadcast ─────────────────────
 #if defined(ARDUINO)
+	// MDNS.begin is commented out temporarily to isolate network bootloop crashes
+	/*
 	if (MDNS.begin("pocketdial")) {
 		MDNS.addService("sip", "udp", port);
-		MDNS.addService("http", "tcp", httpPort);
+		MDNS.addService("http", "httpPort", httpPort);
 		std::cout << "[mDNS] Broadcast active: pocketdial.local\n";
 	} else {
 		std::cerr << "[mDNS] Failed to start responder\n";
 	}
+	*/
 #elif defined(ESP_PLATFORM)
 	esp_err_t err = mdns_init();
 	if (err == ESP_OK) {

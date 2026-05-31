@@ -34,7 +34,7 @@
 
 #include <Arduino_GFX_Library.h>
 #include <Wire.h>
-#include <qrcode.h>       // ricmoo/QRCode
+#include "qrcode.h"       // ricmoo/QRCode
 #include <WiFi.h>
 #include "SipServer.hpp"
 #include "HttpServer.hpp"
@@ -588,7 +588,7 @@ void setup()
 
     // Backlight — drive both pins; different board revisions use one or the other
     pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, HIGH);
-    pinMode(19, OUTPUT);     digitalWrite(19, HIGH);
+    // pinMode(19, OUTPUT);     digitalWrite(19, HIGH); // Hijacks native USB D- pin (GPIO 19), disabling serial!
 
     Serial.printf("[SYSTEM] PSRAM found: %s\n", psramFound() ? "YES" : "NO");
     Serial.printf("[SYSTEM] Free PSRAM: %d KB\n", (int)(ESP.getFreePsram() / 1024));
@@ -620,7 +620,7 @@ void setup()
                        "Check OPI PSRAM setting and QSPI pin map. Running headless.");
         // Re-assert backlight in case begin() toggled it
         digitalWrite(TFT_BL, HIGH);
-        digitalWrite(19, HIGH);
+        // digitalWrite(19, HIGH); // Hijacks native USB D- pin (GPIO 19), disabling serial!
     } else {
         Serial.println("[GFX] begin() OK.");
     }

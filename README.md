@@ -2,7 +2,7 @@
 
 A self-contained SIP PBX on a $10 board. Flash an ESP32-S3, connect two softphones to its SoftAP, and place a call. No router, no upstream, no infrastructure — the registrar, the proxy, the DHCP server, and the access point all run on the chip.
 
-Now with **smart display support**: the [JC3248W535EN](#jc3248w535en-smart-display) variant adds a 3.5" IPS touchscreen running a retro CGA-style switchboard dashboard — live call status, Wi-Fi QR join, and hardware reboot, all on the panel.
+Now with **smart display support**: the [JC3248W535EN](#jc3248w535en-smart-display) variant features a native **ESP-IDF v5.3 + LVGL 8.3** application driving a 3.5" IPS touchscreen with a retro CGA-style switchboard dashboard — live call status, dynamic Wi-Fi scan and onboarding, captive portal, and hardware reboot, all on the panel.
 
 Written in C++17. Also builds for **Linux** and **Windows**, which is useful for iterating on the SIP logic without a flash cycle — but the embedded target is the point.
 
@@ -44,7 +44,8 @@ Written in C++17. Also builds for **Linux** and **Windows**, which is useful for
 ## Features
 
 * **Standalone AP Mode (ESP32-S3)** — On power-up the board brings up an open Wi-Fi access point (`esp32-sipserver`), runs a DHCP server, and binds the SIP registrar to `192.168.4.1:5060`. Nothing else required: connect, register, call.
-* **Smart Display Dashboard (JC3248W535EN)** — On the Guition 3.5" IPS touchscreen variant, the board renders a retro CGA CRT-style switchboard directly on the 320×480 panel: live uptime, station count, registered extensions, active sessions, and a scrolling console log. Tap to show a Wi-Fi QR code for instant phone connection, cycle color themes (CGA Blue / Amber CRT / Green Phosphor), or trigger a hardware reboot with confirmation.
+* **Smart Display Dashboard (JC3248W535EN)** — Now running a production-grade, native **ESP-IDF 5.3 + LVGL 8.3** stack! On the Guition 3.5" IPS touchscreen variant, the board renders a retro CGA CRT-style switchboard directly on the 320×480 panel: live uptime, station count, registered extensions, active sessions, and an integrated scrolling system console log. Tap to cycle color themes (CGA Blue / Amber CRT / Green Phosphor), trigger a hardware reboot with YES/NO confirmation, or view onboarding status.
+* **Captive Portal Wi-Fi Onboarding** — If Wi-Fi is unconfigured or fails to connect, the display automatically displays an onboarding layout showing a secure setup SoftAP (`My-Ap`) and join QR code. Concurrently, a lightweight background DNS redirector and HTTP redirect server automatically redirect any connecting client browser to a retro-themed `/wifi_setup.html` page to easily scan local hotspots, input credentials, or choose to launch the server permanently in Standalone AP Mode.
 * **SIP User Registration** — Clients send `REGISTER`; the server responds `200 OK` and maintains an in-memory registry of active extensions. Re-registration refreshes the client's address (NAT rebind safe).
 * **Full Call Signaling** — Proxies `INVITE`, `TRYING`, `RINGING`, `200 OK`, `ACK`, `BYE`, `CANCEL`, `486 Busy Here`, `480 Temporarily Unavailable`, and `487 Request Terminated` between registered endpoints.
 * **SDP Media Negotiation** — Parses `application/sdp` bodies to extract RTP port information, letting endpoints establish direct peer-to-peer media streams. Signaling goes through the board; audio does not.
@@ -105,14 +106,25 @@ pocket-dial/
 ├── CMakeLists.txt              # Dual-mode build: desktop (CMake) or ESP-IDF
 ├── main.cpp                    # Desktop entry point (cxxopts CLI)
 ├── main/
-│   ├── CMakeLists.txt          # ESP-IDF component registration
-│   └── esp_main.cpp            # ESP32-S3 entry point (SoftAP + FreeRTOS)
+│   ├── CMakeLists.txt          # ESP-IDF component registration supporting wifi/eth/display targets
+│   ├── esp_main.cpp            # ESP32-S3 entry point (WiFi SoftAP transport)
+│   ├── esp_main_eth.cpp        # ESP32-S3 entry point (W5500 Ethernet transport)
+│   ├── esp_main_display.cpp    # ESP32-S3 entry point (Guition AXS15231B touch display target)
+│   ├── drivers/                # Low-level QSPI panel and touch screen driver layer
+│   │   ├── esp_lcd_axs15231b.c # NorthernMan54-derived esp_lcd panel controller source
+│   │   └── esp_lcd_axs15231b.h # NorthernMan54-derived esp_lcd panel controller header
+│   ├── ui/                     # Interactive LVGL 8.3 dashboard and views
+│   │   ├── ui.cpp              # Retro CGA switchboard layout, simulated touch press router, log terminal
+│   │   └── ui.h                # HMI UI layout definitions and styles
+│   └── wifi/                   # Captive portal and Wi-Fi onboarding helpers
+│       ├── DnsServer.cpp       # Background UDP Port 53 captive DNS redirection
+│       └── DnsServer.hpp       # DNS redirector header
 ├── sketches/
 │   ├── SipServer/              # Arduino: generic ESP32-S3 Wi-Fi SoftAP
 │   ├── SipServerETH/           # Arduino: Waveshare ESP32-S3-ETH (W5500)
 │   ├── SipServer_T_ETH_Lite_W5500/   # Arduino: LilyGO T-ETH-Lite W5500
 │   ├── SipServer_T_POE_Pro_LAN8720/  # Arduino: LilyGO T-PoE-Pro LAN8720
-│   ├── SipServer_JC3248W535/   # Arduino: Guition 3.5" IPS Smart Display ⬅ NEW
+│   ├── SipServer_JC3248W535/   # Arduino: Guition 3.5" IPS Smart Display [DEPRECATED]
 │   ├── MinimalTest/            # Diagnostic: PSRAM / heap / buffer test
 │   └── PinFuzzer/              # Diagnostic: GPIO / QSPI / I2C pin probe
 ├── src/
@@ -198,7 +210,35 @@ The sketch uses Arduino's `WiFi.h` to start the SoftAP, then instantiates `SipSe
 
 ### JC3248W535EN Smart Display
 
-For the **Guition JC3248W535EN** (3.5" IPS touchscreen, ESP32-S3, AXS15231B QSPI display controller):
+For the **Guition JC3248W535EN** (3.5" IPS touchscreen, ESP32-S3, AXS15231B QSPI display controller), the display server can be built in two ways:
+
+#### 1. [RECOMMENDED] Native ESP-IDF 5.3 + LVGL 8.3
+This method compiles the core as a native CMake application, using high-performance Espressif `esp_lcd` low-level drivers, double-buffered graphics task pinned to Core 1, and captive portal setup wizard capabilities.
+
+##### Prerequisites
+* [ESP-IDF v5.3](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/get-started/) installed and sourced.
+* The ESP-IDF Component Manager will automatically pull down `lvgl/lvgl: ^8.3.11` from the registry during build.
+
+##### Compilation & Flashing
+```bash
+# Sourced ESP-IDF environment required
+
+# 1. Set standard target to ESP32-S3
+idf.py set-target esp32s3
+
+# 2. Build target with display transport configuration
+idf.py -D SIP_TRANSPORT=display build
+
+# 3. Flash and monitor the target (replace COM3 with your actual serial port)
+idf.py -p COM3 -D SIP_TRANSPORT=display flash monitor
+```
+
+> **Note:** The QSPI PSRAM and 16MB QIO flash configurations are already predefined in `sdkconfig.defaults`, ensuring automatic PSRAM allocation for LVGL's double buffers.
+
+---
+
+#### 2. [DEPRECATED] Arduino IDE Method (sketches/SipServer_JC3248W535/)
+This is a legacy implementation. No new features will be added here.
 
 1. Install the **ESP32 board package** via Boards Manager.
 2. Install the following libraries via Library Manager:
@@ -238,6 +278,7 @@ For the **Guition JC3248W535EN** (3.5" IPS touchscreen, ESP32-S3, AXS15231B QSPI
 
 Two additional sketches are provided for hardware bring-up and debugging:
 
+* **`sketches/AXS15231B_CanvasTest/`** — Canvas double-buffering test using direct raw `Arduino_GFX` to isolate blank panel driver configurations.
 * **`sketches/MinimalTest/`** — PSRAM detection, heap reporting, and frame buffer allocation test. Flash this first to verify your board settings are correct.
 * **`sketches/PinFuzzer/`** — Scans GPIO pins to verify QSPI data lines, I2C touch bus, and backlight control. Useful for confirming pin assignments on unknown board revisions.
 
@@ -290,17 +331,28 @@ To place a call:
    * **Transport:** UDP
 4. Register an extension on each, then dial the other.
 
-### JC3248W535EN Mode
+### JC3248W535EN Mode (Touch Dashboard & Onboarding)
 
-Behavior is identical to [ESP32-S3 Mode](#esp32-s3-mode) above, with the addition of the on-screen dashboard. After boot you will see:
+When running the native display build, the device handles two primary states: **Onboarding Wizard** and **Active Switchboard Dashboard**.
 
-* **Status Panel** — Server IP, SIP port, uptime counter, connected stations, registered extensions, and active call sessions — all updating live.
-* **[ TAP FOR WI-FI QR CODE ]** — Shows a full-screen QR code that phones can scan to instantly join the `esp32-sipserver` network.
-* **[ COLOR ]** — Cycles through three CRT themes: CGA Blue, Amber Phosphor, Green Phosphor.
-* **[ REBOOT ]** — Hardware reset with a YES/NO confirmation dialog.
-* **Live Console** — Scrolling log at the bottom of the screen showing connection events, SIP registrations, and call state changes in real time.
+#### 1. Wi-Fi Onboarding Mode
+If the device has never been configured, or fails to connect to the saved hotspot, it starts onboarding:
+1. **SoftAP Spawned**: Launches a secure setup access point named `My-Ap` (Password: `12345678`, IP: `192.168.4.1`).
+2. **Setup Screen UI**: Renders a scannable Wi-Fi connection QR code on screen along with dynamic AP credentials.
+3. **Captive Portal Redirect**: Connect a phone or computer to the `My-Ap` Wi-Fi segment. The background UDP DNS Server (Port 53) and Host-redirect handler automatically load a retro-styled Wi-Fi wizard (`http://192.168.4.1`) in the client browser.
+4. **Choose Hotspot / Standalone Mode**:
+   * **Connect to Hotspot**: Choose a scanned local SSID, enter its WPA password, and click Connect. The device will write settings to NVS and reboot in Station mode.
+   * **Standalone AP Mode**: Click "Host Standalone AP" on screen or the webpage. The server commits standalone mode to NVS and reboots to run on its own open network segment.
 
-If the display fails to initialize, the board enters **headless mode** — the SIP server and web dashboard continue running normally, and all logs are still available via Serial and the HTTP dashboard at `http://192.168.4.1`.
+#### 2. Active Switchboard Mode
+Once connected to a router or committed to standalone AP mode, the screen shows the main HMI panel:
+* **Status Panel** — Host IP, SIP port, uptime counter, registered extensions, and active sessions — all updating live.
+* **Header Indicators** — Real-time battery voltage ADC status and single-cell Li-ion percentage indicator.
+* **Color Themes** — Tap the screen or options to cycle through three beautiful CRT phosphors: CGA Blue, Amber Phosphor, and Green Phosphor.
+* **Interactive Reboot** — Trigger a hardware reset with an interactive YES/NO touch dialog on screen.
+* **Live Scrolling Console** — Overrides standard ESP system logs (`esp_log_set_vprintf`) to display system boot status, Wi-Fi connectivity, SIP requests/replies, and active calls directly on the screen's scrolling CRT window.
+
+If the display or touch driver fails to initialize, the board falls back to **headless mode** — network registration, SIP registrar/proxy, and the retro HTTP Web dashboard will continue running normally without crashing.
 
 ### Desktop Mode
 
@@ -510,19 +562,23 @@ Compile-time constants in `main/esp_main.cpp`:
 
 The SIP server always binds to `192.168.4.1:5060` (the default ESP-IDF SoftAP gateway address).
 
-### JC3248W535EN
+### JC3248W535EN (Native ESP-IDF Target)
 
-Compile-time constants at the top of `sketches/SipServer_JC3248W535/SipServer_JC3248W535.ino`:
+All operations are persistent in the `nvs_flash` partition using the `"wifi_conf"` namespace:
 
-|Constant|Default|Description|
-|-|-|-|
-|`AP_SSID`|`"esp32-sipserver"`|Wi-Fi network name|
-|`AP_PASSWORD`|`""`|Wi-Fi password (empty = open)|
-|`AP_CHANNEL`|`1`|Wi-Fi channel|
-|`AP_MAX_CLIENTS`|`10`|Max simultaneous Wi-Fi clients|
-|`SIP_BIND_IP`|`"192.168.4.1"`|SIP server bind address|
-|`SIP_PORT`|`5060`|SIP server port|
-|`HTTP_PORT`|`80`|Web dashboard port|
+| NVS Key | Type | Default | Description |
+|---------|------|---------|-------------|
+| `wifi_mode` | `uint8_t` | `0` (Unconfigured) | `0` = Not configured (starts Onboarding), `1` = Station Mode (hotspot), `2` = Standalone AP Mode |
+| `wifi_ssid` | `string` | `""` | Destination Wi-Fi router SSID |
+| `wifi_pass` | `string` | `""` | Destination Wi-Fi router password |
+
+#### Hardcoded Fallbacks (Onboarding SoftAP)
+* **Onboarding SSID**: `My-Ap`
+* **Onboarding Password**: `12345678`
+* **Onboarding Gateway IP**: `192.168.4.1`
+* **SIP Port**: `5060`
+* **HTTP Dashboard Port**: `80`
+* **DNS Redirection Port**: `53`
 
 ### Desktop
 

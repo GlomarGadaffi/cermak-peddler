@@ -47,11 +47,13 @@ private:
 	// Response builders
 	void sendResponse(int sock, int statusCode, const std::string& statusText,
 	                   const std::string& contentType, const std::string& body);
+	void sendRedirect(int sock, const std::string& location);
 	void sendHtml(int sock);
 	void sendApiStatus(int sock);
 	void sendApiKill(int sock, const std::string& body);
 	void sendApiWifiScan(int sock);
 	void sendApiWifiConnect(int sock, const std::string& body);
+	void sendApiWifiModeAp(int sock);
 	void send404(int sock);
 
 	// Returns true if the request has no Origin header (direct browser nav / curl)
