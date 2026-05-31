@@ -9,6 +9,28 @@
 #include "IDGen.hpp"
 #include "IPHelper.hpp"
 
+// ── Compile-time tunables (Issues #47, #31) ──────────────────────────────────
+// Override any of these with -D on the command line / build_flags to suit a
+// known fleet. Defaults are chosen to be interoperable with softphones that do
+// not answer out-of-dialog OPTIONS (a SHOULD, not a MUST, in RFC 3261).
+#ifndef POCKETDIAL_KEEPALIVE_PING_SECS
+#define POCKETDIAL_KEEPALIVE_PING_SECS 30   // how often we OPTIONS-ping each client
+#endif
+#ifndef POCKETDIAL_KEEPALIVE_TIMEOUT_SECS
+#define POCKETDIAL_KEEPALIVE_TIMEOUT_SECS 90  // endpoint silence that flags an orphaned call
+#endif
+
+// Issue #38: per-source-IP flood protection. RATE_BURST is the bucket capacity
+// (max packets accepted back-to-back); RATE_PER_SEC is the sustained refill rate.
+#ifndef POCKETDIAL_RATE_BURST
+#define POCKETDIAL_RATE_BURST 40
+#endif
+#ifndef POCKETDIAL_RATE_PER_SEC
+#define POCKETDIAL_RATE_PER_SEC 20
+#endif
+// Optional allowlist, e.g. -DPOCKETDIAL_ALLOW_CIDR=\"192.168.1.0/24\". Undefined =
+// accept every source (rate limiting still applies).
+
 namespace
 {
 	// Default lease granted when a REGISTER does not request one (seconds).
@@ -19,6 +41,20 @@ namespace
 	constexpr int MIN_EXPIRES = 30;
 	// How often the opportunistic sweep is allowed to run.
 	constexpr auto SWEEP_INTERVAL = std::chrono::seconds(1);
+
+	// Issue #47: OPTIONS ping cadence (was a bare 5s).
+	constexpr auto KEEPALIVE_PING_INTERVAL = std::chrono::seconds(POCKETDIAL_KEEPALIVE_PING_SECS);
+	// Issue #31/#47: an endpoint silent this long is treated as gone for the
+	// purpose of reaping its *active sessions*. It does NOT by itself unregister
+	// the client — registration rides the REGISTER lease (see sweepExpired).
+	constexpr auto KEEPALIVE_TIMEOUT = std::chrono::seconds(POCKETDIAL_KEEPALIVE_TIMEOUT_SECS);
+
+	// Sessions in a terminal/handshake state are not subject to orphan reaping;
+	// only an established (Connected) call can leak when an endpoint vanishes.
+	bool isLiveCall(Session::State s)
+	{
+		return s == Session::State::Connected;
+	}
 }
 
 RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
@@ -27,6 +63,65 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	_onHandled(onHandledEvent)
 {
 	initHandlers();
+
+#ifdef POCKETDIAL_ALLOW_CIDR
+	// Issue #38: parse the compile-time CIDR allowlist once. Anything that fails
+	// to parse leaves the allowlist disabled (fail-open, rate limiting still on).
+	{
+		std::string cidr = POCKETDIAL_ALLOW_CIDR;
+		auto slash = cidr.find('/');
+		std::string ipPart = (slash == std::string::npos) ? cidr : cidr.substr(0, slash);
+		int prefix = 32;
+		if (slash != std::string::npos)
+		{
+			try { prefix = std::stoi(cidr.substr(slash + 1)); } catch (...) { prefix = -1; }
+		}
+		struct in_addr a {};
+		if (prefix >= 0 && prefix <= 32 && inet_pton(AF_INET, ipPart.c_str(), &a) == 1)
+		{
+			_allowNet  = ntohl(a.s_addr);
+			_allowMask = (prefix == 0) ? 0u : (0xFFFFFFFFu << (32 - prefix));
+		}
+	}
+#endif
+}
+
+bool RequestsHandler::ipAllowed(const sockaddr_in& src) const
+{
+	// No allowlist configured → accept everyone.
+	if (_allowMask == 0)
+	{
+		return true;
+	}
+	uint32_t ip = ntohl(src.sin_addr.s_addr);
+	return (ip & _allowMask) == (_allowNet & _allowMask);
+}
+
+bool RequestsHandler::allowPacket(const sockaddr_in& src)
+{
+	auto now = std::chrono::steady_clock::now();
+	uint32_t key = src.sin_addr.s_addr;   // network order is fine as a map key
+	auto& bucket = _rateBuckets[key];
+
+	if (bucket.last.time_since_epoch().count() == 0)
+	{
+		// First packet from this IP — start the bucket full.
+		bucket.tokens = static_cast<double>(POCKETDIAL_RATE_BURST);
+	}
+	else
+	{
+		double elapsed = std::chrono::duration<double>(now - bucket.last).count();
+		bucket.tokens = (std::min)(static_cast<double>(POCKETDIAL_RATE_BURST),
+			bucket.tokens + elapsed * static_cast<double>(POCKETDIAL_RATE_PER_SEC));
+	}
+	bucket.last = now;
+
+	if (bucket.tokens >= 1.0)
+	{
+		bucket.tokens -= 1.0;
+		return true;
+	}
+	return false;
 }
 
 void RequestsHandler::initHandlers()
@@ -52,6 +147,15 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		_outbox.clear();
+
+		// Issue #38: drop traffic from non-allowlisted IPs or sources that are
+		// flooding us, before any parsing/registry work or markActive() — so a
+		// flood can neither do work nor keep a registration artificially alive.
+		if (!ipAllowed(request->getSource()) || !allowPacket(request->getSource()))
+		{
+			_packetsDropped.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
 
 		auto client = findClientByAddress(request->getSource());
 		if (client.has_value())
@@ -158,8 +262,8 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	auto message = dynamic_cast<SipSdpMessage*>(data.get());
-	if (!message) 
+	// Issue #42: hasSdp() virtual dispatch instead of dynamic_cast (RTTI is off on Arduino).
+	if (!data->hasSdp())
 	{
 		std::cerr << "Couldn't get SDP from " << data->getFromNumber() << "'s INVITE request." << std::endl;
 		std::shared_ptr<SipMessage> responseObj = std::make_shared<SipMessage>(*data);
@@ -229,8 +333,8 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 				return;
 			}
 
-			auto sdpMessage = dynamic_cast<SipSdpMessage*>(data.get());
-			if (!sdpMessage) 
+			// Issue #42: hasSdp() virtual dispatch instead of dynamic_cast (RTTI is off on Arduino).
+			if (!data->hasSdp())
 			{
 				std::cerr << "Couldn't get SDP from: " << client.value()->getNumber() << "'s OK message.\n";
 				std::shared_ptr<SipMessage> responseObj = std::make_shared<SipMessage>(*data);
@@ -390,43 +494,74 @@ int RequestsHandler::parseRequestedExpires(const std::shared_ptr<SipMessage>& da
 void RequestsHandler::sweepExpired()
 {
 	auto now = std::chrono::steady_clock::now();
+
+	// Drop every session that involves a given extension.
+	auto eraseSessionsFor = [this](const std::string& extension) {
+		for (auto sit = _sessions.begin(); sit != _sessions.end(); )
+		{
+			const bool involved =
+				(sit->second->getSrc()  && sit->second->getSrc()->getNumber()  == extension) ||
+				(sit->second->getDest() && sit->second->getDest()->getNumber() == extension);
+			if (involved)
+				sit = _sessions.erase(sit);
+			else
+				++sit;
+		}
+	};
+
+	// ── Pass 1 (Issue #31): reap orphaned live calls ────────────────────────
+	// The server is blind to peer-to-peer RTP, so a client that loses power or
+	// walks out of range mid-call never sends BYE. Detect it by endpoint silence:
+	// any inbound packet (REGISTER refresh or a 200 OK to our OPTIONS ping) calls
+	// markActive(); an endpoint quiet past KEEPALIVE_TIMEOUT is treated as gone and
+	// its established call is torn down — without unregistering the client itself.
+	for (auto sit = _sessions.begin(); sit != _sessions.end(); )
+	{
+		const auto& session = sit->second;
+		auto silent = [&](const std::shared_ptr<SipClient>& c) {
+			return c && (now - c->getLastActiveTime() > KEEPALIVE_TIMEOUT);
+		};
+		if (isLiveCall(session->getState()) &&
+			(silent(session->getSrc()) || silent(session->getDest())))
+		{
+			std::cout << "Reaping orphaned session (endpoint silent > "
+			          << POCKETDIAL_KEEPALIVE_TIMEOUT_SECS << "s): " << sit->first << '\n';
+			sit = _sessions.erase(sit);
+		}
+		else
+		{
+			++sit;
+		}
+	}
+
+	// ── Pass 2 (Issue #47): unregister clients on REGISTER-lease expiry only ──
+	// Responding to out-of-dialog OPTIONS is a SHOULD, not a MUST. We no longer
+	// evict a client merely for ignoring our pings — that flapped live phones in
+	// and out of the registry between REGISTERs. Registration now rides the lease.
 	for (auto it = _clients.begin(); it != _clients.end(); )
 	{
-		bool keepAliveTimedOut = (now - it->second->getLastActiveTime() > std::chrono::seconds(15));
-		bool leaseExpired = it->second->isExpired(now);
-
-		if (keepAliveTimedOut || leaseExpired)
+		if (it->second->isExpired(now))
 		{
-			if (keepAliveTimedOut)
-			{
-				std::cout << "Pruning client due to missed OPTIONS keepalive pings: " << it->first << '\n';
-			}
-			else
-			{
-				std::cout << "Registration lease expired: " << it->first << '\n';
-			}
-
-			// Clean up sessions involving this client
-			std::string extension = it->first;
-			for (auto sit = _sessions.begin(); sit != _sessions.end(); )
-			{
-				bool involved = false;
-				if (sit->second->getSrc() && sit->second->getSrc()->getNumber() == extension)
-					involved = true;
-				if (sit->second->getDest() && sit->second->getDest()->getNumber() == extension)
-					involved = true;
-				if (involved)
-					sit = _sessions.erase(sit);
-				else
-					++sit;
-			}
-
+			std::cout << "Registration lease expired: " << it->first << '\n';
+			eraseSessionsFor(it->first);
 			it = _clients.erase(it);
 		}
 		else
 		{
 			++it;
 		}
+	}
+
+	// ── Pass 3 (Issue #38): evict idle rate-limit buckets to bound memory ────
+	// Critical on ESP32: without this an attacker spoofing many source IPs could
+	// grow _rateBuckets without limit. A bucket idle for 5 min is fully refilled
+	// anyway, so dropping it costs nothing.
+	for (auto it = _rateBuckets.begin(); it != _rateBuckets.end(); )
+	{
+		if (now - it->second.last > std::chrono::minutes(5))
+			it = _rateBuckets.erase(it);
+		else
+			++it;
 	}
 }
 
@@ -555,6 +690,11 @@ uint64_t RequestsHandler::getPacketsProcessed() const
 	return _packetsProcessed.load(std::memory_order_relaxed);
 }
 
+uint64_t RequestsHandler::getPacketsDropped() const
+{
+	return _packetsDropped.load(std::memory_order_relaxed);
+}
+
 size_t RequestsHandler::getClientCount()
 {
 	std::lock_guard<std::mutex> lock(_mutex);
@@ -586,7 +726,7 @@ void RequestsHandler::tick()
 
 		for (auto& [number, client] : _clients)
 		{
-			if (now - client->getLastPingTime() >= std::chrono::seconds(5))
+			if (now - client->getLastPingTime() >= KEEPALIVE_PING_INTERVAL)
 			{
 				client->setLastPingTime(now);
 				auto ping = buildOptionsPing(client);
