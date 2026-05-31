@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Display Bring-Up / Isolation Sketch (#40)**: Added `sketches/AXS15231B_CanvasTest/AXS15231B_CanvasTest.ino`, a standalone (no Wi-Fi/SIP/HTTP) test that drives the panel with the *proven* raw `Arduino_GFX` stack — `Arduino_ESP32QSPI` → `Arduino_AXS15231B` → `Arduino_Canvas` with an explicit `gfx->flush()` per frame. It isolates the blank-screen fault: if this renders, the panel/pins/PSRAM are good and the issue is the `JC3248W535EN` library's internal config (migrate per the recipe in the sketch); if it's also blank, the fault is hardware/board-settings (PSRAM mode or pin map). Test pattern includes colour bars, edge-to-edge corner markers, and a live frame counter to confirm repeated flushes refresh the panel.
+- **Battery Voltage Monitor (#46)**: `SipServer_JC3248W535.ino` now samples the GPIO 5 battery divider every 10 s via the calibrated `analogReadMilliVolts()`, converts to volts (configurable `BATTERY_DIVIDER`) and an approximate single-cell Li-ion percentage, logs it to Serial, and shows it in the top-right of the on-screen header (renders once the display path from #40 is resolved).
+
+### Notes
+- **#40 diagnosis**: The `JC3248W535EN` library exposes no `flush()`/`update()` and refreshes internally, so the blank panel cannot be fixed from the app sketch by adding a flush — the reliable fix is to drive the AXS15231B directly with `Arduino_GFX` + `Arduino_Canvas` + `flush()` (the community-confirmed path for this board), which the bring-up sketch above demonstrates.
+
 ## [v1.2.0] - 2026-05-31
 
 ### Added

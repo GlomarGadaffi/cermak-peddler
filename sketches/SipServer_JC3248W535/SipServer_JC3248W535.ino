@@ -42,6 +42,19 @@ static constexpr const char* SIP_BIND_IP    = "192.168.4.1";
 static constexpr int         SIP_PORT       = 5060;
 static constexpr int         HTTP_PORT      = 80;
 
+// ── Battery monitor (Issue #46) ───────────────────────────────────────────────
+// The JC3248W535EN exposes battery voltage on GPIO 5 through an on-board divider.
+// BATTERY_DIVIDER is the divider ratio (Vbat / Vadc); 2.0 assumes a 1:1 (e.g.
+// 100k/100k) divider — verify against your board revision and adjust.
+// analogReadMilliVolts() uses the ESP32-S3 eFuse ADC calibration, so it already
+// returns the pin voltage in mV; we only multiply by the divider ratio.
+static constexpr int    BATTERY_ADC_PIN  = 5;
+static constexpr float  BATTERY_DIVIDER  = 2.0f;
+static constexpr unsigned long BATTERY_READ_INTERVAL_MS = 10000;
+static float         batteryVolts   = 0.0f;
+static int           batteryPercent = -1;
+static unsigned long lastBatteryRead = 0;
+
 // ── Globals ─────────────────────────────────────────────────────────────────
 static SipServer*  server     = nullptr;
 static HttpServer* httpServer = nullptr;
@@ -132,6 +145,7 @@ void drawDashboard();
 void drawWiFiQR();
 void drawRebootConfirm();
 void handleTouch(uint16_t x, uint16_t y);
+void readBattery();
 
 // ── Log Handler Helper ──────────────────────────────────────────────────────
 void addLogLine(const String& line) {
@@ -163,6 +177,36 @@ void addLogLine(const String& line) {
     }
 }
 
+// ── Battery monitor (Issue #46) ───────────────────────────────────────────────
+void readBattery() {
+    // analogReadMilliVolts() applies the chip's eFuse ADC calibration and returns
+    // the pin voltage in mV; scale by the divider ratio to recover Vbat.
+    uint32_t mv = analogReadMilliVolts(BATTERY_ADC_PIN);
+    batteryVolts = (mv * BATTERY_DIVIDER) / 1000.0f;
+
+    // Rough single-cell Li-ion mapping (4.20 V full … 3.30 V empty), clamped.
+    float pct = (batteryVolts - 3.30f) / (4.20f - 3.30f) * 100.0f;
+    if (pct < 0)   pct = 0;
+    if (pct > 100) pct = 100;
+    batteryPercent = (int)(pct + 0.5f);
+
+    Serial.printf("[BATT] %.2f V (%d%%)\n", batteryVolts, batteryPercent);
+}
+
+// Battery readout in the top-right of the header bar. The header is filled with
+// the border colour, so we clear our small corner to that colour then print the
+// value in the background colour to match the rest of the header text.
+void drawBatteryHeader() {
+    if (!displayActive || batteryPercent < 0) return;
+    const Palette& p = PALETTES[currentTheme];
+    screen.setColor(p.border.r, p.border.g, p.border.b);
+    screen.drawFillRect(232, 4, 86, 24);
+    char b[24];
+    sprintf(b, "%.1fV %d%%", batteryVolts, batteryPercent);
+    screen.setColor(p.bg.r, p.bg.g, p.bg.b);
+    screen.prt(b, 234, 10, 1);
+}
+
 // ── UI Drawing Orchestrator ─────────────────────────────────────────────────
 void redrawUI() {
     const Palette& p = PALETTES[currentTheme];
@@ -190,7 +234,8 @@ void drawDashboard() {
     screen.drawFillRect(0, 0, 320, 32);
     screen.setColor(p.bg.r, p.bg.g, p.bg.b); // Text stands out against block header
     screen.prt("══ POCKET-DIAL SWITCHBOARD ══", 10, 10, 1);
-    
+    drawBatteryHeader(); // Issue #46: battery readout, top-right of the header
+
     // 2. Status Box
     screen.setColor(p.border.r, p.border.g, p.border.b);
     // Draw Box Borders (Double line effect via offset)
@@ -498,7 +543,13 @@ void loop()
 
     // 3. Status updates, change detection, and periodic logs
     unsigned long now = millis();
-    
+
+    // Battery monitor (Issue #46): sample on an interval; first pass fires at boot.
+    if (lastBatteryRead == 0 || now - lastBatteryRead >= BATTERY_READ_INTERVAL_MS) {
+        lastBatteryRead = now;
+        readBattery();
+    }
+
     // Check Wi-Fi Client connections
     int currentStations = WiFi.softAPgetStationNum();
     if (currentStations != prevStations) {
@@ -574,6 +625,8 @@ void loop()
             int sessions = server ? server->getHandler().getSessionCount() : 0;
             sprintf(buf, "%d active", sessions);
             screen.prt(buf, 110, 172, 1);
+
+            drawBatteryHeader(); // Issue #46: keep the header readout current
         }
     }
 
