@@ -77,43 +77,73 @@ Arduino_GFX    *raw_panel  = new Arduino_AXS15231B(bus, GFX_NOT_DEFINED /*RST*/,
 Arduino_GFX    *gfx        = new Arduino_Canvas(320, 480, raw_panel, 0, 0);
 
 // ── AXS15231B integrated capacitive touch (I2C) ──────────────────────────────
-// The JC3248W535 uses the AXS15231B, a combo display+touch (TDDI) controller.
-// Touch is NOT a separate CST816S — it's the AXS's own touch engine at I2C 0x3B,
-// read via a fixed command sequence rather than register reads.
-#define TOUCH_SDA   4
-#define TOUCH_SCL   8
+// Source-verified against AudunKodehode/JC3248W535EN-Touch-LCD library.
+// Critical findings vs. our earlier implementation:
+//   1. RST pin 12 must be pulsed LOW→HIGH after Wire.begin() or the touch
+//      controller never exits reset and all reads silently fail.
+//   2. The read command is 11 bytes, not 8. Bytes 6-7 encode the expected
+//      response length; bytes 8-10 are 0x00.
+//   3. Portrait coordinate mapping: x = rawY, y = map(rawX, 0,320, 320,0).
+#define TOUCH_SDA      4
+#define TOUCH_SCL      8
+#define TOUCH_RST_PIN  12
+#define TOUCH_INT_PIN  11
 #define AXS_TOUCH_ADDR 0x3B
+#define AXS_MAX_TOUCH  1
+#define AXS_READ_LEN   (AXS_MAX_TOUCH * 6 + 2)
 
-// Set 1 to dump raw touch bytes (rate-limited) so we can verify parsing/orientation.
+// Set 1 to dump raw touch bytes (rate-limited) to verify parsing/orientation.
 #ifndef DIAG_TOUCH_RAW
 #define DIAG_TOUCH_RAW 1
 #endif
 
+static void axs_touch_init()
+{
+    Wire.begin(TOUCH_SDA, TOUCH_SCL);
+    Wire.setClock(400000);
+    pinMode(TOUCH_INT_PIN, INPUT_PULLUP);
+    pinMode(TOUCH_RST_PIN, OUTPUT);
+    digitalWrite(TOUCH_RST_PIN, LOW);
+    delay(200);
+    digitalWrite(TOUCH_RST_PIN, HIGH);
+    delay(200);
+}
+
 static bool axs_touch_read(uint16_t& tx, uint16_t& ty)
 {
-    // AXS15231B touch read: write the 8-byte "read touchpad" command, then read
-    // 8 bytes back. buf[1]=touch count, x=buf[2..3], y=buf[4..5] (12-bit each).
-    static const uint8_t read_cmd[8] = {0xb5, 0xab, 0xa5, 0x5a, 0x00, 0x00, 0x00, 0x08};
+    const uint8_t read_cmd[11] = {
+        0xb5, 0xab, 0xa5, 0x5a, 0x00, 0x00,
+        (uint8_t)(AXS_READ_LEN >> 8),
+        (uint8_t)(AXS_READ_LEN & 0xff),
+        0x00, 0x00, 0x00
+    };
     Wire.beginTransmission(AXS_TOUCH_ADDR);
     Wire.write(read_cmd, sizeof(read_cmd));
     if (Wire.endTransmission() != 0) return false;
 
-    uint8_t buf[8] = {0};
-    if (Wire.requestFrom((uint8_t)AXS_TOUCH_ADDR, (uint8_t)8) < 8) return false;
-    for (int i = 0; i < 8; i++) buf[i] = Wire.read();
+    uint8_t buf[AXS_READ_LEN] = {0};
+    if (Wire.requestFrom((uint8_t)AXS_TOUCH_ADDR, (uint8_t)AXS_READ_LEN) < AXS_READ_LEN)
+        return false;
+    for (int i = 0; i < AXS_READ_LEN; i++) buf[i] = Wire.read();
 
-    uint8_t fingers = buf[1];
-    if (fingers == 0 || fingers > 5) return false;
+    if (buf[1] == 0 || buf[1] > AXS_MAX_TOUCH) return false;
 
-    tx = ((uint16_t)(buf[2] & 0x0F) << 8) | buf[3];
-    ty = ((uint16_t)(buf[4] & 0x0F) << 8) | buf[5];
+    uint16_t rawX = ((uint16_t)(buf[2] & 0x0F) << 8) | buf[3];
+    uint16_t rawY = ((uint16_t)(buf[4] & 0x0F) << 8) | buf[5];
+
+    // Sanity filter (from library source)
+    if (rawX == 273 && rawY == 273) return false;
+    if (rawX > 4000 || rawY > 4000)  return false;
+
+    // Portrait coordinate mapping: panel raw axes are rotated vs screen layout
+    tx = rawY;
+    ty = map(rawX, 0, 320, 320, 0);
 
 #if DIAG_TOUCH_RAW
     static unsigned long lastDump = 0;
     if (millis() - lastDump > 150) {
         lastDump = millis();
-        Serial.printf("[TOUCH raw] cnt=%u  x=%u y=%u  bytes=%02X %02X %02X %02X %02X %02X %02X %02X\n",
-                      fingers, tx, ty, buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7]);
+        Serial.printf("[TOUCH] rawX=%u rawY=%u -> tx=%u ty=%u\n", rawX, rawY, tx, ty);
     }
 #endif
     return true;
@@ -567,12 +597,13 @@ void setup()
         Serial.println("[SYSTEM] WARNING: OPI PSRAM not detected. "
                        "The 307 KB canvas will fail. Set Tools > PSRAM = OPI PSRAM.");
 
-    // ── 1. Initialise Touch I2C ─────────────────────────────────────────────
-    Wire.begin(TOUCH_SDA, TOUCH_SCL);
-    Serial.println("[TOUCH] I2C init (SDA=4, SCL=8). Expecting AXS15231B touch @ 0x3B.");
+    // ── 1. Initialise Touch (I2C + RST pulse) ───────────────────────────────
+    // axs_touch_init() pulses RST pin 12 LOW→HIGH — without this the AXS touch
+    // engine never exits reset and all reads silently fail.
+    axs_touch_init();
+    Serial.println("[TOUCH] AXS15231B init: RST pulsed, I2C @ 400kHz (SDA=4, SCL=8, addr=0x3B).");
 
-    // I2C scan — ground truth on the touch controller address. AXS15231B touch
-    // normally ACKs at 0x3B; a CST816S would show at 0x15. Confirms which we have.
+    // I2C scan — confirms the controller is alive and ACKing.
     Serial.print("[I2C] scanning:");
     int found = 0;
     for (uint8_t a = 1; a < 127; a++) {
