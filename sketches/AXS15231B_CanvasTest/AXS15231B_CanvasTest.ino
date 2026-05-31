@@ -44,17 +44,29 @@ Arduino_DataBus *bus        = new Arduino_ESP32QSPI(TFT_CS, TFT_SCK, TFT_D0, TFT
 Arduino_GFX     *raw_panel  = new Arduino_AXS15231B(bus, GFX_NOT_DEFINED /*RST*/, 0 /*rotation*/, true /*IPS*/, 320, 480);
 Arduino_GFX     *gfx        = new Arduino_Canvas(320, 480, raw_panel, 0, 0);
 
+// RGB565 colour literals. Defined here rather than using Arduino_GFX's BLACK/RED/…
+// macros, because recent library releases renamed those to RGB565_BLACK/RGB565_RED/…
+// — these literals compile against any version.
+static constexpr uint16_t C_BLACK   = 0x0000;
+static constexpr uint16_t C_WHITE   = 0xFFFF;
+static constexpr uint16_t C_RED     = 0xF800;
+static constexpr uint16_t C_GREEN   = 0x07E0;
+static constexpr uint16_t C_BLUE    = 0x001F;
+static constexpr uint16_t C_YELLOW  = 0xFFE0;
+static constexpr uint16_t C_CYAN    = 0x07FF;
+static constexpr uint16_t C_MAGENTA = 0xF81F;
+
 static uint32_t frame = 0;
 
 void drawTestFrame()
 {
     // Everything below draws into the PSRAM canvas; the single flush() at the
     // end is what makes any of it visible.
-    gfx->fillScreen(BLACK);
+    gfx->fillScreen(C_BLACK);
 
     // Title block
     gfx->fillRect(0, 0, 320, 34, gfx->color565(0, 0, 170));
-    gfx->setTextColor(WHITE);
+    gfx->setTextColor(C_WHITE);
     gfx->setTextSize(2);
     gfx->setCursor(10, 9);
     gfx->print("POCKET-DIAL");
@@ -65,16 +77,16 @@ void drawTestFrame()
     gfx->print("AXS15231B canvas+flush OK");
 
     // Primary-color bars — confirms full-width addressing & color order.
-    const uint16_t bars[] = { RED, GREEN, BLUE, YELLOW, CYAN, MAGENTA, WHITE };
+    const uint16_t bars[] = { C_RED, C_GREEN, C_BLUE, C_YELLOW, C_CYAN, C_MAGENTA, C_WHITE };
     for (int i = 0; i < 7; i++)
         gfx->fillRect(10 + i * 43, 70, 40, 60, bars[i]);
 
     // Corner markers — confirms the panel is addressed edge-to-edge (no offset).
-    gfx->drawRect(0, 0, 320, 480, WHITE);
-    gfx->fillRect(0, 0, 12, 12, RED);             // top-left
-    gfx->fillRect(308, 0, 12, 12, GREEN);         // top-right
-    gfx->fillRect(0, 468, 12, 12, BLUE);          // bottom-left
-    gfx->fillRect(308, 468, 12, 12, YELLOW);      // bottom-right
+    gfx->drawRect(0, 0, 320, 480, C_WHITE);
+    gfx->fillRect(0, 0, 12, 12, C_RED);             // top-left
+    gfx->fillRect(308, 0, 12, 12, C_GREEN);         // top-right
+    gfx->fillRect(0, 468, 12, 12, C_BLUE);          // bottom-left
+    gfx->fillRect(308, 468, 12, 12, C_YELLOW);      // bottom-right
 
     // Live counter — confirms repeated flush()es actually refresh the panel.
     gfx->setTextSize(3);
@@ -83,7 +95,7 @@ void drawTestFrame()
     gfx->printf("FRAME %lu", (unsigned long)frame);
 
     gfx->setTextSize(2);
-    gfx->setTextColor(WHITE);
+    gfx->setTextColor(C_WHITE);
     gfx->setCursor(10, 220);
     gfx->printf("uptime %lus", (unsigned long)(millis() / 1000));
 
