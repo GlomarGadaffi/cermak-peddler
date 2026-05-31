@@ -4,7 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [v1.1.0] - 2026-05-29
+## [v1.2.0] - 2026-05-31
+
+### Added
+- **JC3248W535EN (Guition 3.5" IPS) Display Support**:
+    - Added `SipServer_JC3248W535.ino` Arduino sketch: a full SIP PBX server with integrated touchscreen UI via the AXS15231B QSPI display controller. Uses the `JC3248W535EN` library with LVGL for rendering a call-status dashboard directly on the 320×480 IPS panel. Includes a `displayActive` global flag and headless fallback so the SIP server continues operating even if the display driver fails to initialise.
+    - Added `MinimalTest.ino` diagnostic sketch: standalone PSRAM/heap/buffer verification tool that confirms OPI PSRAM detection, 307.2 KB frame-buffer allocation, and correct `FlashMode=qio` configuration on the ESP32-S3.
+    - Added `PinFuzzer.ino` diagnostic sketch: GPIO scan tool for probing and verifying QSPI data lines, I2C touch bus, and backlight control on JC3248W535EN hardware.
+- **Hardware Pin Reference**: JC3248W535EN pin mapping documented in sketch headers — QSPI (GPIO 47/21/48/40/39/45), I2C touch (SDA 4, SCL 8, INT 11, RST 12, addr `0x3B`), backlight (GPIO 1), battery ADC (GPIO 5).
+
+### Fixed
+- **ESP32-S3 Boot Panic from Global Static Display Objects**: Discovered that globally instantiating the `JC3248W535EN` display driver as a static C++ object caused heap/PSRAM allocation in the global constructor — before `setup()` and before PSRAM was initialised by the Arduino core — triggering a hard fault at `0x403c8898`. Refactored to pointer-based deferred instantiation inside `setup()` to ensure safe initialisation order.
+
+### Changed
+- **SIP Core Refactoring (bring-up fixes)**: Updated `UdpServer.cpp/.hpp`, `RequestsHandler.cpp/.hpp`, `SipClient.hpp`, `SipMessage.hpp`, and `SipSdpMessage.hpp` with accumulated fixes discovered during JC3248W535EN board bring-up and testing.
 
 ### Added
 - **mDNS / Bonjour Broadcast (.local domain)**: Added native multicast DNS (mDNS) responder support (`pocketdial.local`). Integrates natively with `<ESPmDNS.h>` in Arduino environments and the built-in `mdns` component in ESP-IDF environments, while compiling out completely on desktop builds to keep them lightweight. Automatically registers `_sip._udp` (port 5060) and `_http._tcp` (port 80/8080) services.
