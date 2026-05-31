@@ -7,16 +7,18 @@ All notable changes to this project will be documented in this file.
 ### Added
 - **Native ESP-IDF 5.3 + LVGL 8.3 Display Integration for JC3248W535EN (#40)**:
   - Migrated the Guition 3.5" IPS display and touch dashboard stack from Arduino to a clean native ESP-IDF v5.3 CMake target environment.
-  - Implemented standard low-level panel and touch screen driver layer `main/drivers/esp_lcd_axs15231b` derived from proven NorthernMan54 drivers.
+  - Implemented standard low-level panel and touch screen driver layer `main/drivers/esp_lcd_axs15231b` derived from proven NorthernMan54 drivers (#43).
   - Ported the retro CGA HMI to native LVGL 8.3 widgets running in a dedicated `lvgl_task` pinned to CPU **Core 1** to guarantee high frame rates without stuttering.
   - Configured double-buffering using two 307.2 KB 16-bit color frames allocated in external **OPI PSRAM** (`sdkconfig.defaults`).
-  - Added a simulated coordinate-based press router to bypass offset calibration issues.
+  - Added a simulated coordinate-based press router to bypass offset calibration and alignment issues (#43).
   - Intercepted ESP-IDF logs using `esp_log_set_vprintf` to pipe boot status, Wi-Fi configuration, and SIP registration events directly into a scrollable terminal area on screen.
 - **Captive Portal Wi-Fi Onboarding**:
   - Implemented a background UDP DNS Redirect Server listening on Port 53, resolving all host queries to `192.168.4.1` on boot when unconfigured.
   - Added Host header inspection in `HttpServer` to intercept all HTTP requests and redirect them (HTTP 302) to the retro-styled Wi-Fi onboarding panel.
   - Created a responsive, theme-matching `wifi_setup.html` web wizard enabling clients to scan local hotspots, input passwords, or commit the server to Standalone AP mode directly from their device.
   - Integrated full NVS-based configuration persistence using the `"wifi_conf"` namespace to persist Wi-Fi credentials and modes across hard power cycles.
+  - Added canvas-based Wi-Fi QR code join credentials rendering using `ricmoo/QRCode` in the setup and menu overlays (#45).
+  - Integrated battery voltage ADC sampling on GPIO 5 to display live percentages and voltage status in the CRT dashboard header bar (#46).
 - **Arduino Display Sketch Deprecation**:
   - Formally deprecated the legacy `sketches/SipServer_JC3248W535/` Arduino sketch while keeping it in the repository tree for historical context.
 - **Display Bring-Up / Isolation Sketch (#40)**: Added `sketches/AXS15231B_CanvasTest/AXS15231B_CanvasTest.ino`, a standalone (no Wi-Fi/SIP/HTTP) test that drives the panel with the *proven* raw `Arduino_GFX` stack — `Arduino_ESP32QSPI` → `Arduino_AXS15231B` → `Arduino_Canvas` with an explicit `gfx->flush()` per frame. It isolates the blank-screen fault: if this renders, the panel/pins/PSRAM are good and the issue is the `JC3248W535EN` library's internal config (migrate per the recipe in the sketch); if it's also blank, the fault is hardware/board-settings (PSRAM mode or pin map). Test pattern includes colour bars, edge-to-edge corner markers, and a live frame counter to confirm repeated flushes refresh the panel.
