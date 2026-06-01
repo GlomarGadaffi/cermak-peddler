@@ -1,18 +1,21 @@
 # pocket-dial
 
-A self-contained SIP PBX on a $10 board. Flash an ESP32-S3, connect two softphones to its SoftAP, and place a call. No router, no upstream, no infrastructure — the registrar, the proxy, the DHCP server, and the access point all run on the chip.
+A self-contained, enterprise-capable SIP PBX on a $10 microcontroller. Flash an ESP32-S3, connect softphones or physical IP phones to its network, and make direct VoIP calls instantly. No routers, no upstream trunks, no complex servers — the registrar, proxy, DHCP server, HTTP management server, and access point all run concurrently on a single dual-core chip.
 
-Now with **smart display support**: the [JC3248W535EN](#jc3248w535en-smart-display) variant features a native **ESP-IDF v5.3 + LVGL 8.3** application driving a 3.5" IPS touchscreen with a retro CGA-style switchboard dashboard — live call status, dynamic Wi-Fi scan and onboarding, captive portal, and hardware reboot, all on the panel.
+Now with **native touch display support** and **W5500 wired-Ethernet capability**:
+* **Guition JC3248W535EN HMI Target**: Features a native **ESP-IDF v5.3 + LVGL 8.3** application driving a 3.5" IPS capacitive touchscreen with a retro CGA CRT-style switchboard dashboard — displaying live uptime, battery stats, registration counts, active sessions, and a real-time scrollable system console log directly on the panel.
+* **Wired-Ethernet & PoE Support**: Pre-configured transport targets for Waveshare ESP32-S3-ETH and LilyGO T-ETH boards, bridging pocket-dial to professional wired and Power-over-Ethernet network segments.
+* **SIP Virtual Extensions**: Features an inline **SIP Echo Test (`777`)** with zero-media-processing SDP loopback, and a **Parallel Broadcast / All-Page Intercom (`999`)** with target-URI rewriting and dynamic SIP auto-answer injection.
+* **Strict VoIP Interoperability**: Resolves early media loopback loops and ringing hangs on professional devices (like Yealink IP phones) by automatically stripping caller SDPs from all provisional `180 Ringing` responses via `clearBody()`, while enforcing PCMU/PCMA G.711 codec compliance.
 
-Written in C++17. Also builds for **Linux** and **Windows**, which is useful for iterating on the SIP logic without a flash cycle — but the embedded target is the point.
+---
 
-## What it's for
+## Developer Roadmap & Issue Tracker
 
-* Ad-hoc voice between endpoints with zero infrastructure — lab, field, festival, CTF, air-gapped site.
-* Embedded VoIP / SIP behavior research without standing up Asterisk or FreeSWITCH.
-* A complete, demonstrable, end-to-end SIP stack you can hold in one hand.
+> [!NOTE]
+> We maintain an active architectural roadmap and issue tracker documenting concurrency challenges, task pinning, and socket-blocking mitigations. Review our planned performance updates in [ISSUES.md](file:///C:/Users/desmo/Documents/antigravity/vibrant-bose/ISSUES.md).
 
-\---
+---
 
 ## Table of Contents
 
@@ -21,47 +24,52 @@ Written in C++17. Also builds for **Linux** and **Windows**, which is useful for
 * [Architecture](#architecture)
 * [Project Structure](#project-structure)
 * [Supported SIP Methods \& Responses](#supported-sip-methods--responses)
+* [Virtual Extensions (`777` & `999`)](#virtual-extensions-777--999)
+* [VoIP Interoperability & SDP Stripping](#voip-interoperability--sdp-stripping)
+* [Automated Testing & Remote Control](#automated-testing--remote-control)
 * [Building](#building)
-
-  * [ESP32-S3 (ESP-IDF)](#esp32-s3-esp-idf)
-  * [ESP32-S3 (Arduino IDE)](#esp32-s3-arduino-ide)
+  * [ESP32-S3 (ESP-IDF v5.3)](#esp32-s3-esp-idf-v53)
   * [JC3248W535EN Smart Display](#jc3248w535en-smart-display)
-  * [Desktop (Linux)](#desktop-linux)
-  * [Desktop (Windows)](#desktop-windows)
-* [Usage](#usage)
-
-  * [ESP32-S3 Mode](#esp32-s3-mode)
-  * [JC3248W535EN Mode](#jc3248w535en-mode)
-  * [Desktop Mode](#desktop-mode)
-* [Call Flow](#call-flow)
+  * [W5500 Ethernet & PoE](#w5500-ethernet--poe)
+  * [ESP32-S3 (Arduino IDE)](#esp32-s3-arduino-ide)
+  * [Desktop (Linux / Windows)](#desktop-mode)
 * [API Reference](#api-reference)
 * [Configuration](#configuration)
 * [License](#license)
-* [Credits](#credits)
 
-\---
+---
 
 ## Features
 
-* **Standalone AP Mode (ESP32-S3)** — On power-up the board brings up an open Wi-Fi access point (`esp32-sipserver`), runs a DHCP server, and binds the SIP registrar to `192.168.4.1:5060`. Nothing else required: connect, register, call.
-* **Smart Display Dashboard (JC3248W535EN)** — Now running a production-grade, native **ESP-IDF 5.3 + LVGL 8.3** stack! On the Guition 3.5" IPS touchscreen variant, the board renders a retro CGA CRT-style switchboard directly on the 320×480 panel: live uptime, station count, registered extensions, active sessions, and an integrated scrolling system console log. Tap to cycle color themes (CGA Blue / Amber CRT / Green Phosphor), trigger a hardware reboot with YES/NO confirmation, or view onboarding status.
-* **Captive Portal Wi-Fi Onboarding** — If Wi-Fi is unconfigured or fails to connect, the display automatically displays an onboarding layout showing a secure setup SoftAP (`My-Ap`) and join QR code. Concurrently, a lightweight background DNS redirector and HTTP redirect server automatically redirect any connecting client browser to a retro-themed `/wifi_setup.html` page to easily scan local hotspots, input credentials, or choose to launch the server permanently in Standalone AP Mode.
-* **SIP User Registration** — Clients send `REGISTER`; the server responds `200 OK` and maintains an in-memory registry of active extensions. Re-registration refreshes the client's address (NAT rebind safe).
-* **Full Call Signaling** — Proxies `INVITE`, `TRYING`, `RINGING`, `200 OK`, `ACK`, `BYE`, `CANCEL`, `486 Busy Here`, `480 Temporarily Unavailable`, and `487 Request Terminated` between registered endpoints.
-* **SDP Media Negotiation** — Parses `application/sdp` bodies to extract RTP port information, letting endpoints establish direct peer-to-peer media streams. Signaling goes through the board; audio does not.
-* **Session State Machine** — Tracks per-call state (`Invited → Connected → Bye`) with cleanup of orphaned sessions on cancel, busy, or unavailable.
-* **Headless Fallback** — If the display driver fails to initialize on a display-equipped board, the SIP server continues operating in headless mode. The `displayActive` flag gates all UI code so the PBX never crashes due to a panel issue.
-* **Cross-Platform Core** — A single codebase compiles against POSIX sockets (Linux), Winsock2 (Windows), and lwIP (ESP32-S3 via ESP-IDF and Arduino IDE).
+* **Standalone AP Mode (ESP32-S3)** — Spawns an open Wi-Fi access point (`esp32-sipserver`), runs an internal DHCP server, and binds the SIP registrar to `192.168.4.1:5060`. Connect, register, and call with zero external infrastructure.
+* **W5500 Ethernet / PoE Transport** — Direct network interface driver support for wired RJ45 and Power-over-Ethernet environments, featuring DHCP or static IP fallbacks.
+* **Captive Portal Wi-Fi Onboarding** — When unconfigured, spawns a secure setup SoftAP (`My-Ap`) and displays a join QR code on screen. Intercepts HTTP traffic via a background DNS redirection server (Port 53), leading clients to a retro-themed onboarding wizard at `192.168.4.1` to provision router credentials or toggle permanent Standalone AP mode.
+* **Smart Touchscreen Dashboard** — Native ESP-IDF 5.3 + LVGL 8.3 CGA-style HMI. Double-buffered in external OPI PSRAM (307.2 KB 16-bit color frames). Tap to cycle phosphorus theme colors (CGA Blue / Amber CRT / Green Phosphor), reset via touch dialog, or monitor system console logs captured from standard stdout (`esp_log_set_vprintf`).
+* **Active Keepalive OPTIONS & Pruning** — Periodically dispatches OPTIONS ping packets to all active clients. Automatically reaps dead bindings upon lease timeouts or silent periods to bound memory.
+* **Robust Concurrency & Headless Fallback** — Dedicated, core-isolated FreeRTOS tasks. SIP signaling executes on Core 1, and HTTP/Web dashboard operations execute on Core 0. If the display panel fails to initialize, the server falls back to headless operation seamlessly.
 
-\---
+---
 
 ## How It Works
 
-The device boots as its own network. There is no DHCP lease to wait on, no SIP provider to register against, and no internet path in the call. Two phones associate to the SoftAP, register their extensions with the on-board registrar, and the proxy brokers the `INVITE`/`OK`/`ACK` handshake between them. Media (RTP) flows directly phone-to-phone over the local Wi-Fi segment.
+The device boots as its own isolated telecommunication hub. Media (RTP) flows directly **peer-to-peer (P2P)** between the endpoints over the local wireless or wired segment. The board brokers signaling handshakes (`INVITE`, `200 OK`, `ACK`, `BYE`), allowing the microcontroller to coordinate high-bandwidth calls without processing or routing the audio packets themselves.
 
-The result is a closed voice cell — everything needed to place a call lives on the microcontroller, and nothing leaves it.
+```
+                  ┌──────────────────────┐
+                  │  pocket-dial Server  │
+                  │   (SIP Signaling)    │
+                  └──────────────────────┘
+                       ▲            ▲
+             INVITE /  │            │  INVITE /
+             200 OK    │            │  200 OK
+                       ▼            ▼
+             ┌───────────┐        ┌───────────┐
+             │ Phone 102 │◀══════▶│ Phone 105 │
+             │  (Caller) │   RTP  │  (Callee) │
+             └───────────┘  Audio └───────────┘
+```
 
-\---
+---
 
 ## Architecture
 
@@ -75,528 +83,272 @@ The result is a closed voice cell — everything needed to place a call lives on
 │  │ (recv/    │    │ Parses raw UDP   │    │          │  │
 │  │  send)    │◀───│ into SipMessage  │    │ Dispatch │  │
 │  │           │    │ or SipSdpMessage │    │ table of │  │
-│  └───────────┘    └──────────────────┘    │ handlers │  │
-│                                           │          │  │
-│                   ┌──────────────────┐    │ Manages: │  │
-│                   │    SipClient     │◀───│ \_clients │  │
-│                   │ (number + addr)  │    │ \_sessions│  │
-│                   └──────────────────┘    └──────────┘  │
-│                                                         │
-│                   ┌──────────────────┐                   │
-│                   │     Session      │                   │
-│                   │ (callID, state,  │                   │
-│                   │  src, dest, RTP) │                   │
-│                   └──────────────────┘                   │
+│  │           │    └──────────────────┘    │ handlers │  │
+│  └───────────┘                            │          │  │
+│                                           │ Manages: │  │
+│                   ┌──────────────────┐    │ _clients │  │
+│                   │    SipClient     │◀───│_sessions │  │
+│                   │ (number + addr)  │    └──────────┘  │
+│                   └──────────────────┘          │       │
+│                                                 ▼       │
+│                   ┌──────────────────┐    ┌──────────┐  │
+│                   │     Session      │◀───│ Outbox   │  │
+│                   │ (callID, state,  │    │ Queue    │  │
+│                   │  src, dest, P2P) │    │ (Lock-   │  │
+│                   └──────────────────┘    │  free)   │  │
+│                                           └──────────┘  │
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Data flow:**
-
-1. `UdpServer` receives a raw UDP datagram and invokes `SipServer::onNewMessage`.
-2. `SipMessageFactory` inspects the payload: if it contains `application/sdp`, it creates a `SipSdpMessage`; otherwise a plain `SipMessage`.
-3. The parsed message is dispatched to `RequestsHandler::handle`, which looks up the message type in a `std::unordered\_map` of handler functions.
-4. The appropriate handler (`onInvite`, `onRegister`, `onBye`, …) processes the request, mutates headers as needed, and calls `endHandle` to route the response back through `UdpServer::send`.
-
-\---
+---
 
 ## Project Structure
 
 ```
 pocket-dial/
 ├── CMakeLists.txt              # Dual-mode build: desktop (CMake) or ESP-IDF
+├── ISSUES.md                   # Roadmap & Architectural Concurrency Issues
+├── CHANGELOG.md                # Detailed release notes and issue fixes
+├── LICENSE                     # MIT
+├── README.md                   # Developer Manual (You are here)
 ├── main.cpp                    # Desktop entry point (cxxopts CLI)
 ├── main/
-│   ├── CMakeLists.txt          # ESP-IDF component registration supporting wifi/eth/display targets
-│   ├── esp_main.cpp            # ESP32-S3 entry point (WiFi SoftAP transport)
+│   ├── CMakeLists.txt          # ESP-IDF component builder (wifi/eth/display targets)
+│   ├── esp_main.cpp            # ESP32-S3 entry point (Wi-Fi AP transport)
 │   ├── esp_main_eth.cpp        # ESP32-S3 entry point (W5500 Ethernet transport)
 │   ├── esp_main_display.cpp    # ESP32-S3 entry point (Guition AXS15231B touch display target)
 │   ├── drivers/                # Low-level QSPI panel and touch screen driver layer
-│   │   ├── esp_lcd_axs15231b.c # NorthernMan54-derived esp_lcd panel controller source
-│   │   └── esp_lcd_axs15231b.h # NorthernMan54-derived esp_lcd panel controller header
-│   ├── ui/                     # Interactive LVGL 8.3 dashboard and views
-│   │   ├── ui.cpp              # Retro CGA switchboard layout, simulated touch press router, log terminal
-│   │   └── ui.h                # HMI UI layout definitions and styles
-│   └── wifi/                   # Captive portal and Wi-Fi onboarding helpers
-│       ├── DnsServer.cpp       # Background UDP Port 53 captive DNS redirection
-│       └── DnsServer.hpp       # DNS redirector header
-├── sketches/
-│   ├── SipServer/              # Arduino: generic ESP32-S3 Wi-Fi SoftAP
-│   ├── SipServerETH/           # Arduino: Waveshare ESP32-S3-ETH (W5500)
-│   ├── SipServer_T_ETH_Lite_W5500/   # Arduino: LilyGO T-ETH-Lite W5500
-│   ├── SipServer_T_POE_Pro_LAN8720/  # Arduino: LilyGO T-PoE-Pro LAN8720
-│   ├── SipServer_JC3248W535/   # Arduino: Guition 3.5" IPS Smart Display [DEPRECATED]
-│   ├── MinimalTest/            # Diagnostic: PSRAM / heap / buffer test
-│   └── PinFuzzer/              # Diagnostic: GPIO / QSPI / I2C pin probe
-├── src/
+│   │   ├── esp_lcd_axs15231b.c # High-performance esp_lcd driver
+│   │   └── esp_lcd_axs15231b.h
+│   ├── ui/                     # Interactive LVGL 8.3 switchboard dashboard
+│   │   ├── ui.cpp              # CGA interface, touch press router, log terminal
+│   │   └── ui.h
+│   └── wifi/                   # DNS/HTTP redirect captive portal wizard
+│       ├── DnsServer.cpp
+│       └── DnsServer.hpp
+├── sketches/                   # Self-contained Arduino IDE sketches
+│   ├── SipServer/              # Generic ESP32-S3 Wi-Fi SoftAP
+│   ├── SipServerETH/           # Waveshare ESP32-S3-ETH (W5500)
+│   ├── SipServer_T_ETH_Lite_W5500/   # LilyGO T-ETH-Lite W5500
+│   ├── SipServer_T_POE_Pro_LAN8720/  # LilyGO T-PoE-Pro LAN8720
+│   ├── SipServer_JC3248W535/   # Guition 3.5" IPS Smart Display [DEPRECATED]
+│   ├── MinimalTest/            # Diagnostic: PSRAM / heap allocation verification
+│   └── PinFuzzer/              # Diagnostic: GPIO scanning tool
+├── src/                        # Core SIP Engine (Cross-Platform C++)
 │   ├── Helpers/
-│   │   ├── cxxopts.hpp         # CLI argument parser (desktop only)
-│   │   ├── IDGen.hpp           # Thread-safe random alphanumeric ID generator
-│   │   ├── UdpServer.hpp       # UDP socket abstraction (header)
-│   │   └── UdpServer.cpp       # UDP socket abstraction (implementation)
+│   │   ├── IDGen.hpp           # Thread-safe alphanumeric generator
+│   │   ├── UdpServer.cpp       # Threaded, platform-abstracted UDP socket
+│   │   └── UdpServer.hpp
 │   └── SIP/
-│       ├── SipMessageTypes.h   # SIP method & response string constants
-│       ├── SipMessage.hpp      # Base SIP message parser (header)
-│       ├── SipMessage.cpp      # Base SIP message parser (implementation)
-│       ├── SipSdpMessage.hpp   # SDP-aware SIP message (header)
-│       ├── SipSdpMessage.cpp   # SDP body parser (implementation)
-│       ├── SipMessageFactory.hpp  # Factory: SipMessage vs SipSdpMessage
-│       ├── SipMessageFactory.cpp
-│       ├── SipClient.hpp       # Registered client model (number + address)
+│       ├── SipMessageTypes.h   # SIP method & status string definitions
+│       ├── SipMessage.cpp      # O(n) index-walking header parser
+│       ├── SipMessage.hpp
+│       ├── SipSdpMessage.cpp   # SDP body extraction
+│       ├── SipSdpMessage.hpp
+│       ├── SipMessageFactory.cpp # RTTI-free dispatch factory
+│       ├── SipMessageFactory.hpp
+│       ├── SipClient.hpp       # Active registrar model
 │       ├── SipClient.cpp
-│       ├── Session.hpp         # Call session state machine (header)
-│       ├── Session.cpp         # Call session state machine (implementation)
-│       ├── RequestsHandler.hpp # SIP method dispatch & client/session mgmt
-│       ├── RequestsHandler.cpp
-│       ├── SipServer.hpp       # Top-level server orchestrator (header)
-│       └── SipServer.cpp       # Top-level server orchestrator (implementation)
-├── CHANGELOG.md
-├── LICENSE                     # MIT
-└── README.md                   # ← You are here
+│       ├── Session.hpp         # Call state machine tracker
+│       ├── Session.cpp
+│       ├── RequestsHandler.cpp # Signaling logic & client/session registry
+│       ├── RequestsHandler.hpp
+│       ├── SipServer.cpp       # Orchestrator
+│       └── SipServer.hpp
 ```
-
-\---
-
-## Supported SIP Methods \& Responses
-
-|Type|Constant|Handler|Description|
-|-|-|-|-|
-|`REGISTER`|`SipMessageTypes::REGISTER`|`onRegister`|Adds/updates a client in the registry. Responds `200 OK`.|
-|`INVITE`|`SipMessageTypes::INVITE`|`onInvite`|Initiates a call. Creates a `Session`. Forwards to callee.|
-|`ACK`|`SipMessageTypes::ACK`|`onAck`|Acknowledges a final response. Cleans up failed sessions.|
-|`BYE`|`SipMessageTypes::BYE`|`onBye`|Terminates an active call. Forwards to the other party.|
-|`CANCEL`|`SipMessageTypes::CANCEL`|`onCancel`|Cancels a pending INVITE.|
-|`SIP/2.0 100 Trying`|`SipMessageTypes::TRYING`|`onTrying`|Provisional: call is being routed.|
-|`SIP/2.0 180 Ringing`|`SipMessageTypes::RINGING`|`onRinging`|Provisional: destination phone is ringing.|
-|`SIP/2.0 200 OK`|`SipMessageTypes::OK`|`onOk`|Success. On INVITE OK, extracts SDP and completes session.|
-|`SIP/2.0 404 Not Found`|`SipMessageTypes::NOT\_FOUND`|—|Sent when destination number is not registered.|
-|`SIP/2.0 480 Temporarily Unavailable`|`SipMessageTypes::UNAVAILABLE`|`onUnavailable`|Destination unavailable.|
-|`SIP/2.0 486 Busy Here`|`SipMessageTypes::BUSY`|`onBusy`|Destination is busy.|
-|`SIP/2.0 487 Request Terminated`|`SipMessageTypes::REQUEST\_TERMINATED`|`onReqTerminated`|INVITE was cancelled before completion.|
-
-\---
-
-## Building
-
-The repository builds two ways from one tree. The root `CMakeLists.txt` auto-detects the `IDF\_PATH` environment variable: when present, it delegates to ESP-IDF's component build system; when absent, it builds the standard desktop executable.
-
-### ESP32-S3 (ESP-IDF)
-
-The primary target. Requires [ESP-IDF v5.x](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/get-started/) installed and sourced.
-
-```
-# Set your target chip
-idf.py set-target esp32s3
-
-# (Optional) Adjust settings via menuconfig
-idf.py menuconfig
-
-# Build, flash, and monitor serial output
-idf.py build flash monitor
-```
-
-### ESP32-S3 (Arduino IDE)
-
-If you prefer Arduino over ESP-IDF:
-
-1. Install the **ESP32 board package** via Boards Manager (search `esp32` by Espressif).
-2. Open `sketches/SipServer/SipServer.ino`.
-3. Select your board: **Tools → Board → ESP32S3 Dev Module** (or your specific LilyGO variant).
-4. Select your port: **Tools → Port → COMx**.
-5. Click **Upload**.
-
-The sketch uses Arduino's `WiFi.h` to start the SoftAP, then instantiates `SipServer` directly in `setup()`. Each sketch directory includes its own copies of the SIP source files for self-contained compilation.
-
-> **Note:** The Arduino sketches and the ESP-IDF `esp_main.cpp` are independent entry points into the same SIP engine. Use whichever toolchain you prefer — runtime behavior is identical.
-
-### JC3248W535EN Smart Display
-
-For the **Guition JC3248W535EN** (3.5" IPS touchscreen, ESP32-S3, AXS15231B QSPI display controller), the display server can be built in two ways:
-
-#### 1. [RECOMMENDED] Native ESP-IDF 5.3 + LVGL 8.3
-This method compiles the core as a native CMake application, using high-performance Espressif `esp_lcd` low-level drivers, double-buffered graphics task pinned to Core 1, and captive portal setup wizard capabilities.
-
-##### Prerequisites
-* [ESP-IDF v5.3](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/get-started/) installed and sourced.
-* The ESP-IDF Component Manager will automatically pull down `lvgl/lvgl: ^8.3.11` from the registry during build.
-
-##### Compilation & Flashing
-```bash
-# Sourced ESP-IDF environment required
-
-# 1. Set standard target to ESP32-S3
-idf.py set-target esp32s3
-
-# 2. Build target with display transport configuration
-idf.py -D SIP_TRANSPORT=display build
-
-# 3. Flash and monitor the target (replace COM3 with your actual serial port)
-idf.py -p COM3 -D SIP_TRANSPORT=display flash monitor
-```
-
-> **Note:** The QSPI PSRAM and 16MB QIO flash configurations are already predefined in `sdkconfig.defaults`, ensuring automatic PSRAM allocation for LVGL's double buffers.
 
 ---
 
-#### 2. [DEPRECATED] Arduino IDE Method (sketches/SipServer_JC3248W535/)
-This is a legacy implementation. No new features will be added here.
+## Supported SIP Methods & Responses
 
-1. Install the **ESP32 board package** via Boards Manager.
-2. Install the following libraries via Library Manager:
-   * **JC3248W535EN-Touch-LCD** by AudunKodehode
-   * **Arduino_GFX Library** by Moon On Our Nation (installed as dependency)
-3. Open `sketches/SipServer_JC3248W535/SipServer_JC3248W535.ino`.
-4. Configure **Tools** with these **mandatory** settings:
+| Method/Response | Enum Constant | Handler | Description |
+|---|---|---|---|
+| `REGISTER` | `SipMessageTypes::REGISTER` | `onRegister` | Adds or updates client binding in the registrar. |
+| `INVITE` | `SipMessageTypes::INVITE` | `onInvite` | Initiates a call session. Intercepts `777` / `999`. |
+| `ACK` | `SipMessageTypes::ACK` | `onAck` | Acknowledges session completion. |
+| `BYE` | `SipMessageTypes::BYE` | `onBye` | Terminates an active call. |
+| `CANCEL` | `SipMessageTypes::CANCEL` | `onCancel` | Aborts a pending call during ringing. |
+| `100 Trying` | `SipMessageTypes::TRYING` | `onTrying` | Provisional: call is being routed. |
+| `180 Ringing` | `SipMessageTypes::RINGING` | `onRinging` | Provisional: device alerting. Ringing SDP stripped. |
+| `200 OK` | `SipMessageTypes::OK` | `onOk` | Final success. Closes signaling handshakes. |
+| `404 Not Found` | `SipMessageTypes::NOT_FOUND` | — | Callee number is not currently registered. |
+| `480 Temp Unavailable` | `SipMessageTypes::UNAVAILABLE` | `onUnavailable` | Callee is out of range or unregistered. |
+| `486 Busy Here` | `SipMessageTypes::BUSY` | `onBusy` | Callee rejected the call. |
+| `487 Request Terminated`| `SipMessageTypes::REQUEST_TERMINATED` | `onReqTerminated` | Call aborted via CANCEL. |
 
-   | Setting | Value |
-   |---------|-------|
-   | Board | ESP32S3 Dev Module |
-   | PSRAM | **OPI PSRAM** |
-   | Flash Mode | **QIO 80MHz** |
-   | Flash Size | 16MB (128Mb) |
-   | USB CDC On Boot | Enabled |
+---
 
-5. Select your port and click **Upload**.
+## Virtual Extensions (`777` & `999`)
 
-> **⚠️ PSRAM = OPI and Flash Mode = QIO are mandatory.** The AXS15231B display driver allocates a 307.2 KB frame buffer in PSRAM during initialization. Without OPI PSRAM enabled, the board will panic on boot.
+pocket-dial includes two built-in virtual extensions to test network media paths and deploy emergency broadcast systems easily:
 
-#### Pin Mapping
+### 1. Echo Loopback Test (`777`)
+* When an endpoint dials `777`, `RequestsHandler` intercepts the `INVITE` and immediately answers `200 OK` using **the caller's own SDP connection information**.
+* This forces standard softphones and IP phones to open their RTP channels and stream their output packets back to their own receive ports.
+* Resolves the need for server-side audio transcoding or DSP, producing a zero-latency hardware echo test.
 
-| Function | GPIO | Notes |
-|----------|-------|-------|
-| QSPI PCLK | 47 | Display clock |
-| QSPI DATA0–3 | 21, 48, 40, 39 | QSPI data bus |
-| QSPI CS | 45 | Chip select |
-| Touch SDA | 4 | I2C data |
-| Touch SCL | 8 | I2C clock |
-| Touch INT | 11 | Interrupt |
-| Touch RST | 12 | Reset |
-| Touch Addr | — | `0x3B` |
-| Backlight | 1 | Active HIGH |
-| Battery ADC | 5 | Voltage divider |
+### 2. Parallel Intercom / Emergency Broadcast (`999`)
+* Dialing `999` invokes parallel forking. The server registers a broadcast session, saves the caller's `INVITE`, and cloning it, dispatches concurrent `INVITE` requests to **every registered extension** on the network (excluding the caller).
+* **Auto-Answer Injection**: Injects VoIP-standard auto-answer headers into the outgoing forks:
+  * `Call-Info: <sip:any>;answer-after=0`
+  * `Alert-Info: info=alert-autoanswer`
+  * `Alert-Info: answer-after=0`
+  * `Alert-Info: intercom=true`
+  * `P-Auto-Answer: normal`
+* **Target-URI Rewriting**: Rewrites the Request-URI and `To` headers dynamically to use the target's unique extension rather than `999` (essential for phone-side SIP validation rules).
+* **Race Connection**: The first device to answer with `200 OK` is connected to the caller. The server forwards its SDP and immediately fires off a `CANCEL` to all losing ringing targets so their alarms cease instantly. If an endpoint answers too late, the server sends an inline `BYE` to close its session cleanly.
 
-#### Diagnostic Sketches
+---
 
-Two additional sketches are provided for hardware bring-up and debugging:
+## VoIP Interoperability & SDP Stripping
 
-* **`sketches/AXS15231B_CanvasTest/`** — Canvas double-buffering test using direct raw `Arduino_GFX` to isolate blank panel driver configurations.
-* **`sketches/MinimalTest/`** — PSRAM detection, heap reporting, and frame buffer allocation test. Flash this first to verify your board settings are correct.
-* **`sketches/PinFuzzer/`** — Scans GPIO pins to verify QSPI data lines, I2C touch bus, and backlight control. Useful for confirming pin assignments on unknown board revisions.
+During testing with strict, professional SIP terminals (like Yealink IP phones), standard softphone behaviors can introduce early media loops or codec failures. pocket-dial applies two core signaling rules to guarantee perfect voice paths:
 
-### Desktop (Linux)
+1. **Ringing SDP Stripper (`clearBody`)**: When forwarding a `180 Ringing` packet, any copy of the caller's SDP is erased via `ringing->clearBody()`. The body is removed and the `Content-Length` header is rewritten to `0`. This prevents phones from opening pre-handshake early media RTP loops, avoiding local echo loops and ensuring the call transitions cleanly to "Connected" upon answering.
+2. **Strict Codec Enforcement (`enforceG711`)**: Strips non-G.711 audio configurations (like HD G.722 or Opus codecs) from forked `INVITE` and `200 OK` SDP packages, locking the media session to **PCMU / PCMA G.711** (`0 8 101`). This eliminates dead air and codec negotiation failures during auto-answers.
 
-For developing the SIP logic without flashing hardware.
+---
 
+## Automated Testing & Remote Control
+
+To facilitate automated signaling tests and validation in lab networks without physical button presses, the directory contains:
+
+### `scratch/yealink_controller.py`
+A comprehensive Python CLI tool that exploits the remote control **Action URI** endpoints on Yealink IP phones. It bypasses Web UI form handshakes and security limits by performing secure Basic Auth and anti-CSRF token-signed RSA/AES configuration provisioning uploads.
+
+#### Basic Usage:
+```bash
+# Force the T29G phone (Extension 102 / IP 181) to dial the emergency broadcast
+python scratch/yealink_controller.py 181 --dial 999
+
+# Force the older model (Extension 105 / IP 205) to dial the echo loopback
+python scratch/yealink_controller.py 205 --dial 777
+
+# Send key press codes to simulate key actions (like toggling Speakerphone or Mute)
+python scratch/yealink_controller.py both --key SPEAKER
+python scratch/yealink_controller.py 181 --key CANCEL
 ```
+
+---
+
+## Building
+
+### ESP32-S3 (ESP-IDF v5.3)
+Required for professional firmware development. Installs and registers the device under native ESP-IDF structures.
+
+```bash
+# Set compilation target chip
+idf.py set-target esp32s3
+
+# (Optional) Open configuration menu
+idf.py menuconfig
+
+# Compile, flash to the board, and monitor serial output
+idf.py build flash monitor
+```
+
+---
+
+### JC3248W535EN Smart Display
+To compile the high-performance native touchscreen switchboard UI:
+
+```bash
+# Sourced ESP-IDF environment required
+
+# 1. Select the ESP32-S3 target chip
+idf.py set-target esp32s3
+
+# 2. Build using the display transport compile flag
+idf.py -D SIP_TRANSPORT=display build
+
+# 3. Flash and monitor (replace COM3 with your actual serial port)
+idf.py -p COM3 -D SIP_TRANSPORT=display flash monitor
+```
+> [!IMPORTANT]
+> The target allocates two 307.2 KB 16-bit double buffers in external RAM. The mandatory configurations (`FlashMode=qio` and `OPI PSRAM`) are automatically handled via `sdkconfig.defaults`.
+
+---
+
+### W5500 Ethernet & PoE
+To build the server utilizing high-speed wired Ethernet (e.g. Waveshare ESP32-S3-ETH or LilyGO T-ETH-Lite):
+
+```bash
+# Build using the Ethernet transport compile flag
+idf.py -D SIP_TRANSPORT=eth build
+
+# Flash and monitor
+idf.py -p COM3 -D SIP_TRANSPORT=eth flash monitor
+```
+
+---
+
+### ESP32-S3 (Arduino IDE)
+If compiling within an Arduino framework:
+
+1. Open Boards Manager and install the **ESP32 board package** by Espressif.
+2. Open `sketches/SipServer/SipServer.ino` (or target `SipServerETH.ino` for wired PoE W5500 connections).
+3. Set your target board to **ESP32S3 Dev Module** (or specific board model).
+4. Configure **Flash Mode = QIO 80MHz** and **PSRAM = OPI PSRAM** (mandatory for display sketches).
+5. Click **Upload**.
+
+---
+
+### Desktop Mode
+
+#### 1. Linux
+Useful for debugging SIP transactions or testing softphone connections lock-free without flash waiting periods:
+```bash
 mkdir build && cd build
 cmake ..
 make
 ```
 
-### Desktop (Windows)
-
-From a Visual Studio Developer Command Prompt:
-
-```
+#### 2. Windows
+Open a Visual Studio Developer Command Prompt:
+```powershell
 mkdir build && cd build
-cmake ..
-msbuild SipServer.sln
+& "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" ..
+& "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" --build . --config Release
 ```
 
-\---
+#### Running the Desktop Binary:
+The compiled executable requires the binding IP interface as an argument:
+```bash
+# Bind the SIP server to your local network interface IP
+./build_desktop/Release/SipServer.exe --ip=192.168.12.225
 
-## Usage
-
-### ESP32-S3 Mode
-
-No configuration required. On power-up the board will:
-
-1. Initialize Non-Volatile Storage (NVS) for Wi-Fi calibration data.
-2. Start a **Wi-Fi Soft Access Point**:
-
-   * **SSID:** `esp32-sipserver`
-   * **Password:** *(none — open network)*
-   * **Channel:** 1
-   * **Max clients:** 10
-3. Run a **DHCP server** that assigns addresses to connected devices.
-4. Bind the SIP server to **`192.168.4.1:5060`** in a dedicated FreeRTOS task (8 KB stack).
-
-To place a call:
-
-1. Flash the firmware to your ESP32-S3 board.
-2. On two phones (or laptops), connect to the `esp32-sipserver` Wi-Fi network.
-3. In a SIP softphone on each, configure:
-
-   * **Domain / Outbound Proxy:** `192.168.4.1`
-   * **Port:** `5060`
-   * **Transport:** UDP
-4. Register an extension on each, then dial the other.
-
-### JC3248W535EN Mode (Touch Dashboard & Onboarding)
-
-When running the native display build, the device handles two primary states: **Onboarding Wizard** and **Active Switchboard Dashboard**.
-
-#### 1. Wi-Fi Onboarding Mode
-If the device has never been configured, or fails to connect to the saved hotspot, it starts onboarding:
-1. **SoftAP Spawned**: Launches a secure setup access point named `My-Ap` (Password: `12345678`, IP: `192.168.4.1`).
-2. **Setup Screen UI**: Renders a scannable Wi-Fi connection QR code on screen along with dynamic AP credentials.
-3. **Captive Portal Redirect**: Connect a phone or computer to the `My-Ap` Wi-Fi segment. The background UDP DNS Server (Port 53) and Host-redirect handler automatically load a retro-styled Wi-Fi wizard (`http://192.168.4.1`) in the client browser.
-4. **Choose Hotspot / Standalone Mode**:
-   * **Connect to Hotspot**: Choose a scanned local SSID, enter its WPA password, and click Connect. The device will write settings to NVS and reboot in Station mode.
-   * **Standalone AP Mode**: Click "Host Standalone AP" on screen or the webpage. The server commits standalone mode to NVS and reboots to run on its own open network segment.
-
-#### 2. Active Switchboard Mode
-Once connected to a router or committed to standalone AP mode, the screen shows the main HMI panel:
-* **Status Panel** — Host IP, SIP port, uptime counter, registered extensions, and active sessions — all updating live.
-* **Header Indicators** — Real-time battery voltage ADC status and single-cell Li-ion percentage indicator.
-* **Color Themes** — Tap the screen or options to cycle through three beautiful CRT phosphors: CGA Blue, Amber Phosphor, and Green Phosphor.
-* **Interactive Reboot** — Trigger a hardware reset with an interactive YES/NO touch dialog on screen.
-* **Live Scrolling Console** — Overrides standard ESP system logs (`esp_log_set_vprintf`) to display system boot status, Wi-Fi connectivity, SIP requests/replies, and active calls directly on the screen's scrolling CRT window.
-
-If the display or touch driver fails to initialize, the board falls back to **headless mode** — network registration, SIP registrar/proxy, and the retro HTTP Web dashboard will continue running normally without crashing.
-
-### Desktop Mode
-
-```
-# Required: --ip specifies the interface to bind
-./SipServer --ip=192.168.1.100
-
-# Optional: --port overrides the default SIP port (5060)
-./SipServer --ip=192.168.1.100 --port=5080
-
-# Show help
-./SipServer --help
+# Optional: Override the default port (5060)
+./build_desktop/Release/SipServer.exe --ip=192.168.12.225 --port=5080
 ```
 
-|Option|Required|Default|Description|
-|-|-|-|-|
-|`--ip`, `-i`|Yes|—|IP address to bind the UDP listener to|
-|`--port`, `-p`|No|`5060`|UDP port to listen on|
-|`--help`, `-h`|No|—|Print usage information|
-
-\---
-
-## Call Flow
-
-### Successful Call
-
-```
-Caller (1001)          SipServer           Callee (1002)
-    │                      │                      │
-    │── REGISTER ─────────▶│                      │
-    │◀──── 200 OK ─────────│                      │
-    │                      │                      │
-    │                      │◀──── REGISTER ───────│
-    │                      │──────── 200 OK ─────▶│
-    │                      │                      │
-    │── INVITE (SDP) ─────▶│                      │
-    │                      │── INVITE (SDP) ─────▶│
-    │                      │                      │
-    │                      │◀──── 180 Ringing ────│
-    │◀──── 180 Ringing ────│                      │
-    │                      │                      │
-    │                      │◀──── 200 OK (SDP) ───│
-    │◀──── 200 OK (SDP) ───│                      │
-    │                      │                      │
-    │── ACK ──────────────▶│                      │
-    │                      │── ACK ──────────────▶│
-    │                      │                      │
-    │◀═══════════ RTP Media (direct P2P) ═══════▶│
-    │                      │                      │
-    │── BYE ──────────────▶│                      │
-    │                      │── BYE ──────────────▶│
-    │                      │◀──── 200 OK ─────────│
-    │◀──── 200 OK ─────────│                      │
-    │                      │                      │
-```
-
-### Cancelled Call
-
-```
-Caller (1001)          SipServer           Callee (1002)
-    │                      │                      │
-    │── INVITE ───────────▶│── INVITE ───────────▶│
-    │                      │◀──── 180 Ringing ────│
-    │◀──── 180 Ringing ────│                      │
-    │                      │                      │
-    │── CANCEL ───────────▶│── CANCEL ───────────▶│
-    │                      │◀──── 200 OK ─────────│
-    │◀──── 200 OK ─────────│                      │
-    │                      │◀── 487 Req Term ─────│
-    │◀── 487 Req Term ─────│                      │
-    │── ACK ──────────────▶│── ACK ──────────────▶│
-    │                      │                      │
-```
-
-### Destination Not Found
-
-```
-Caller (1001)          SipServer
-    │                      │
-    │── INVITE ───────────▶│
-    │◀── 404 Not Found ────│  (callee not registered)
-    │                      │
-```
-
-\---
+---
 
 ## API Reference
 
 ### Core Classes
 
 #### `SipServer`
-
-Top-level orchestrator. Binds a UDP socket and wires the message factory to the request handler.
-
+Manages the lifetime of top-level sockets and binds the handler callbacks.
 ```cpp
-SipServer(std::string ip, int port = 5060);
+SipServer(std::string ip, int port = 5060, int httpPort = 8080);
 ```
 
 #### `UdpServer`
-
-Platform-abstracted UDP socket with a threaded receive loop.
-
+Handles socket execution loops, threading abstractions, and core task pinning.
 ```cpp
 UdpServer(std::string ip, int port, OnNewMessageEvent event);
-void startReceive();            // Spawns receiver thread
-int send(sockaddr\_in addr, const std::string\& buffer);
+void startReceive(); // Spawns background thread
+int send(sockaddr_in addr, const std::string& buffer);
 ```
 
-* `OnNewMessageEvent` = `std::function<void(std::string, sockaddr\_in)>`
-* Buffer size: 2048 bytes
-* Platforms: Linux (POSIX), Windows (Winsock2), ESP32 (lwIP)
+#### `SipMessage` & `SipSdpMessage`
+Parses headers and extracts SDP details through an O(n) non-mutating index-walking algorithm.
+* **`clearBody()`**: Purges message bodies and rewrites content lengths.
+* **`enforceG711()`**: Forces audio codecs list to `0 8 101`.
+* **`addHeader(name, value)`**: Injects new SIP headers before the content boundary.
 
-#### `SipMessageFactory`
-
-Creates the correct message subtype based on payload content.
-
-```cpp
-std::optional<std::shared\_ptr<SipMessage>> createMessage(std::string message, sockaddr\_in src);
-```
-
-Returns `SipSdpMessage` if the body contains `application/sdp`, otherwise `SipMessage`. Returns `std::nullopt` on parse failure.
-
-#### `SipMessage`
-
-Parses and stores SIP header fields from raw datagram text.
-
-|Getter|Returns|
-|-|-|
-|`getType()`|Request method or response line (e.g. `"INVITE"`, `"SIP/2.0 200 OK"`)|
-|`getHeader()`|Full first line of the SIP message|
-|`getVia()`|`Via` header value|
-|`getFrom()` / `getFromNumber()`|`From` header / extracted extension number|
-|`getTo()` / `getToNumber()`|`To` header / extracted extension number|
-|`getCallID()`|`Call-ID` header|
-|`getCSeq()`|`CSeq` header|
-|`getContact()` / `getContactNumber()`|`Contact` header / extracted extension|
-|`getSource()`|`sockaddr\_in` of the sending endpoint|
-|`toString()`|Reconstructed SIP message with any mutations applied|
-
-All setters (`setHeader`, `setVia`, `setTo`, …) perform in-place replacement on the raw message string, keeping `toString()` consistent.
-
-#### `SipSdpMessage` (extends `SipMessage`)
-
-Additionally parses the SDP body.
-
-|Getter|Returns|
-|-|-|
-|`getVersion()`|SDP `v=` line|
-|`getOriginator()`|SDP `o=` line|
-|`getSessionName()`|SDP `s=` line|
-|`getConnectionInformation()`|SDP `c=` line|
-|`getTime()`|SDP `t=` line|
-|`getMedia()`|SDP `m=` line|
-|`getRtpPort()`|Extracted RTP port from `m=` line|
-
-#### `SipClient`
-
-Represents a registered SIP endpoint.
-
-```cpp
-SipClient(std::string number, sockaddr\_in address);
-std::string getNumber() const;
-sockaddr\_in getAddress() const;
-```
-
-#### `Session`
-
-Tracks the lifecycle of a single call.
-
-```cpp
-Session(std::string callID, std::shared\_ptr<SipClient> src, uint32\_t srcRtpPort);
-```
-
-**States:** `Invited` → `Connected` | `Busy` | `Unavailable` | `Cancel` | `Bye`
-
-#### `RequestsHandler`
-
-Central dispatch. Maintains the client registry and active session table.
-
-```cpp
-RequestsHandler(std::string serverIp, int serverPort, OnHandledEvent onHandledEvent);
-void handle(std::shared\_ptr<SipMessage> request);
-```
-
-#### `IDGen`
-
-Thread-safe random alphanumeric string generator using `std::mt19937`.
-
-```cpp
-static std::string GenerateID(int len);  // e.g. IDGen::GenerateID(9)
-```
-
-\---
-
-## Configuration
-
-### ESP32-S3 (ESP-IDF)
-
-Compile-time constants in `main/esp_main.cpp`:
-
-|Define|Default|Description|
-|-|-|-|
-|`EXAMPLE_ESP_WIFI_SSID`|`"esp32-sipserver"`|Wi-Fi network name|
-|`EXAMPLE_ESP_WIFI_PASS`|`""`|Wi-Fi password (empty = open)|
-|`EXAMPLE_ESP_WIFI_CHANNEL`|`1`|Wi-Fi channel|
-|`EXAMPLE_MAX_STA_CONN`|`10`|Max simultaneous Wi-Fi clients|
-
-The SIP server always binds to `192.168.4.1:5060` (the default ESP-IDF SoftAP gateway address).
-
-### JC3248W535EN (Native ESP-IDF Target)
-
-All operations are persistent in the `nvs_flash` partition using the `"wifi_conf"` namespace:
-
-| NVS Key | Type | Default | Description |
-|---------|------|---------|-------------|
-| `wifi_mode` | `uint8_t` | `0` (Unconfigured) | `0` = Not configured (starts Onboarding), `1` = Station Mode (hotspot), `2` = Standalone AP Mode |
-| `wifi_ssid` | `string` | `""` | Destination Wi-Fi router SSID |
-| `wifi_pass` | `string` | `""` | Destination Wi-Fi router password |
-
-#### Hardcoded Fallbacks (Onboarding SoftAP)
-* **Onboarding SSID**: `My-Ap`
-* **Onboarding Password**: `12345678`
-* **Onboarding Gateway IP**: `192.168.4.1`
-* **SIP Port**: `5060`
-* **HTTP Dashboard Port**: `80`
-* **DNS Redirection Port**: `53`
-
-### Desktop
-
-All configuration is via command-line arguments. See [Usage → Desktop Mode](#desktop-mode).
-
-\---
+---
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
-\---
-
-## Credits
-
-The SIP/SDP parsing and dispatch architecture is inherited from the original [SipServer](https://github.com/BarGabriel/SipServer) by **Bar Gabriel** — the desktop server this project grew out of. The embedded target, SoftAP bring-up, lwIP integration, and Arduino entry point are new here.
-
-The JC3248W535EN display integration uses the [JC3248W535EN-Touch-LCD](https://github.com/AudunKodehode/JC3248W535EN-Touch-LCD) library by **AudunKodehode**, built on top of [Arduino_GFX](https://github.com/moononournation/Arduino_GFX) by **Moon On Our Nation**. Hardware reference from [NorthernMan54/JC3248W535EN](https://github.com/NorthernMan54/JC3248W535EN).
-
-Thank you, Bar, for the clean foundation for lightweight VoIP development.
-
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
