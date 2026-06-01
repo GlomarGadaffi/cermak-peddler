@@ -17,7 +17,10 @@
 class SipClient
 {
 public:
+	SipClient();
 	SipClient(std::string number, sockaddr_in address, int expiresSeconds = 3600);
+
+	void reset(std::string number, sockaddr_in address, int expiresSeconds);
 
 	bool operator==(const SipClient& other) const;
 

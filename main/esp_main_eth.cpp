@@ -205,7 +205,7 @@ static void http_server_task(void* pvParameters)
 
     ESP_LOGI(TAG, "Starting CGA CRT Dashboard on %s:%d", s_ip_addr.c_str(), HTTP_DASHBOARD_PORT);
 
-    HttpServer http(s_ip_addr, HTTP_DASHBOARD_PORT, g_sipServer->getHandler());
+    HttpServer http(s_ip_addr, HTTP_DASHBOARD_PORT, &g_sipServer->getHandler());
     http.start();
     ESP_LOGI(TAG, "CGA CRT Dashboard RUNNING at http://%s:%d/",
              s_ip_addr.c_str(), HTTP_DASHBOARD_PORT);

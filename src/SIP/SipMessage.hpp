@@ -55,10 +55,10 @@ public:
 	virtual bool hasSdp() const { return false; }
 
 	std::string toString() const;
+	bool isValidMessage() const;
 
 protected:
 	void parse();
-	bool isValidMessage() const;
 	std::string extractNumber(const std::string& header) const;
 
 	std::string _type;

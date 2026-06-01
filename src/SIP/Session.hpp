@@ -24,7 +24,10 @@ public:
 	};
 
 
+	Session();
 	Session(std::string callID, std::shared_ptr<SipClient> src);
+
+	void reset(std::string callID, std::shared_ptr<SipClient> src);
 
 	void setState(State state);
 	void setDest(std::shared_ptr<SipClient> dest);

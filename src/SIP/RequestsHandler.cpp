@@ -28,6 +28,16 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	_serverPort(serverPort)
 {
 	initHandlers();
+	// Pre-allocate pools (Issue #53)
+	for (int i = 0; i < 32; ++i)
+	{
+		_clientPool.push_back(std::make_shared<SipClient>());
+	}
+	for (int i = 0; i < 8; ++i)
+	{
+		_sessionPool.push_back(std::make_shared<Session>());
+	}
+	_dummyClient = std::make_shared<SipClient>();
 }
 
 void RequestsHandler::initHandlers()
@@ -48,10 +58,25 @@ void RequestsHandler::initHandlers()
 
 void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 {
-	_packetsProcessed.fetch_add(1, std::memory_order_relaxed);
+	// Input validation: Drop null or structurally malformed packets instantly (SEC-02)
+	if (!request || !request->isValidMessage())
+	{
+		_packetsDropped.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> localOutbox;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
+
+		// Per-source IP Rate Limiting (Issue #38 / SEC-02)
+		if (!ipAllowed(request->getSource()) || !allowPacket(request->getSource()))
+		{
+			_packetsDropped.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+
+		_packetsProcessed.fetch_add(1, std::memory_order_relaxed);
 		_outbox.clear();
 
 		auto client = findClientByAddress(request->getSource());
@@ -102,8 +127,21 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	{
 		grantedExpires = (std::max)(MIN_EXPIRES, (std::min)(requestedExpires, MAX_EXPIRES));
 		// Always update address so re-REGISTER after a NAT rebind works correctly
-		auto newClient = std::make_shared<SipClient>(data->getFromNumber(), data->getSource(), grantedExpires);
-		registerClient(std::move(newClient));
+		auto newClient = allocateClient(data->getFromNumber(), data->getSource(), grantedExpires);
+		if (newClient)
+		{
+			registerClient(newClient);
+		}
+		else
+		{
+			// Server full: reply with 503 Service Unavailable
+			auto response = std::make_shared<SipMessage>(*data);
+			response->setHeader("SIP/2.0 503 Service Unavailable");
+			std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+			response->setVia(data->getVia() + ";received=" + activeIp);
+			_outbox.emplace_back(data->getSource(), std::move(response));
+			return;
+		}
 	}
 
 	auto response = std::make_shared<SipMessage>(*data);
@@ -214,11 +252,14 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		okResponse->enforceG711();
 		_outbox.emplace_back(data->getSource(), std::move(okResponse));
 
-		auto dummyClient = std::make_shared<SipClient>("777", data->getSource(), 3600);
-		auto newSession = std::make_shared<Session>(data->getCallID(), caller.value());
-		newSession->setDest(dummyClient);
-		_sessions.emplace(data->getCallID(), newSession);
-		newSession->setState(Session::State::Connected);
+		_dummyClient->reset("777", data->getSource(), 3600);
+		auto newSession = allocateSession(data->getCallID(), caller.value());
+		if (newSession)
+		{
+			newSession->setDest(_dummyClient);
+			_sessions.emplace(data->getCallID(), newSession);
+			newSession->setState(Session::State::Connected);
+		}
 		return;
 	}
 
@@ -243,7 +284,15 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 			return;
 		}
 
-		auto newSession = std::make_shared<Session>(data->getCallID(), caller.value());
+		auto newSession = allocateSession(data->getCallID(), caller.value());
+		if (!newSession)
+		{
+			std::shared_ptr<SipMessage> responseObj = std::make_shared<SipMessage>(*data);
+			responseObj->setHeader("SIP/2.0 503 Service Unavailable");
+			responseObj->setContact(buildContact(caller.value()->getNumber()));
+			_outbox.emplace_back(data->getSource(), std::move(responseObj));
+			return;
+		}
 		newSession->setBroadcast(true);
 		newSession->setPendingTargets(targets);
 		newSession->setInviteMessage(data);
@@ -309,7 +358,15 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	auto newSession = std::make_shared<Session>(data->getCallID(), caller.value());
+	auto newSession = allocateSession(data->getCallID(), caller.value());
+	if (!newSession)
+	{
+		std::shared_ptr<SipMessage> responseObj = std::make_shared<SipMessage>(*data);
+		responseObj->setHeader("SIP/2.0 503 Service Unavailable");
+		responseObj->setContact(buildContact(caller.value()->getNumber()));
+		endHandle(data->getFromNumber(), responseObj);
+		return;
+	}
 	_sessions.emplace(data->getCallID(), newSession);
 
 	auto response = std::make_shared<SipMessage>(*data);
@@ -834,41 +891,14 @@ static const char* sessionStateToString(Session::State s)
 
 std::vector<std::pair<std::string, std::string>> RequestsHandler::getActiveClients()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
-	sweepExpired();
-	std::vector<std::pair<std::string, std::string>> result;
-	result.reserve(_clients.size());
-	for (const auto& [number, client] : _clients)
-	{
-		const auto& addr = client->getAddress();
-		char ipBuf[INET_ADDRSTRLEN]{};
-		inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf));
-		std::string ipPort = std::string(ipBuf) + ":" + std::to_string(ntohs(addr.sin_port));
-		result.emplace_back(number, ipPort);
-	}
-	return result;
+	std::lock_guard<std::mutex> lock(_snapshotMutex);
+	return _snapshot.clients;
 }
 
 std::vector<std::tuple<std::string, std::string, std::string, int>> RequestsHandler::getActiveSessions()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
-	std::vector<std::tuple<std::string, std::string, std::string, int>> result;
-	result.reserve(_sessions.size());
-	auto now = std::chrono::steady_clock::now();
-	for (const auto& [callID, session] : _sessions)
-	{
-		std::string caller = session->getSrc() ? session->getSrc()->getNumber() : "?";
-		std::string callee = session->getDest() ? session->getDest()->getNumber() : "?";
-
-		int durationSec = 0;
-		if (session->getState() == Session::State::Connected)
-		{
-			durationSec = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
-				now - session->getStartTime()).count());
-		}
-		result.emplace_back(caller, callee, sessionStateToString(session->getState()), durationSec);
-	}
-	return result;
+	std::lock_guard<std::mutex> lock(_snapshotMutex);
+	return _snapshot.sessions;
 }
 
 void RequestsHandler::forceDisconnect(const std::string& extension)
@@ -903,15 +933,14 @@ uint64_t RequestsHandler::getPacketsDropped() const
 
 size_t RequestsHandler::getClientCount()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
-	sweepExpired();
-	return _clients.size();
+	std::lock_guard<std::mutex> lock(_snapshotMutex);
+	return _snapshot.clients.size();
 }
 
 size_t RequestsHandler::getSessionCount()
 {
-	std::lock_guard<std::mutex> lock(_mutex);
-	return _sessions.size();
+	std::lock_guard<std::mutex> lock(_snapshotMutex);
+	return _snapshot.sessions.size();
 }
 
 void RequestsHandler::tick()
@@ -938,6 +967,40 @@ void RequestsHandler::tick()
 				auto ping = buildOptionsPing(client);
 				_outbox.emplace_back(client->getAddress(), std::move(ping));
 			}
+		}
+
+		// Build snapshot under registrar mutex lock, then save it under snapshot mutex lock
+		RegistrarSnapshot nextSnapshot;
+		nextSnapshot.packetsProcessed = _packetsProcessed.load(std::memory_order_relaxed);
+		nextSnapshot.packetsDropped = _packetsDropped.load(std::memory_order_relaxed);
+		nextSnapshot.clients.reserve(_clients.size());
+		for (const auto& [number, client] : _clients)
+		{
+			const auto& addr = client->getAddress();
+			char ipBuf[INET_ADDRSTRLEN]{};
+			inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf));
+			std::string ipPort = std::string(ipBuf) + ":" + std::to_string(ntohs(addr.sin_port));
+			nextSnapshot.clients.emplace_back(number, ipPort);
+		}
+
+		nextSnapshot.sessions.reserve(_sessions.size());
+		for (const auto& [callID, session] : _sessions)
+		{
+			std::string caller = session->getSrc() ? session->getSrc()->getNumber() : "?";
+			std::string callee = session->getDest() ? session->getDest()->getNumber() : "?";
+
+			int durationSec = 0;
+			if (session->getState() == Session::State::Connected)
+			{
+				durationSec = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
+					now - session->getStartTime()).count());
+			}
+			nextSnapshot.sessions.emplace_back(caller, callee, sessionStateToString(session->getState()), durationSec);
+		}
+
+		{
+			std::lock_guard<std::mutex> snapLock(_snapshotMutex);
+			_snapshot = std::move(nextSnapshot);
 		}
 
 		localOutbox = std::move(_outbox);
@@ -990,4 +1053,91 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_
 	   << "Content-Length: 0\r\n\r\n";
 
 	return std::make_shared<SipMessage>(ss.str(), client->getAddress());
+}
+
+std::shared_ptr<SipClient> RequestsHandler::allocateClient(std::string number, sockaddr_in address, int expiresSeconds)
+{
+	// Search if already exists in _clients
+	auto it = _clients.find(number);
+	if (it != _clients.end())
+	{
+		it->second->reset(std::move(number), address, expiresSeconds);
+		return it->second;
+	}
+
+	// Otherwise, find an unused slot in _clientPool
+	for (auto& client : _clientPool)
+	{
+		if (client->getNumber().empty())
+		{
+			client->reset(std::move(number), address, expiresSeconds);
+			return client;
+		}
+	}
+
+	// No free slots! Evict the oldest expired client
+	auto now = std::chrono::steady_clock::now();
+	for (auto& client : _clientPool)
+	{
+		if (client->isExpired(now))
+		{
+			client->reset(std::move(number), address, expiresSeconds);
+			return client;
+		}
+	}
+
+	// Out of space!
+	return nullptr;
+}
+
+std::shared_ptr<Session> RequestsHandler::allocateSession(std::string callID, std::shared_ptr<SipClient> src)
+{
+	// Find an unused session slot in _sessionPool
+	for (auto& session : _sessionPool)
+	{
+		if (session->getCallID().empty())
+		{
+			session->reset(std::move(callID), src);
+			return session;
+		}
+	}
+
+	// If all are full, we can't accept another session
+	return nullptr;
+}
+
+bool RequestsHandler::ipAllowed(const sockaddr_in& src) const
+{
+	if (_allowMask == 0) return true; // No allowlist configured
+	uint32_t ip = ntohl(src.sin_addr.s_addr);
+	return (ip & _allowMask) == _allowNet;
+}
+
+bool RequestsHandler::allowPacket(const sockaddr_in& src)
+{
+	auto now = std::chrono::steady_clock::now();
+	uint32_t ip = src.sin_addr.s_addr; // Key by raw network-byte-order IP
+
+	auto it = _rateBuckets.find(ip);
+	if (it == _rateBuckets.end())
+	{
+		// New bucket: burst 40, sustained 20 pkt/s
+		_rateBuckets[ip] = { 40.0, now };
+		return true;
+	}
+
+	auto& bucket = it->second;
+	double elapsedSec = std::chrono::duration<double>(now - bucket.last).count();
+	bucket.last = now;
+
+	// Replenish tokens (sustained rate = 20 tokens/sec)
+	bucket.tokens = std::min(40.0, bucket.tokens + elapsedSec * 20.0);
+
+	if (bucket.tokens >= 1.0)
+	{
+		bucket.tokens -= 1.0;
+		return true;
+	}
+
+	return false; // Denied (Rate limit exceeded)
 }

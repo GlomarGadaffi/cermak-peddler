@@ -40,7 +40,7 @@ int main(int argc, char** argv)
 		std::cout << "SIP server started on " << bindIp << ":" << port << " (LAN IP: " << lanIp << ")\n";
 
 		// Start the CGA CRT web dashboard
-		HttpServer http(bindIp, webPort, server.getHandler());
+		HttpServer http(bindIp, webPort, &server.getHandler());
 		http.start();
 		std::cout << "CGA CRT Dashboard: http://" << (bindIp == "0.0.0.0" ? "localhost" : bindIp) << ":" << webPort << "/\n";
 		if (bindIp == "0.0.0.0")

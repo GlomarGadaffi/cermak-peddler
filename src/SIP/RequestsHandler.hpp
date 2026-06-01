@@ -93,6 +93,10 @@ private:
 	void endHandle(const std::string& destNumber, std::shared_ptr<SipMessage> message);
 	std::string buildContact(const std::string& number) const;
 
+	std::shared_ptr<SipClient> allocateClient(std::string number, sockaddr_in address, int expiresSeconds);
+	std::shared_ptr<Session> allocateSession(std::string callID, std::shared_ptr<SipClient> src);
+	std::shared_ptr<SipClient> _dummyClient;
+
 	// RequestsHandler.hpp: Issues #24 and #28 resolved.
 	std::unordered_map<std::string, std::function<void(std::shared_ptr<SipMessage> request)>> _handlers;
 	std::unordered_map<std::string, std::shared_ptr<Session>>   _sessions;
@@ -107,6 +111,20 @@ private:
 
 	std::atomic<uint64_t> _packetsProcessed{0};
 	std::atomic<uint64_t> _packetsDropped{0};
+
+	struct RegistrarSnapshot
+	{
+		std::vector<std::pair<std::string, std::string>> clients;
+		std::vector<std::tuple<std::string, std::string, std::string, int>> sessions;
+		uint64_t packetsProcessed = 0;
+		uint64_t packetsDropped = 0;
+	};
+	RegistrarSnapshot _snapshot;
+	std::mutex _snapshotMutex;
+
+	// Pre-allocated static memory pools (Issue #53)
+	std::vector<std::shared_ptr<SipClient>> _clientPool;
+	std::vector<std::shared_ptr<Session>> _sessionPool;
 
 	// Issue #38: token bucket keyed by source IPv4 (network-order s_addr).
 	struct RateBucket

@@ -54,10 +54,10 @@ void wifi_init_softap(void)
                                                         NULL));
 
     wifi_config_t wifi_config = {};
-    strcpy((char*)wifi_config.ap.ssid, EXAMPLE_ESP_WIFI_SSID);
+    strlcpy((char*)wifi_config.ap.ssid, EXAMPLE_ESP_WIFI_SSID, sizeof(wifi_config.ap.ssid));
     wifi_config.ap.ssid_len = strlen(EXAMPLE_ESP_WIFI_SSID);
     wifi_config.ap.channel = EXAMPLE_ESP_WIFI_CHANNEL;
-    strcpy((char*)wifi_config.ap.password, EXAMPLE_ESP_WIFI_PASS);
+    strlcpy((char*)wifi_config.ap.password, EXAMPLE_ESP_WIFI_PASS, sizeof(wifi_config.ap.password));
     wifi_config.ap.max_connection = EXAMPLE_MAX_STA_CONN;
     wifi_config.ap.authmode = WIFI_AUTH_OPEN;
 
@@ -98,7 +98,7 @@ void http_server_task(void *pvParameters)
     std::string ip = "192.168.4.1";
     ESP_LOGI("HttpTask", "Starting CGA CRT Dashboard on %s:%d", ip.c_str(), HTTP_DASHBOARD_PORT);
 
-    HttpServer http(ip, HTTP_DASHBOARD_PORT, g_sipServer->getHandler());
+    HttpServer http(ip, HTTP_DASHBOARD_PORT, &g_sipServer->getHandler());
     http.start();
     ESP_LOGI("HttpTask", "CGA CRT Dashboard is RUNNING at http://%s:%d/", ip.c_str(), HTTP_DASHBOARD_PORT);
     while (1) {

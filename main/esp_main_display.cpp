@@ -187,7 +187,7 @@ static void wifi_init_softap(const char* ssid, const char* pass, bool open_netwo
     esp_netif_create_default_wifi_ap();
 
     wifi_config_t wifi_config = {};
-    strcpy((char*)wifi_config.ap.ssid, ssid);
+    strlcpy((char*)wifi_config.ap.ssid, ssid, sizeof(wifi_config.ap.ssid));
     wifi_config.ap.ssid_len = strlen(ssid);
     wifi_config.ap.channel = 1;
     wifi_config.ap.max_connection = 10;
@@ -196,7 +196,7 @@ static void wifi_init_softap(const char* ssid, const char* pass, bool open_netwo
         wifi_config.ap.password[0] = '\0';
     } else {
         wifi_config.ap.authmode = WIFI_AUTH_WPA_WPA2_PSK;
-        strcpy((char*)wifi_config.ap.password, pass);
+        strlcpy((char*)wifi_config.ap.password, pass, sizeof(wifi_config.ap.password));
     }
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
@@ -210,8 +210,8 @@ static bool wifi_init_sta(const char* ssid, const char* pass) {
     esp_netif_t* sta_netif = esp_netif_create_default_wifi_sta();
 
     wifi_config_t wifi_config = {};
-    strcpy((char*)wifi_config.sta.ssid, ssid);
-    strcpy((char*)wifi_config.sta.password, pass);
+    strlcpy((char*)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
+    strlcpy((char*)wifi_config.sta.password, pass, sizeof(wifi_config.sta.password));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
@@ -276,7 +276,7 @@ static void http_server_task(void *pvParameters) {
     while (g_sipServer == nullptr) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    g_httpServer = new HttpServer(g_localIp, 80, g_sipServer->getHandler());
+    g_httpServer = new HttpServer(g_localIp, 80, &g_sipServer->getHandler());
     g_httpServer->start();
     ESP_LOGI("HttpTask", "CGA Web UI Running successfully!");
     
@@ -425,12 +425,20 @@ extern "C" void app_main(void) {
 
     nvs_handle_t nvs_handle;
     if (nvs_open("storage", NVS_READONLY, &nvs_handle) == ESP_OK) {
-        nvs_get_u8(nvs_handle, "wifi_mode", &wifi_mode);
+        if (nvs_get_u8(nvs_handle, "wifi_mode", &wifi_mode) != ESP_OK) {
+            wifi_mode = 0;
+        }
         size_t size = sizeof(saved_ssid);
-        nvs_get_str(nvs_handle, "wifi_ssid", saved_ssid, &size);
+        if (nvs_get_str(nvs_handle, "wifi_ssid", saved_ssid, &size) != ESP_OK) {
+            saved_ssid[0] = '\0';
+        }
         size = sizeof(saved_pass);
-        nvs_get_str(nvs_handle, "wifi_pass", saved_pass, &size);
+        if (nvs_get_str(nvs_handle, "wifi_pass", saved_pass, &size) != ESP_OK) {
+            saved_pass[0] = '\0';
+        }
         nvs_close(nvs_handle);
+    } else {
+        wifi_mode = 0; // Default to onboarding setup AP on NVS failure
     }
 
     ESP_LOGI(TAG, "Persisted Network settings: Mode=%d, SSID=%s", wifi_mode, saved_ssid);
@@ -484,7 +492,7 @@ extern "C" void app_main(void) {
         
         // Start configuration Web portal on Port 80
         g_localIp = "192.168.4.1";
-        g_httpServer = new HttpServer(g_localIp, 80, *(RequestsHandler*)nullptr); // pass null since no sip server is active yet
+        g_httpServer = new HttpServer(g_localIp, 80, nullptr); // pass null since no sip server is active yet
         g_httpServer->start();
         
         ESP_LOGI(TAG, "Captive onboarding interface active. Access http://192.168.4.1/");
