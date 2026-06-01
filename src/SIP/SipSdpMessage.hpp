@@ -7,6 +7,8 @@ class SipSdpMessage : public SipMessage
 {
 public:
 	SipSdpMessage(std::string message, sockaddr_in src);
+
+	// Issue #42: see SipMessage::hasSdp(). This concrete type always carries SDP.
 	bool hasSdp() const override { return true; }
 
 	void setMedia(std::string value);

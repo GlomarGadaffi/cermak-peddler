@@ -380,6 +380,7 @@ void HttpServer::sendApiStatus(int sock)
 	auto clients = _handler.getActiveClients();
 	auto sessions = _handler.getActiveSessions();
 	uint64_t packets = _handler.getPacketsProcessed();
+	uint64_t dropped = _handler.getPacketsDropped();   // Issue #38
 
 	std::string displayIp = _ip;
 	if (displayIp == "0.0.0.0")
@@ -394,6 +395,7 @@ void HttpServer::sendApiStatus(int sock)
 	json << "\"httpPort\":" << _port << ",";
 	json << "\"uptime\":" << uptimeSec << ",";
 	json << "\"packetsProcessed\":" << packets << ",";
+	json << "\"packetsDropped\":" << dropped << ",";
 
 	// Clients array
 	json << "\"clients\":[";

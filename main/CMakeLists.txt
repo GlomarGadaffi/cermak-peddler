@@ -33,4 +33,12 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/SipSdpMessage.cpp"
                             "../src/SIP/SipServer.cpp"
                     INCLUDE_DIRS "../src/Helpers" "../src/SIP" "drivers" "ui" "wifi"
-                    REQUIRES nvs_flash lwip esp_netif esp_event freertos espressif__mdns esp_driver_gpio esp_wifi esp_lcd lvgl__lvgl esp_eth driver)
+                    REQUIRES nvs_flash lwip esp_netif esp_event freertos mdns ${EXTRA_REQUIRES})
+
+# Issue #49: the display transport reserves Core 1 for the LVGL graphics task and
+# runs the SIP engine on Core 0, so the UDP receiver (which carries SIP signaling)
+# must stay on Core 0. The SoftAP/Ethernet transports run SIP on Core 1 and use the
+# UdpServer default (Core 1).
+if(SIP_TRANSPORT STREQUAL "display")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE POCKETDIAL_UDP_RX_CORE=0)
+endif()

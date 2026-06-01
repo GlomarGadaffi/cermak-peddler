@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Broadcast / All-Page Extension (#37)**: An `INVITE` to the virtual extension `999` (compile-time `-DPOCKETDIAL_PAGE_EXTENSION="…"`) is forked to every other registered endpoint at once. The first to answer with `200 OK` is connected to the caller and the rest receive a `CANCEL`; an endpoint that answers after the race is sent a `BYE` so it doesn't sit off-hook. In-dialog `ACK`/`BYE` for a paging call are routed by the connected peer's address rather than the (virtual) page extension. Useful for field/event/emergency deployments where an admin needs to reach *anyone* currently registered.
+- **Per-Source-IP Rate Limiting & Optional Allowlist (#38)**: `RequestsHandler` now drops UDP traffic from flooding sources via a per-IP token bucket (defaults: burst 40, sustained 20 pkt/s), evaluated before any parsing or registry work so a flood can neither consume CPU nor keep a registration artificially alive. Idle buckets are evicted during the periodic sweep to bound memory on ESP32. An optional compile-time CIDR allowlist (`-DPOCKETDIAL_ALLOW_CIDR="192.168.1.0/24"`) restricts which subnets may reach the server. Dropped-packet count is exposed on the dashboard `/api/status` as `packetsDropped`.
+- **Configurable mDNS Hostname (#47)**: The mDNS hostname is now a compile-time define (`-DPOCKETDIAL_HOSTNAME="..."`, default `pocketdial`) so two units on one LAN no longer both claim `pocketdial.local`.
+- **Configurable Keepalive Cadence (#47)**: OPTIONS ping interval and the endpoint-silence timeout are now compile-time tunables (`POCKETDIAL_KEEPALIVE_PING_SECS`, default 30; `POCKETDIAL_KEEPALIVE_TIMEOUT_SECS`, default 90).
+
 - **Native ESP-IDF 5.3 + LVGL 8.3 Display Integration for JC3248W535EN (#40)**:
   - Migrated the Guition 3.5" IPS display and touch dashboard stack from Arduino to a clean native ESP-IDF v5.3 CMake target environment.
   - Implemented standard low-level panel and touch screen driver layer `main/drivers/esp_lcd_axs15231b` derived from proven NorthernMan54 drivers (#43).
@@ -24,6 +29,14 @@ All notable changes to this project will be documented in this file.
 - **Display Bring-Up / Isolation Sketch (#40)**: Added `sketches/AXS15231B_CanvasTest/AXS15231B_CanvasTest.ino`, a standalone (no Wi-Fi/SIP/HTTP) test that drives the panel with the *proven* raw `Arduino_GFX` stack — `Arduino_ESP32QSPI` → `Arduino_AXS15231B` → `Arduino_Canvas` with an explicit `gfx->flush()` per frame. It isolates the blank-screen fault: if this renders, the panel/pins/PSRAM are good and the issue is the `JC3248W535EN` library's internal config (migrate per the recipe in the sketch); if it's also blank, the fault is hardware/board-settings (PSRAM mode or pin map). Test pattern includes colour bars, edge-to-edge corner markers, and a live frame counter to confirm repeated flushes refresh the panel.
 - **Battery Voltage Monitor (#46)**: `SipServer_JC3248W535.ino` now samples the GPIO 5 battery divider every 10 s via the calibrated `analogReadMilliVolts()`, converts to volts (configurable `BATTERY_DIVIDER`) and an approximate single-cell Li-ion percentage, logs it to Serial, and shows it in the top-right of the on-screen header (renders once the display path from #40 is resolved).
 
+### Fixed
+- **Keepalive Pruning Evicted Live Clients (#47)**: Registration is no longer torn down merely because a client ignores our `OPTIONS` pings (answering out-of-dialog OPTIONS is a SHOULD, not a MUST in RFC 3261). Clients now ride their negotiated REGISTER lease; the previous 5 s/15 s defaults had been flapping live softphones in and out of the registry between REGISTERs.
+- **Orphaned Session Leak on Lost Endpoint (#31)**: Because the server is blind to peer-to-peer RTP, a client that lost power or walked out of range mid-call never sent `BYE`, leaking the session indefinitely. `sweepExpired()` now reaps an established (`Connected`) session once either endpoint has been silent past the keepalive timeout — without unregistering the client itself.
+- **SIP Signaling Pinned to the Wrong Core (#49)**: `udp_receiver_task` runs `RequestsHandler::handle()` inline, so it *is* the SIP signaling control plane — but it was hardcoded to Core 0, where it competed with the HTTP server and the Wi-Fi/lwIP stack while the SIP engine task sat idle on Core 1, defeating the dual-core split. The receiver core is now a compile-time override (`-DPOCKETDIAL_UDP_RX_CORE`, default 1) that matches the SIP engine task on the SoftAP and Ethernet builds; the LVGL display build overrides it to 0 to keep Core 1 free for graphics.
+
+### Changed
+- **RTTI-Free SDP Dispatch (#42)**: `RequestsHandler::onInvite()` and `onOk()` now probe for SDP via a virtual `SipMessage::hasSdp()` instead of `dynamic_cast<SipSdpMessage*>`, which fails silently on the Arduino ESP32 toolchain (built with `-fno-rtti`). Desktop behavior is identical; Arduino call setup is fixed.
+
 ### Notes
 - **#40 diagnosis**: The `JC3248W535EN` library exposes no `flush()`/`update()` and refreshes internally, so the blank panel cannot be fixed from the app sketch by adding a flush — the reliable fix is to drive the AXS15231B directly with `Arduino_GFX` + `Arduino_Canvas` + `flush()` (the community-confirmed path for this board), which the bring-up sketch above demonstrates.
 
@@ -41,6 +54,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 - **SIP Core Refactoring (bring-up fixes)**: Updated `UdpServer.cpp/.hpp`, `RequestsHandler.cpp/.hpp`, `SipClient.hpp`, `SipMessage.hpp`, and `SipSdpMessage.hpp` with accumulated fixes discovered during JC3248W535EN board bring-up and testing.
+
+## [v1.1.0] - 2026-05-29
 
 ### Added
 - **mDNS / Bonjour Broadcast (.local domain)**: Added native multicast DNS (mDNS) responder support (`pocketdial.local`). Integrates natively with `<ESPmDNS.h>` in Arduino environments and the built-in `mdns` component in ESP-IDF environments, while compiling out completely on desktop builds to keep them lightweight. Automatically registers `_sip._udp` (port 5060) and `_http._tcp` (port 80/8080) services.
