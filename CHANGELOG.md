@@ -4,6 +4,57 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Broadcast / All-Page Extension (#37)**: An `INVITE` to the virtual extension `999` (compile-time `-DPOCKETDIAL_PAGE_EXTENSION="…"`) is forked to every other registered endpoint at once. The first to answer with `200 OK` is connected to the caller and the rest receive a `CANCEL`; an endpoint that answers after the race is sent a `BYE` so it doesn't sit off-hook. In-dialog `ACK`/`BYE` for a paging call are routed by the connected peer's address rather than the (virtual) page extension. Useful for field/event/emergency deployments where an admin needs to reach *anyone* currently registered.
+- **Per-Source-IP Rate Limiting & Optional Allowlist (#38)**: `RequestsHandler` now drops UDP traffic from flooding sources via a per-IP token bucket (defaults: burst 40, sustained 20 pkt/s), evaluated before any parsing or registry work so a flood can neither consume CPU nor keep a registration artificially alive. Idle buckets are evicted during the periodic sweep to bound memory on ESP32. An optional compile-time CIDR allowlist (`-DPOCKETDIAL_ALLOW_CIDR="192.168.1.0/24"`) restricts which subnets may reach the server. Dropped-packet count is exposed on the dashboard `/api/status` as `packetsDropped`.
+- **Configurable mDNS Hostname (#47)**: The mDNS hostname is now a compile-time define (`-DPOCKETDIAL_HOSTNAME="..."`, default `pocketdial`) so two units on one LAN no longer both claim `pocketdial.local`.
+- **Configurable Keepalive Cadence (#47)**: OPTIONS ping interval and the endpoint-silence timeout are now compile-time tunables (`POCKETDIAL_KEEPALIVE_PING_SECS`, default 30; `POCKETDIAL_KEEPALIVE_TIMEOUT_SECS`, default 90).
+
+- **Native ESP-IDF 5.3 + LVGL 8.3 Display Integration for JC3248W535EN (#40)**:
+  - Migrated the Guition 3.5" IPS display and touch dashboard stack from Arduino to a clean native ESP-IDF v5.3 CMake target environment.
+  - Implemented standard low-level panel and touch screen driver layer `main/drivers/esp_lcd_axs15231b` derived from proven NorthernMan54 drivers (#43).
+  - Ported the retro CGA HMI to native LVGL 8.3 widgets running in a dedicated `lvgl_task` pinned to CPU **Core 1** to guarantee high frame rates without stuttering.
+  - Configured double-buffering using two 307.2 KB 16-bit color frames allocated in external **OPI PSRAM** (`sdkconfig.defaults`).
+  - Added a simulated coordinate-based press router to bypass offset calibration and alignment issues (#43).
+  - Intercepted ESP-IDF logs using `esp_log_set_vprintf` to pipe boot status, Wi-Fi configuration, and SIP registration events directly into a scrollable terminal area on screen.
+- **Captive Portal Wi-Fi Onboarding**:
+  - Implemented a background UDP DNS Redirect Server listening on Port 53, resolving all host queries to `192.168.4.1` on boot when unconfigured.
+  - Added Host header inspection in `HttpServer` to intercept all HTTP requests and redirect them (HTTP 302) to the retro-styled Wi-Fi onboarding panel.
+  - Created a responsive, theme-matching `wifi_setup.html` web wizard enabling clients to scan local hotspots, input passwords, or commit the server to Standalone AP mode directly from their device.
+  - Integrated full NVS-based configuration persistence using the `"wifi_conf"` namespace to persist Wi-Fi credentials and modes across hard power cycles.
+  - Added canvas-based Wi-Fi QR code join credentials rendering using `ricmoo/QRCode` in the setup and menu overlays (#45).
+  - Integrated battery voltage ADC sampling on GPIO 5 to display live percentages and voltage status in the CRT dashboard header bar (#46).
+- **Arduino Display Sketch Deprecation**:
+  - Formally deprecated the legacy `sketches/SipServer_JC3248W535/` Arduino sketch while keeping it in the repository tree for historical context.
+- **Display Bring-Up / Isolation Sketch (#40)**: Added `sketches/AXS15231B_CanvasTest/AXS15231B_CanvasTest.ino`, a standalone (no Wi-Fi/SIP/HTTP) test that drives the panel with the *proven* raw `Arduino_GFX` stack — `Arduino_ESP32QSPI` → `Arduino_AXS15231B` → `Arduino_Canvas` with an explicit `gfx->flush()` per frame. It isolates the blank-screen fault: if this renders, the panel/pins/PSRAM are good and the issue is the `JC3248W535EN` library's internal config (migrate per the recipe in the sketch); if it's also blank, the fault is hardware/board-settings (PSRAM mode or pin map). Test pattern includes colour bars, edge-to-edge corner markers, and a live frame counter to confirm repeated flushes refresh the panel.
+- **Battery Voltage Monitor (#46)**: `SipServer_JC3248W535.ino` now samples the GPIO 5 battery divider every 10 s via the calibrated `analogReadMilliVolts()`, converts to volts (configurable `BATTERY_DIVIDER`) and an approximate single-cell Li-ion percentage, logs it to Serial, and shows it in the top-right of the on-screen header (renders once the display path from #40 is resolved).
+
+### Fixed
+- **Keepalive Pruning Evicted Live Clients (#47)**: Registration is no longer torn down merely because a client ignores our `OPTIONS` pings (answering out-of-dialog OPTIONS is a SHOULD, not a MUST in RFC 3261). Clients now ride their negotiated REGISTER lease; the previous 5 s/15 s defaults had been flapping live softphones in and out of the registry between REGISTERs.
+- **Orphaned Session Leak on Lost Endpoint (#31)**: Because the server is blind to peer-to-peer RTP, a client that lost power or walked out of range mid-call never sent `BYE`, leaking the session indefinitely. `sweepExpired()` now reaps an established (`Connected`) session once either endpoint has been silent past the keepalive timeout — without unregistering the client itself.
+- **SIP Signaling Pinned to the Wrong Core (#49)**: `udp_receiver_task` runs `RequestsHandler::handle()` inline, so it *is* the SIP signaling control plane — but it was hardcoded to Core 0, where it competed with the HTTP server and the Wi-Fi/lwIP stack while the SIP engine task sat idle on Core 1, defeating the dual-core split. The receiver core is now a compile-time override (`-DPOCKETDIAL_UDP_RX_CORE`, default 1) that matches the SIP engine task on the SoftAP and Ethernet builds; the LVGL display build overrides it to 0 to keep Core 1 free for graphics.
+
+### Changed
+- **RTTI-Free SDP Dispatch (#42)**: `RequestsHandler::onInvite()` and `onOk()` now probe for SDP via a virtual `SipMessage::hasSdp()` instead of `dynamic_cast<SipSdpMessage*>`, which fails silently on the Arduino ESP32 toolchain (built with `-fno-rtti`). Desktop behavior is identical; Arduino call setup is fixed.
+
+### Notes
+- **#40 diagnosis**: The `JC3248W535EN` library exposes no `flush()`/`update()` and refreshes internally, so the blank panel cannot be fixed from the app sketch by adding a flush — the reliable fix is to drive the AXS15231B directly with `Arduino_GFX` + `Arduino_Canvas` + `flush()` (the community-confirmed path for this board), which the bring-up sketch above demonstrates.
+
+## [v1.2.0] - 2026-05-31
+
+### Added
+- **JC3248W535EN (Guition 3.5" IPS) Display Support**:
+    - Added `SipServer_JC3248W535.ino` Arduino sketch: a full SIP PBX server with integrated touchscreen UI via the AXS15231B QSPI display controller. Uses the `JC3248W535EN` library with LVGL for rendering a call-status dashboard directly on the 320×480 IPS panel. Includes a `displayActive` global flag and headless fallback so the SIP server continues operating even if the display driver fails to initialise.
+    - Added `MinimalTest.ino` diagnostic sketch: standalone PSRAM/heap/buffer verification tool that confirms OPI PSRAM detection, 307.2 KB frame-buffer allocation, and correct `FlashMode=qio` configuration on the ESP32-S3.
+    - Added `PinFuzzer.ino` diagnostic sketch: GPIO scan tool for probing and verifying QSPI data lines, I2C touch bus, and backlight control on JC3248W535EN hardware.
+- **Hardware Pin Reference**: JC3248W535EN pin mapping documented in sketch headers — QSPI (GPIO 47/21/48/40/39/45), I2C touch (SDA 4, SCL 8, INT 11, RST 12, addr `0x3B`), backlight (GPIO 1), battery ADC (GPIO 5).
+
+### Fixed
+- **ESP32-S3 Boot Panic from Global Static Display Objects**: Discovered that globally instantiating the `JC3248W535EN` display driver as a static C++ object caused heap/PSRAM allocation in the global constructor — before `setup()` and before PSRAM was initialised by the Arduino core — triggering a hard fault at `0x403c8898`. Refactored to pointer-based deferred instantiation inside `setup()` to ensure safe initialisation order.
+
+### Changed
+- **SIP Core Refactoring (bring-up fixes)**: Updated `UdpServer.cpp/.hpp`, `RequestsHandler.cpp/.hpp`, `SipClient.hpp`, `SipMessage.hpp`, and `SipSdpMessage.hpp` with accumulated fixes discovered during JC3248W535EN board bring-up and testing.
+
 ## [v1.1.0] - 2026-05-29
 
 ### Added

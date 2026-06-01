@@ -12,9 +12,6 @@
 
 #if defined(ESP_PLATFORM)
 #include "esp_wifi.h"
-#include "nvs_flash.h"
-#include "nvs.h"
-#include "esp_system.h"
 #endif
 
 HttpServer::HttpServer(const std::string& ip, int port, RequestsHandler& handler)
@@ -186,23 +183,6 @@ void HttpServer::handleClient(int clientSock)
 
 	HttpRequest req = parseRequest(raw);
 
-#if defined(ESP_PLATFORM)
-	// Captive Portal Redirect: If the request is a GET, and the Host is not our IP or is a generic captive portal test domain,
-	// redirect the user to our landing page. This triggers the OS captive portal prompt.
-	bool isLocalHost = (req.host.find("192.168.4.1") != std::string::npos || 
-	                    req.host.find("localhost") != std::string::npos ||
-	                    req.host.find("pocketdial") != std::string::npos ||
-	                    _ip == "0.0.0.0" || 
-	                    req.host.find(_ip) != std::string::npos);
-
-	if (req.method == "GET" && !isLocalHost && req.path != "/api/status" && req.path != "/api/wifi/scan")
-	{
-		sendRedirect(clientSock, "http://192.168.4.1/");
-		closeSocket(clientSock);
-		return;
-	}
-#endif
-
 	// Route
 	if (req.method == "GET" && (req.path == "/" || req.path == "/index.html"))
 	{
@@ -238,18 +218,6 @@ void HttpServer::handleClient(int clientSock)
 		else
 		{
 			sendApiWifiConnect(clientSock, req.body);
-		}
-	}
-	else if (req.method == "POST" && req.path == "/api/wifi/mode_ap")
-	{
-		if (!isSameOrigin(req))
-		{
-			sendResponse(clientSock, 403, "Forbidden", "application/json",
-			             "{\"error\":\"cross-origin request rejected\"}");
-		}
-		else
-		{
-			sendApiWifiModeAp(clientSock);
 		}
 	}
 	else
@@ -370,7 +338,6 @@ void HttpServer::sendApiStatus(int sock)
 	auto clients = _handler.getActiveClients();
 	auto sessions = _handler.getActiveSessions();
 	uint64_t packets = _handler.getPacketsProcessed();
-	uint64_t dropped = _handler.getPacketsDropped();   // Issue #38
 
 	std::string displayIp = _ip;
 	if (displayIp == "0.0.0.0")
@@ -385,7 +352,6 @@ void HttpServer::sendApiStatus(int sock)
 	json << "\"httpPort\":" << _port << ",";
 	json << "\"uptime\":" << uptimeSec << ",";
 	json << "\"packetsProcessed\":" << packets << ",";
-	json << "\"packetsDropped\":" << dropped << ",";
 
 	// Clients array
 	json << "\"clients\":[";
@@ -612,64 +578,26 @@ void HttpServer::sendApiWifiConnect(int sock, const std::string& body)
 	}
 
 #if defined(ESP_PLATFORM)
-	nvs_handle_t nvs_handle;
-	esp_err_t err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
-	if (err == ESP_OK) {
-		nvs_set_u8(nvs_handle, "wifi_mode", 1); // 1 = STATION
-		nvs_set_str(nvs_handle, "wifi_ssid", ssid.c_str());
-		nvs_set_str(nvs_handle, "wifi_pass", password.c_str());
-		nvs_commit(nvs_handle);
-		nvs_close(nvs_handle);
+	wifi_config_t wifi_config = {};
+	strncpy(reinterpret_cast<char*>(wifi_config.sta.ssid), ssid.c_str(), sizeof(wifi_config.sta.ssid) - 1);
+	strncpy(reinterpret_cast<char*>(wifi_config.sta.password), password.c_str(), sizeof(wifi_config.sta.password) - 1);
+	
+	esp_wifi_set_mode(WIFI_MODE_APSTA);
+	esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+	
+	esp_err_t err = esp_wifi_connect();
+	if (err == ESP_OK)
+	{
+		sendResponse(sock, 200, "OK", "text/plain", "WiFi connection initiated successfully.");
 	}
-
-	sendResponse(sock, 200, "OK", "application/json",
-	             "{\"status\":\"ok\",\"message\":\"WiFi credentials saved. Rebooting to Station Mode...\"}");
-
-	// Create a background task to restart after 1 second
-	xTaskCreate([](void*) {
-		vTaskDelay(pdMS_TO_TICKS(1000));
-		esp_restart();
-	}, "restart_task", 2048, NULL, 5, NULL);
+	else
+	{
+		sendResponse(sock, 500, "Internal Server Error", "application/json",
+		             "{\"error\":\"WiFi connection initiation failed\",\"code\":" + std::to_string(err) + "}");
+	}
 #else
 	(void)password;
 	sendResponse(sock, 501, "Not Implemented", "application/json",
 	             "{\"error\":\"WiFi connect not available on desktop\"}");
 #endif
-}
-
-void HttpServer::sendApiWifiModeAp(int sock)
-{
-#if defined(ESP_PLATFORM)
-	nvs_handle_t nvs_handle;
-	esp_err_t err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
-	if (err == ESP_OK) {
-		nvs_set_u8(nvs_handle, "wifi_mode", 2); // 2 = AP (Standalone)
-		nvs_commit(nvs_handle);
-		nvs_close(nvs_handle);
-	}
-
-	sendResponse(sock, 200, "OK", "application/json",
-	             "{\"status\":\"ok\",\"message\":\"Operational mode set to Standalone AP. Rebooting...\"}");
-
-	// Create a background task to restart after 1 second
-	xTaskCreate([](void*) {
-		vTaskDelay(pdMS_TO_TICKS(1000));
-		esp_restart();
-	}, "restart_task", 2048, NULL, 5, NULL);
-#else
-	sendResponse(sock, 501, "Not Implemented", "application/json",
-	             "{\"error\":\"WiFi mode select not available on desktop\"}");
-#endif
-}
-
-void HttpServer::sendRedirect(int sock, const std::string& location)
-{
-	std::ostringstream resp;
-	resp << "HTTP/1.1 302 Found\r\n";
-	resp << "Location: " << location << "\r\n";
-	resp << "Content-Length: 0\r\n";
-	resp << "Connection: close\r\n\r\n";
-
-	std::string data = resp.str();
-	::send(sock, data.c_str(), static_cast<int>(data.size()), 0);
 }

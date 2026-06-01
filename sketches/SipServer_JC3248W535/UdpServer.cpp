@@ -2,17 +2,6 @@
 #include <thread>
 #include <cstring>
 
-// Issue #49: RequestsHandler::handle() runs inline in udp_receiver_task, so this
-// task IS the SIP signaling control plane and must share a core with the rest of
-// the SIP engine. The SoftAP (esp_main.cpp) and Ethernet (esp_main_eth.cpp) builds
-// run the SIP engine task on Core 1 and reserve Core 0 for the HTTP/Wi-Fi/lwIP
-// stack, so the receiver defaults to Core 1. The display build (esp_main_display.cpp)
-// reserves Core 1 exclusively for the LVGL graphics task and runs SIP on Core 0, so
-// it overrides this to 0 via -DPOCKETDIAL_UDP_RX_CORE=0 (see main/CMakeLists.txt).
-#ifndef POCKETDIAL_UDP_RX_CORE
-#define POCKETDIAL_UDP_RX_CORE 1
-#endif
-
 UdpServer::UdpServer(std::string ip, int port, OnNewMessageEvent event) : _ip(std::move(ip)), _port(port), _onNewMessageEvent(event), _keepRunning(false)
 {
 
@@ -79,7 +68,7 @@ void UdpServer::startReceive()
 		this,
 		5,    // Priority
 		&_receiverTaskHandle,
-		POCKETDIAL_UDP_RX_CORE   // Issue #49: co-locate with the SIP engine (Core 1 by default)
+		0     // Pinned to Core 0
 	);
 #else
 	_receiverThread = std::thread([=]() { receiveLoop(); });

@@ -7,12 +7,6 @@
 #include <mdns.h>
 #endif
 
-// Issue #47: mDNS hostname is compile-time configurable so two units on one LAN
-// don't both claim "pocketdial.local". Override with -DPOCKETDIAL_HOSTNAME=\"foo\".
-#ifndef POCKETDIAL_HOSTNAME
-#define POCKETDIAL_HOSTNAME "pocketdial"
-#endif
-
 SipServer::SipServer(std::string ip, int port, int httpPort) :
 	_socket(ip, port, std::bind(&SipServer::onNewMessage, this, std::placeholders::_1, std::placeholders::_2)),
 	_handler(ip, port, std::bind(&SipServer::onHandled, this, std::placeholders::_1, std::placeholders::_2))
@@ -22,21 +16,24 @@ SipServer::SipServer(std::string ip, int port, int httpPort) :
 
 	// ── Multicast DNS (mDNS) responder broadcast ─────────────────────
 #if defined(ARDUINO)
-	if (MDNS.begin(POCKETDIAL_HOSTNAME)) {
+	// MDNS.begin is commented out temporarily to isolate network bootloop crashes
+	/*
+	if (MDNS.begin("pocketdial")) {
 		MDNS.addService("sip", "udp", port);
-		MDNS.addService("http", "tcp", httpPort);
-		std::cout << "[mDNS] Broadcast active: " << POCKETDIAL_HOSTNAME << ".local\n";
+		MDNS.addService("http", "httpPort", httpPort);
+		std::cout << "[mDNS] Broadcast active: pocketdial.local\n";
 	} else {
 		std::cerr << "[mDNS] Failed to start responder\n";
 	}
+	*/
 #elif defined(ESP_PLATFORM)
 	esp_err_t err = mdns_init();
 	if (err == ESP_OK) {
-		mdns_hostname_set(POCKETDIAL_HOSTNAME);
+		mdns_hostname_set("pocketdial");
 		mdns_instance_name_set("Pocket Dial SIP Server");
 		mdns_service_add(NULL, "_sip", "_udp", port, NULL, 0);
 		mdns_service_add(NULL, "_http", "_tcp", httpPort, NULL, 0);
-		std::cout << "[mDNS] Broadcast active: " << POCKETDIAL_HOSTNAME << ".local\n";
+		std::cout << "[mDNS] Broadcast active: pocketdial.local\n";
 	} else {
 		std::cerr << "[mDNS] Failed to initialize: " << err << "\n";
 	}
