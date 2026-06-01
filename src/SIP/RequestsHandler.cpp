@@ -896,6 +896,11 @@ uint64_t RequestsHandler::getPacketsProcessed() const
 	return _packetsProcessed.load(std::memory_order_relaxed);
 }
 
+uint64_t RequestsHandler::getPacketsDropped() const
+{
+	return _packetsDropped.load(std::memory_order_relaxed);
+}
+
 size_t RequestsHandler::getClientCount()
 {
 	std::lock_guard<std::mutex> lock(_mutex);
