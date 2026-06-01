@@ -260,36 +260,28 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
 // ─── Server Tasks on Core 0 ───
 static void sip_server_task(void *pvParameters) {
     ESP_LOGI("SipTask", "Starting SipServer engine on Core 0 IP %s:%d", g_localIp.c_str(), 5060);
-    try {
-        g_sipServer = new SipServer(g_localIp, 5060);
-        while (1) {
-            if (g_sipServer) {
-                g_sipServer->getHandler().tick();
-            }
-            vTaskDelay(pdMS_TO_TICKS(30)); // match Arduino 30ms latency cycle
+    g_sipServer = new SipServer(g_localIp, 5060);
+    while (1) {
+        if (g_sipServer) {
+            g_sipServer->getHandler().tick();
         }
-    } catch (const std::exception& e) {
-        ESP_LOGE("SipTask", "SIP Engine Fatal Error: %s", e.what());
+        vTaskDelay(pdMS_TO_TICKS(30)); // match Arduino 30ms latency cycle
     }
     vTaskDelete(NULL);
 }
 
 static void http_server_task(void *pvParameters) {
     ESP_LOGI("HttpTask", "Starting Web CGA CRT dashboard on Core 0 IP %s:80", g_localIp.c_str());
-    try {
-        // block task until SipServer is fully instanced
-        while (g_sipServer == nullptr) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        g_httpServer = new HttpServer(g_localIp, 80, g_sipServer->getHandler());
-        g_httpServer->start();
-        ESP_LOGI("HttpTask", "CGA Web UI Running successfully!");
-        
-        while (1) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
-    } catch (const std::exception& e) {
-        ESP_LOGE("HttpTask", "HTTP Server Fatal Error: %s", e.what());
+    // block task until SipServer is fully instanced
+    while (g_sipServer == nullptr) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    g_httpServer = new HttpServer(g_localIp, 80, g_sipServer->getHandler());
+    g_httpServer->start();
+    ESP_LOGI("HttpTask", "CGA Web UI Running successfully!");
+    
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
     vTaskDelete(NULL);
 }

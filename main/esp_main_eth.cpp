@@ -173,31 +173,24 @@ static void sip_server_task(void* pvParameters)
 {
     ESP_LOGI(TAG, "Starting SipServer on %s:%d", s_ip_addr.c_str(), SIP_PORT);
 
-    try
-    {
-        g_sipServer = new SipServer(s_ip_addr, SIP_PORT);
-        ESP_LOGI(TAG, "SIP server is RUNNING.  Point softphones at %s:%d",
-                 s_ip_addr.c_str(), SIP_PORT);
+    g_sipServer = new SipServer(s_ip_addr, SIP_PORT);
+    ESP_LOGI(TAG, "SIP server is RUNNING.  Point softphones at %s:%d",
+             s_ip_addr.c_str(), SIP_PORT);
 
-        unsigned long lastHeartbeat = 0;
-        while (true)
-        {
-            if (g_sipServer) {
-                g_sipServer->getHandler().tick();
-            }
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            unsigned long nowSec = (unsigned long)(esp_timer_get_time() / 1000000);
-            if (nowSec - lastHeartbeat >= 30)
-            {
-                lastHeartbeat = nowSec;
-                ESP_LOGI(TAG, "Heartbeat — IP: %s  Uptime: %lus",
-                         s_ip_addr.c_str(), nowSec);
-            }
-        }
-    }
-    catch (const std::exception& e)
+    unsigned long lastHeartbeat = 0;
+    while (true)
     {
-        ESP_LOGE(TAG, "Fatal error: %s", e.what());
+        if (g_sipServer) {
+            g_sipServer->getHandler().tick();
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        unsigned long nowSec = (unsigned long)(esp_timer_get_time() / 1000000);
+        if (nowSec - lastHeartbeat >= 30)
+        {
+            lastHeartbeat = nowSec;
+            ESP_LOGI(TAG, "Heartbeat — IP: %s  Uptime: %lus",
+                     s_ip_addr.c_str(), nowSec);
+        }
     }
 
     vTaskDelete(nullptr);
@@ -212,21 +205,14 @@ static void http_server_task(void* pvParameters)
 
     ESP_LOGI(TAG, "Starting CGA CRT Dashboard on %s:%d", s_ip_addr.c_str(), HTTP_DASHBOARD_PORT);
 
-    try
-    {
-        HttpServer http(s_ip_addr, HTTP_DASHBOARD_PORT, g_sipServer->getHandler());
-        http.start();
-        ESP_LOGI(TAG, "CGA CRT Dashboard RUNNING at http://%s:%d/",
-                 s_ip_addr.c_str(), HTTP_DASHBOARD_PORT);
+    HttpServer http(s_ip_addr, HTTP_DASHBOARD_PORT, g_sipServer->getHandler());
+    http.start();
+    ESP_LOGI(TAG, "CGA CRT Dashboard RUNNING at http://%s:%d/",
+             s_ip_addr.c_str(), HTTP_DASHBOARD_PORT);
 
-        while (true)
-        {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
-    }
-    catch (const std::exception& e)
+    while (true)
     {
-        ESP_LOGE(TAG, "HTTP Fatal: %s", e.what());
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
     vTaskDelete(nullptr);

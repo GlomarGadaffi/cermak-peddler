@@ -72,7 +72,8 @@ void SipSdpMessage::parseSdp()
 
 	size_t pos_start = _messageStr.find("v=", bodyStart);
 	if (pos_start == std::string::npos) {
-		throw std::runtime_error("SDP body missing version line");
+		std::cerr << "SDP body missing version line\n";
+		return;
 	}
 
 	size_t pos_end;
@@ -132,18 +133,21 @@ void SipSdpMessage::parseSdp()
 
 int SipSdpMessage::extractRtpPort(const std::string& data) const
 {
-	try
-	{
-		// m=<type> <port> <proto> <fmt> — skip the first token to reach the port
-		auto spacePos = data.find(' ');
-		if (spacePos == std::string::npos)
-			return 0;
-		std::string portStr = data.substr(spacePos + 1, data.find(' ', spacePos + 1) - spacePos - 1);
-		return std::stoi(portStr);
-	}
-	catch (const std::exception& e)
-	{
-		std::cerr << "SipSdpMessage: failed to parse RTP port: " << e.what() << '\n';
+	// m=<type> <port> <proto> <fmt> — skip the first token to reach the port
+	auto spacePos = data.find(' ');
+	if (spacePos == std::string::npos)
 		return 0;
+	size_t portStart = spacePos + 1;
+	while (portStart < data.size() && std::isspace(static_cast<unsigned char>(data[portStart]))) ++portStart;
+	size_t portEnd = portStart;
+	while (portEnd < data.size() && std::isdigit(static_cast<unsigned char>(data[portEnd]))) ++portEnd;
+	if (portEnd == portStart)
+		return 0;
+	int val = 0;
+	for (size_t i = portStart; i < portEnd; ++i)
+	{
+		if (val > 200000000) return 200000000;
+		val = val * 10 + (data[i] - '0');
 	}
+	return val;
 }

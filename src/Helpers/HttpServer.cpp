@@ -150,8 +150,18 @@ void HttpServer::handleClient(int clientSock)
 		if (valStart != std::string::npos && valEnd != std::string::npos)
 		{
 			size_t contentLength = 0;
-			try { contentLength = static_cast<size_t>(std::stoul(raw.substr(valStart, valEnd - valStart))); }
-			catch (...) {}
+			size_t parseIdx = valStart;
+			while (parseIdx < valEnd && std::isspace(static_cast<unsigned char>(raw[parseIdx]))) ++parseIdx;
+			while (parseIdx < valEnd && std::isdigit(static_cast<unsigned char>(raw[parseIdx])))
+			{
+				if (contentLength > 200000000)
+				{
+					contentLength = 200000000;
+					break;
+				}
+				contentLength = contentLength * 10 + (raw[parseIdx] - '0');
+				++parseIdx;
+			}
 
 			// Cap total body we are willing to read (16 KB is generous for wifi passwords)
 			constexpr size_t MAX_BODY_BYTES = 16384;

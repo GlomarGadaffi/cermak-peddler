@@ -12,7 +12,7 @@ if(SIP_TRANSPORT STREQUAL "eth")
     message(STATUS "SipServer transport: W5500 Ethernet (PoE)")
 elseif(SIP_TRANSPORT STREQUAL "display")
     set(MAIN_SRC "esp_main_display.cpp")
-    set(EXTRA_REQUIRES esp_wifi esp_lcd lvgl)
+    set(EXTRA_REQUIRES esp_wifi esp_lcd lvgl__lvgl)
     set(ADDITIONAL_SRCS "drivers/esp_lcd_axs15231b.c" "ui/ui.cpp" "wifi/DnsServer.cpp")
     message(STATUS "SipServer transport: Guition AXS15231B Touch Display (LVGL)")
 else()
@@ -33,4 +33,4 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/SipSdpMessage.cpp"
                             "../src/SIP/SipServer.cpp"
                     INCLUDE_DIRS "../src/Helpers" "../src/SIP" "drivers" "ui" "wifi"
-                    REQUIRES nvs_flash lwip esp_netif esp_event freertos mdns ${EXTRA_REQUIRES})
+                    REQUIRES nvs_flash lwip esp_netif esp_event freertos espressif__mdns esp_driver_gpio esp_wifi esp_lcd lvgl__lvgl esp_eth driver)

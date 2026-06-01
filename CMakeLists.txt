@@ -3,6 +3,7 @@ cmake_minimum_required (VERSION 3.16)
 if(DEFINED ENV{IDF_PATH})
     include($ENV{IDF_PATH}/tools/cmake/project.cmake)
     project("SipServer")
+    idf_build_set_property(COMPILE_DEFINITIONS "LV_TICK_CUSTOM_SYS_TIME_EXPR=((esp_timer_get_time()/1000LL))" APPEND)
 else()
     project ("SipServer")
 

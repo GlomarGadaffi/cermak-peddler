@@ -2,19 +2,12 @@
 
 std::optional<std::shared_ptr<SipMessage>> SipMessageFactory::createMessage(std::string message, sockaddr_in src)
 {
-	try
+	if (containsSdp(message))
 	{
-		if (containsSdp(message))
-		{
-			return std::make_shared<SipSdpMessage>(std::move(message), std::move(src));
-		}
+		return std::make_shared<SipSdpMessage>(std::move(message), std::move(src));
+	}
 
-		return std::make_shared<SipMessage>(std::move(message), std::move(src));
-	}
-	catch (const std::exception&)
-	{
-		return {};
-	}
+	return std::make_shared<SipMessage>(std::move(message), std::move(src));
 }
 
 bool SipMessageFactory::containsSdp(const std::string& message) const

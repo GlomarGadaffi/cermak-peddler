@@ -48,7 +48,7 @@ void SipMessage::parse()
 
 	if (pos_end == std::string::npos)
 	{
-		throw std::runtime_error("Invalid message headers.");
+		return;
 	}
 
 	_header = headerBlock.substr(pos_start, pos_end - pos_start);
@@ -147,7 +147,7 @@ void SipMessage::parse()
 
 	if (!isValidMessage())
 	{
-		throw std::runtime_error("Invalid message.");
+		return;
 	}
 }
 
@@ -269,6 +269,72 @@ void SipMessage::setContentLength(std::string value)
 		_messageStr.replace(contentLengthPos, _contentLength.length(), value);
 	}
 	_contentLength = std::move(value);
+}
+
+void SipMessage::addHeader(std::string name, std::string value)
+{
+	size_t clPos = _contentLength.empty()
+	               ? std::string::npos
+	               : _messageStr.find(_contentLength);
+	if (clPos != std::string::npos) {
+		_messageStr.insert(clPos, name + ": " + value + "\r\n");
+	} else {
+		size_t bodyBoundary = _messageStr.find("\r\n\r\n");
+		if (bodyBoundary != std::string::npos) {
+			_messageStr.insert(bodyBoundary + 2, name + ": " + value + "\r\n");
+		} else {
+			_messageStr += name + ": " + value + "\r\n";
+		}
+	}
+}
+
+void SipMessage::enforceG711()
+{
+	size_t mPos = _messageStr.find("m=audio ");
+	if (mPos != std::string::npos)
+	{
+		size_t lineEnd = _messageStr.find("\r\n", mPos);
+		if (lineEnd == std::string::npos) lineEnd = _messageStr.find("\n", mPos);
+		if (lineEnd != std::string::npos)
+		{
+			std::string mLine = _messageStr.substr(mPos, lineEnd - mPos);
+			size_t rtpPos = mLine.find("RTP/AVP ");
+			if (rtpPos != std::string::npos)
+			{
+				std::string newMLine = mLine.substr(0, rtpPos + 8) + "0 8 101";
+				_messageStr.replace(mPos, mLine.length(), newMLine);
+			}
+		}
+	}
+}
+
+void SipMessage::clearBody()
+{
+	size_t bodyStart = _messageStr.find("\r\n\r\n");
+	if (bodyStart != std::string::npos)
+	{
+		_messageStr.erase(bodyStart + 4);
+	}
+	else
+	{
+		bodyStart = _messageStr.find("\n\n");
+		if (bodyStart != std::string::npos)
+		{
+			_messageStr.erase(bodyStart + 2);
+		}
+	}
+
+	if (!_contentLength.empty())
+	{
+		if (_contentLength.find("Content-Length:") != std::string::npos)
+		{
+			setContentLength("Content-Length: 0");
+		}
+		else
+		{
+			setContentLength("l: 0");
+		}
+	}
 }
 
 std::string SipMessage::toString() const

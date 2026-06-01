@@ -77,16 +77,12 @@ void sip_server_task(void *pvParameters)
 
     ESP_LOGI("SipServerTask", "Starting SipServer on %s:%d", ip.c_str(), port);
     
-    try {
-        g_sipServer = new SipServer(ip, port);
-        while (1) {
-            if (g_sipServer) {
-                g_sipServer->getHandler().tick();
-            }
-            vTaskDelay(pdMS_TO_TICKS(1000));
+    g_sipServer = new SipServer(ip, port);
+    while (1) {
+        if (g_sipServer) {
+            g_sipServer->getHandler().tick();
         }
-    } catch (const std::exception& e) {
-        ESP_LOGE("SipServerTask", "Fatal error: %s", e.what());
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
     vTaskDelete(NULL);
@@ -102,15 +98,11 @@ void http_server_task(void *pvParameters)
     std::string ip = "192.168.4.1";
     ESP_LOGI("HttpTask", "Starting CGA CRT Dashboard on %s:%d", ip.c_str(), HTTP_DASHBOARD_PORT);
 
-    try {
-        HttpServer http(ip, HTTP_DASHBOARD_PORT, g_sipServer->getHandler());
-        http.start();
-        ESP_LOGI("HttpTask", "CGA CRT Dashboard is RUNNING at http://%s:%d/", ip.c_str(), HTTP_DASHBOARD_PORT);
-        while (1) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
-    } catch (const std::exception& e) {
-        ESP_LOGE("HttpTask", "Fatal error: %s", e.what());
+    HttpServer http(ip, HTTP_DASHBOARD_PORT, g_sipServer->getHandler());
+    http.start();
+    ESP_LOGI("HttpTask", "CGA CRT Dashboard is RUNNING at http://%s:%d/", ip.c_str(), HTTP_DASHBOARD_PORT);
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
     vTaskDelete(NULL);

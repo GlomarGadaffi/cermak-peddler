@@ -3,6 +3,8 @@
 #include "qrcode.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include <cstdio>
 #include <cstring>
 
@@ -214,8 +216,6 @@ static void onboarding_ap_cb(lv_event_t* e) {
     ESP_LOGI(TAG, "Standalone AP Mode triggered from Touch screen!");
     // Directly inject AP mode selection into NVS and reboot
     #if defined(ESP_PLATFORM)
-    #include "nvs_flash.h"
-    #include "nvs.h"
     nvs_handle_t nvs_handle;
     if (nvs_open("storage", NVS_READWRITE, &nvs_handle) == ESP_OK) {
         nvs_set_u8(nvs_handle, "wifi_mode", 2); // 2 = Standalone AP
@@ -372,7 +372,7 @@ void ui_init(void) {
     lv_obj_align(log_textarea, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_border_width(log_textarea, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(log_textarea, 6, LV_PART_MAIN);
-    lv_textarea_set_readonly(log_textarea, true);
+    lv_textarea_set_read_only(log_textarea, true);
     lv_textarea_set_max_length(log_textarea, 2048);
 
     // 5. Build Wi-Fi Quick Join Modal Overlay
@@ -572,7 +572,7 @@ void ui_set_battery(float volts, int percent) {
     if (percent >= 0) {
         snprintf(buf, sizeof(buf), "%.1fV %d%%", volts, percent);
     } else {
-        snprintf(buf, sizeof(buf), "----V --%");
+        snprintf(buf, sizeof(buf), "----V --%%");
     }
     if (battery_label) {
         lv_label_set_text(battery_label, buf);

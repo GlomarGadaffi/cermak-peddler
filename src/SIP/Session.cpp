@@ -53,3 +53,15 @@ std::chrono::steady_clock::time_point Session::getStartTime() const
 {
 	return _startTime;
 }
+
+void Session::removePendingTarget(const std::string& number)
+{
+	for (auto it = _pendingTargets.begin(); it != _pendingTargets.end(); ++it)
+	{
+		if ((*it)->getNumber() == number)
+		{
+			_pendingTargets.erase(it);
+			break;
+		}
+	}
+}

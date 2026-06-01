@@ -23,8 +23,9 @@ namespace
 
 RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	OnHandledEvent onHandledEvent) :
-	_serverIp(std::move(serverIp)), _serverPort(serverPort),
-	_onHandled(onHandledEvent)
+	_onHandled(onHandledEvent),
+	_serverIp(std::move(serverIp)),
+	_serverPort(serverPort)
 {
 	initHandlers();
 }
@@ -128,12 +129,57 @@ void RequestsHandler::onOptions(std::shared_ptr<SipMessage> data)
 
 void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 {
+	std::string destNumber = data->getToNumber();
+	if (destNumber == "777")
+	{
+		endCall(data->getCallID(), data->getFromNumber(), "777");
+		return;
+	}
+
+	if (destNumber == "999")
+	{
+		auto session = getSession(data->getCallID());
+		if (session.has_value())
+		{
+			std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+			std::string serverIpPort = activeIp + ":" + std::to_string(_serverPort);
+			std::string originalCSeq = data->getCSeq();
+			size_t invitePos = originalCSeq.find("INVITE");
+			if (invitePos != std::string::npos)
+			{
+				originalCSeq.replace(invitePos, 6, "CANCEL");
+			}
+
+			for (const auto& target : session.value()->getPendingTargets())
+			{
+				auto cancelMsg = std::make_shared<SipMessage>(*data);
+				char ipBuf[INET_ADDRSTRLEN]{};
+				inet_ntop(AF_INET, &target->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
+				std::string targetIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(target->getAddress().sin_port));
+
+				cancelMsg->setHeader("CANCEL sip:" + target->getNumber() + "@" + targetIpPort + " SIP/2.0");
+
+				std::string newTo = "To: <sip:" + target->getNumber() + "@" + serverIpPort + ">";
+				cancelMsg->setTo(newTo);
+				cancelMsg->setCSeq(originalCSeq);
+				_outbox.emplace_back(target->getAddress(), std::move(cancelMsg));
+			}
+		}
+		endCall(data->getCallID(), data->getFromNumber(), "999");
+		return;
+	}
+
 	setCallState(data->getCallID(), Session::State::Cancel);
 	endHandle(data->getToNumber(), data);
 }
 
 void RequestsHandler::onReqTerminated(std::shared_ptr<SipMessage> data)
 {
+	auto session = getSession(data->getCallID());
+	if (session.has_value() && session.value()->isBroadcast())
+	{
+		return;
+	}
 	endHandle(data->getFromNumber(), data);
 }
 
@@ -143,6 +189,96 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	auto caller = findClient(data->getFromNumber());
 	if (!caller.has_value())
 	{
+		return;
+	}
+
+	std::string destNumber = data->getToNumber();
+	if (destNumber == "777")
+	{
+		// SDP loopback echo test
+		auto ringing = std::make_shared<SipMessage>(*data);
+		ringing->setHeader("SIP/2.0 180 Ringing");
+		ringing->clearBody();
+		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		ringing->setVia(data->getVia() + ";received=" + activeIp);
+		std::string toTag = IDGen::GenerateID(9);
+		ringing->setTo(data->getTo() + ";tag=" + toTag);
+		ringing->setContact(buildContact("777"));
+		_outbox.emplace_back(data->getSource(), std::move(ringing));
+
+		auto okResponse = std::make_shared<SipMessage>(*data);
+		okResponse->setHeader(SipMessageTypes::OK);
+		okResponse->setVia(data->getVia() + ";received=" + activeIp);
+		okResponse->setTo(data->getTo() + ";tag=" + toTag);
+		okResponse->setContact(buildContact("777"));
+		okResponse->enforceG711();
+		_outbox.emplace_back(data->getSource(), std::move(okResponse));
+
+		auto dummyClient = std::make_shared<SipClient>("777", data->getSource(), 3600);
+		auto newSession = std::make_shared<Session>(data->getCallID(), caller.value());
+		newSession->setDest(dummyClient);
+		_sessions.emplace(data->getCallID(), newSession);
+		newSession->setState(Session::State::Connected);
+		return;
+	}
+
+	if (destNumber == "999")
+	{
+		// All Page / Broadcast
+		std::vector<std::shared_ptr<SipClient>> targets;
+		for (const auto& [num, client] : _clients)
+		{
+			if (num != caller.value()->getNumber())
+			{
+				targets.push_back(client);
+			}
+		}
+
+		if (targets.empty())
+		{
+			std::shared_ptr<SipMessage> responseObj = std::make_shared<SipMessage>(*data);
+			responseObj->setHeader(SipMessageTypes::NOT_FOUND);
+			responseObj->setContact(buildContact(caller.value()->getNumber()));
+			_outbox.emplace_back(data->getSource(), std::move(responseObj));
+			return;
+		}
+
+		auto newSession = std::make_shared<Session>(data->getCallID(), caller.value());
+		newSession->setBroadcast(true);
+		newSession->setPendingTargets(targets);
+		newSession->setInviteMessage(data);
+		_sessions.emplace(data->getCallID(), newSession);
+
+		auto ringing = std::make_shared<SipMessage>(*data);
+		ringing->setHeader("SIP/2.0 180 Ringing");
+		ringing->clearBody();
+		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		ringing->setVia(data->getVia() + ";received=" + activeIp);
+		ringing->setTo(data->getTo() + ";tag=" + IDGen::GenerateID(9));
+		ringing->setContact(buildContact("999"));
+		_outbox.emplace_back(data->getSource(), std::move(ringing));
+
+		for (auto& target : targets)
+		{
+			auto inviteFork = std::make_shared<SipMessage>(*data);
+			inviteFork->setContact(buildContact(caller.value()->getNumber()));
+
+			char ipBuf[INET_ADDRSTRLEN]{};
+			inet_ntop(AF_INET, &target->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
+			std::string targetIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(target->getAddress().sin_port));
+			std::string serverIpPort = activeIp + ":" + std::to_string(_serverPort);
+
+			inviteFork->setHeader("INVITE sip:" + target->getNumber() + "@" + targetIpPort + " SIP/2.0");
+			inviteFork->setTo("To: <sip:" + target->getNumber() + "@" + serverIpPort + ">");
+
+			inviteFork->addHeader("Call-Info", "<sip:any>;answer-after=0");
+			inviteFork->addHeader("Alert-Info", "info=alert-autoanswer");
+			inviteFork->addHeader("Alert-Info", "answer-after=0");
+			inviteFork->addHeader("Alert-Info", "intercom=true");
+			inviteFork->addHeader("P-Auto-Answer", "normal");
+			inviteFork->enforceG711();
+			_outbox.emplace_back(target->getAddress(), std::move(inviteFork));
+		}
 		return;
 	}
 
@@ -183,28 +319,111 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 
 void RequestsHandler::onTrying(std::shared_ptr<SipMessage> data)
 {
+	auto session = getSession(data->getCallID());
+	if (session.has_value() && session.value()->isBroadcast())
+	{
+		return;
+	}
 	endHandle(data->getFromNumber(), data);
 }
 
 void RequestsHandler::onRinging(std::shared_ptr<SipMessage> data)
 {
+	auto session = getSession(data->getCallID());
+	if (session.has_value() && session.value()->isBroadcast())
+	{
+		return;
+	}
 	endHandle(data->getFromNumber(), data);
 }
 
 void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 {
+	auto session = getSession(data->getCallID());
+	if (session.has_value() && session.value()->isBroadcast())
+	{
+		session.value()->removePendingTarget(data->getFromNumber());
+		if (session.value()->getPendingTargets().empty() && session.value()->getState() == Session::State::Invited)
+		{
+			endHandle(session.value()->getSrc()->getNumber(), data);
+			endCall(data->getCallID(), session.value()->getSrc()->getNumber(), "999", "all targets busy");
+		}
+		return;
+	}
 	setCallState(data->getCallID(), Session::State::Busy);
 	endHandle(data->getFromNumber(), data);
 }
 
 void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 {
+	auto session = getSession(data->getCallID());
+	if (session.has_value() && session.value()->isBroadcast())
+	{
+		session.value()->removePendingTarget(data->getFromNumber());
+		if (session.value()->getPendingTargets().empty() && session.value()->getState() == Session::State::Invited)
+		{
+			endHandle(session.value()->getSrc()->getNumber(), data);
+			endCall(data->getCallID(), session.value()->getSrc()->getNumber(), "999", "all targets unavailable");
+		}
+		return;
+	}
 	setCallState(data->getCallID(), Session::State::Unavailable);
 	endHandle(data->getFromNumber(), data);
 }
 
 void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 {
+	auto session = getSession(data->getCallID());
+	std::string destNumber = data->getToNumber();
+	if (destNumber == "777")
+	{
+		auto response = std::make_shared<SipMessage>(*data);
+		response->setHeader(SipMessageTypes::OK);
+		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		response->setVia(data->getVia() + ";received=" + activeIp);
+		_outbox.emplace_back(data->getSource(), std::move(response));
+		endCall(data->getCallID(), data->getFromNumber(), destNumber);
+		return;
+	}
+
+	if (destNumber == "999")
+	{
+		auto response = std::make_shared<SipMessage>(*data);
+		response->setHeader(SipMessageTypes::OK);
+		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		response->setVia(data->getVia() + ";received=" + activeIp);
+		_outbox.emplace_back(data->getSource(), std::move(response));
+
+		if (session.has_value())
+		{
+			auto answeringClient = session.value()->getDest();
+			if (answeringClient)
+			{
+				auto byeFork = std::make_shared<SipMessage>(*data);
+				std::string serverIpPort = activeIp + ":" + std::to_string(_serverPort);
+
+				char ipBuf[INET_ADDRSTRLEN]{};
+				inet_ntop(AF_INET, &answeringClient->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
+				std::string targetIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(answeringClient->getAddress().sin_port));
+
+				byeFork->setHeader("BYE sip:" + answeringClient->getNumber() + "@" + targetIpPort + " SIP/2.0");
+
+				std::string originalTo = data->getTo();
+				std::string newTo = "To: <sip:" + answeringClient->getNumber() + "@" + serverIpPort + ">";
+				size_t tagPos = originalTo.find(";tag=");
+				if (tagPos != std::string::npos)
+				{
+					newTo += originalTo.substr(tagPos);
+				}
+				byeFork->setTo(newTo);
+
+				_outbox.emplace_back(answeringClient->getAddress(), std::move(byeFork));
+			}
+		}
+		endCall(data->getCallID(), data->getFromNumber(), destNumber);
+		return;
+	}
+
 	setCallState(data->getCallID(), Session::State::Bye);
 	endHandle(data->getToNumber(), data);
 }
@@ -227,6 +446,79 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 
 		if (data->getCSeq().find(SipMessageTypes::INVITE) != std::string::npos) 
 		{
+			if (session.value()->isBroadcast())
+			{
+				if (session.value()->getState() != Session::State::Connected)
+				{
+					auto clientOpt = findClientByAddress(data->getSource());
+					if (!clientOpt.has_value())
+					{
+						return;
+					}
+					auto answeringClient = clientOpt.value();
+
+					SipSdpMessage* sdpMessage = nullptr;
+					if (data && data->hasSdp())
+					{
+						sdpMessage = static_cast<SipSdpMessage*>(data.get());
+					}
+					if (!sdpMessage)
+					{
+						std::cerr << "Couldn't get SDP from: " << answeringClient->getNumber() << "'s broadcast OK message.\n";
+						return;
+					}
+
+					session->get()->setDest(answeringClient);
+					session->get()->setState(Session::State::Connected);
+
+					auto inviteMsg = session.value()->getInviteMessage();
+
+					auto response = std::make_shared<SipMessage>(*data);
+					response->setContact(buildContact(answeringClient->getNumber()));
+
+					if (inviteMsg)
+					{
+						std::string originalTo = inviteMsg->getTo();
+						std::string bTo = data->getTo();
+						size_t tagPos = bTo.find(";tag=");
+						if (tagPos != std::string::npos)
+						{
+							originalTo += bTo.substr(tagPos);
+						}
+						response->setTo(originalTo);
+					}
+
+					response->enforceG711();
+					endHandle(session.value()->getSrc()->getNumber(), std::move(response));
+
+					if (inviteMsg)
+					{
+						std::string originalCSeq = inviteMsg->getCSeq();
+						size_t invitePos = originalCSeq.find("INVITE");
+						if (invitePos != std::string::npos)
+						{
+							originalCSeq.replace(invitePos, 6, "CANCEL");
+						}
+
+						for (const auto& target : session.value()->getPendingTargets())
+						{
+							if (target->getNumber() != answeringClient->getNumber())
+							{
+								auto cancelMsg = std::make_shared<SipMessage>(*inviteMsg);
+								char ipBuf[INET_ADDRSTRLEN]{};
+								inet_ntop(AF_INET, &target->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
+								std::string targetIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(target->getAddress().sin_port));
+
+								cancelMsg->setHeader("CANCEL sip:" + target->getNumber() + "@" + targetIpPort + " SIP/2.0");
+								cancelMsg->setCSeq(originalCSeq);
+								_outbox.emplace_back(target->getAddress(), std::move(cancelMsg));
+							}
+						}
+					}
+				}
+				return;
+			}
+
 			auto client = findClient(data->getToNumber());
 			if (!client.has_value())
 			{
@@ -269,6 +561,41 @@ void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 	auto session = getSession(data->getCallID());
 	if (!session.has_value())
 	{
+		return;
+	}
+
+	std::string destNumber = data->getToNumber();
+	if (destNumber == "777")
+	{
+		return;
+	}
+
+	if (destNumber == "999")
+	{
+		auto answeringClient = session.value()->getDest();
+		if (answeringClient)
+		{
+			auto ackFork = std::make_shared<SipMessage>(*data);
+			std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+			std::string serverIpPort = activeIp + ":" + std::to_string(_serverPort);
+
+			char ipBuf[INET_ADDRSTRLEN]{};
+			inet_ntop(AF_INET, &answeringClient->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
+			std::string targetIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(answeringClient->getAddress().sin_port));
+
+			ackFork->setHeader("ACK sip:" + answeringClient->getNumber() + "@" + targetIpPort + " SIP/2.0");
+
+			std::string originalTo = data->getTo();
+			std::string newTo = "To: <sip:" + answeringClient->getNumber() + "@" + serverIpPort + ">";
+			size_t tagPos = originalTo.find(";tag=");
+			if (tagPos != std::string::npos)
+			{
+				newTo += originalTo.substr(tagPos);
+			}
+			ackFork->setTo(newTo);
+
+			_outbox.emplace_back(answeringClient->getAddress(), std::move(ackFork));
+		}
 		return;
 	}
 
@@ -347,7 +674,13 @@ int RequestsHandler::parseRequestedExpires(const std::shared_ptr<SipMessage>& da
 		size_t end = from;
 		while (end < s.size() && std::isdigit(static_cast<unsigned char>(s[end]))) ++end;
 		if (end == from) return -1;
-		try { return std::stoi(s.substr(from, end - from)); } catch (...) { return -1; }
+		int val = 0;
+		for (size_t i = from; i < end; ++i)
+		{
+			if (val > 200000000) return 200000000;
+			val = val * 10 + (s[i] - '0');
+		}
+		return val;
 	};
 
 	// 1. expires= parameter on the Contact header (most common form).

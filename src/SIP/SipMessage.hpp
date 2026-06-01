@@ -31,6 +31,9 @@ public:
 	void setCSeq(std::string value);
 	void setContact(std::string value);
 	void setContentLength(std::string value);
+	void addHeader(std::string name, std::string value);
+	void enforceG711();
+	void clearBody();
 
 
 	const std::string& getType() const;
