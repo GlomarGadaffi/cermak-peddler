@@ -43,6 +43,11 @@ public:
 	const std::string& getContentLength() const;
 	sockaddr_in getSource() const;
 
+	// Issue #42: virtual SDP probe replaces dynamic_cast so call setup works
+	// on the Arduino ESP32 toolchain, which builds with RTTI disabled (-fno-rtti).
+	// Base messages carry no SDP; SipSdpMessage overrides this to return true.
+	virtual bool hasSdp() const { return false; }
+
 	std::string toString() const;
 
 protected:

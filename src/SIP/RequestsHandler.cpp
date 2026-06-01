@@ -9,6 +9,35 @@
 #include "IDGen.hpp"
 #include "IPHelper.hpp"
 
+// ── Compile-time tunables (Issues #47, #31) ──────────────────────────────────
+// Override any of these with -D on the command line / build_flags to suit a
+// known fleet. Defaults are chosen to be interoperable with softphones that do
+// not answer out-of-dialog OPTIONS (a SHOULD, not a MUST, in RFC 3261).
+#ifndef POCKETDIAL_KEEPALIVE_PING_SECS
+#define POCKETDIAL_KEEPALIVE_PING_SECS 30   // how often we OPTIONS-ping each client
+#endif
+#ifndef POCKETDIAL_KEEPALIVE_TIMEOUT_SECS
+#define POCKETDIAL_KEEPALIVE_TIMEOUT_SECS 90  // endpoint silence that flags an orphaned call
+#endif
+
+// Issue #38: per-source-IP flood protection. RATE_BURST is the bucket capacity
+// (max packets accepted back-to-back); RATE_PER_SEC is the sustained refill rate.
+#ifndef POCKETDIAL_RATE_BURST
+#define POCKETDIAL_RATE_BURST 40
+#endif
+#ifndef POCKETDIAL_RATE_PER_SEC
+#define POCKETDIAL_RATE_PER_SEC 20
+#endif
+// Optional allowlist, e.g. -DPOCKETDIAL_ALLOW_CIDR=\"192.168.1.0/24\". Undefined =
+// accept every source (rate limiting still applies).
+
+// Issue #37: virtual broadcast / all-page extension. An INVITE addressed here is
+// forked to every other registered endpoint; the first to answer wins. Reserve
+// this number — do not register a real client under it. Override with -D.
+#ifndef POCKETDIAL_PAGE_EXTENSION
+#define POCKETDIAL_PAGE_EXTENSION "999"
+#endif
+
 namespace
 {
 	// Default lease granted when a REGISTER does not request one (seconds).
@@ -19,6 +48,26 @@ namespace
 	constexpr int MIN_EXPIRES = 30;
 	// How often the opportunistic sweep is allowed to run.
 	constexpr auto SWEEP_INTERVAL = std::chrono::seconds(1);
+
+	// Issue #47: OPTIONS ping cadence (was a bare 5s).
+	constexpr auto KEEPALIVE_PING_INTERVAL = std::chrono::seconds(POCKETDIAL_KEEPALIVE_PING_SECS);
+	// Issue #31/#47: an endpoint silent this long is treated as gone for the
+	// purpose of reaping its *active sessions*. It does NOT by itself unregister
+	// the client — registration rides the REGISTER lease (see sweepExpired).
+	constexpr auto KEEPALIVE_TIMEOUT = std::chrono::seconds(POCKETDIAL_KEEPALIVE_TIMEOUT_SECS);
+
+	// Sessions in a terminal/handshake state are not subject to orphan reaping;
+	// only an established (Connected) call can leak when an endpoint vanishes.
+	bool isLiveCall(Session::State s)
+	{
+		return s == Session::State::Connected;
+	}
+
+	// True if two endpoints are the same IPv4 socket (address + port).
+	bool addrEqual(const sockaddr_in& a, const sockaddr_in& b)
+	{
+		return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
+	}
 }
 
 RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
@@ -27,6 +76,65 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	_onHandled(onHandledEvent)
 {
 	initHandlers();
+
+#ifdef POCKETDIAL_ALLOW_CIDR
+	// Issue #38: parse the compile-time CIDR allowlist once. Anything that fails
+	// to parse leaves the allowlist disabled (fail-open, rate limiting still on).
+	{
+		std::string cidr = POCKETDIAL_ALLOW_CIDR;
+		auto slash = cidr.find('/');
+		std::string ipPart = (slash == std::string::npos) ? cidr : cidr.substr(0, slash);
+		int prefix = 32;
+		if (slash != std::string::npos)
+		{
+			try { prefix = std::stoi(cidr.substr(slash + 1)); } catch (...) { prefix = -1; }
+		}
+		struct in_addr a {};
+		if (prefix >= 0 && prefix <= 32 && inet_pton(AF_INET, ipPart.c_str(), &a) == 1)
+		{
+			_allowNet  = ntohl(a.s_addr);
+			_allowMask = (prefix == 0) ? 0u : (0xFFFFFFFFu << (32 - prefix));
+		}
+	}
+#endif
+}
+
+bool RequestsHandler::ipAllowed(const sockaddr_in& src) const
+{
+	// No allowlist configured → accept everyone.
+	if (_allowMask == 0)
+	{
+		return true;
+	}
+	uint32_t ip = ntohl(src.sin_addr.s_addr);
+	return (ip & _allowMask) == (_allowNet & _allowMask);
+}
+
+bool RequestsHandler::allowPacket(const sockaddr_in& src)
+{
+	auto now = std::chrono::steady_clock::now();
+	uint32_t key = src.sin_addr.s_addr;   // network order is fine as a map key
+	auto& bucket = _rateBuckets[key];
+
+	if (bucket.last.time_since_epoch().count() == 0)
+	{
+		// First packet from this IP — start the bucket full.
+		bucket.tokens = static_cast<double>(POCKETDIAL_RATE_BURST);
+	}
+	else
+	{
+		double elapsed = std::chrono::duration<double>(now - bucket.last).count();
+		bucket.tokens = (std::min)(static_cast<double>(POCKETDIAL_RATE_BURST),
+			bucket.tokens + elapsed * static_cast<double>(POCKETDIAL_RATE_PER_SEC));
+	}
+	bucket.last = now;
+
+	if (bucket.tokens >= 1.0)
+	{
+		bucket.tokens -= 1.0;
+		return true;
+	}
+	return false;
 }
 
 void RequestsHandler::initHandlers()
@@ -52,6 +160,15 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		_outbox.clear();
+
+		// Issue #38: drop traffic from non-allowlisted IPs or sources that are
+		// flooding us, before any parsing/registry work or markActive() — so a
+		// flood can neither do work nor keep a registration artificially alive.
+		if (!ipAllowed(request->getSource()) || !allowPacket(request->getSource()))
+		{
+			_packetsDropped.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
 
 		auto client = findClientByAddress(request->getSource());
 		if (client.has_value())
@@ -146,6 +263,13 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// Issue #37: an INVITE to the virtual page extension fans out to everyone.
+	if (data->getToNumber() == POCKETDIAL_PAGE_EXTENSION)
+	{
+		startPaging(std::move(data), caller.value());
+		return;
+	}
+
 	// Check if the called is registered
 	auto called = findClient(data->getToNumber());
 	if (!called.has_value())
@@ -158,8 +282,8 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	auto message = dynamic_cast<SipSdpMessage*>(data.get());
-	if (!message) 
+	// Issue #42: hasSdp() virtual dispatch instead of dynamic_cast (RTTI is off on Arduino).
+	if (!data->hasSdp())
 	{
 		std::cerr << "Couldn't get SDP from " << data->getFromNumber() << "'s INVITE request." << std::endl;
 		std::shared_ptr<SipMessage> responseObj = std::make_shared<SipMessage>(*data);
@@ -175,6 +299,54 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	auto response = std::make_shared<SipMessage>(*data);
 	response->setContact(buildContact(caller.value()->getNumber()));
 	endHandle(data->getToNumber(), response);
+}
+
+// Issue #37: fork the caller's INVITE to every other registered endpoint.
+void RequestsHandler::startPaging(std::shared_ptr<SipMessage> data, std::shared_ptr<SipClient> caller)
+{
+	// A page is still a call — require SDP, same as a normal INVITE.
+	if (!data->hasSdp())
+	{
+		auto bad = std::make_shared<SipMessage>(*data);
+		bad->setHeader(SipMessageTypes::BAD_REQUEST);
+		bad->setContact(buildContact(caller->getNumber()));
+		endHandle(caller->getNumber(), bad);
+		return;
+	}
+
+	auto session = std::make_shared<Session>(data->getCallID(), caller);
+	session->setPaging(true);
+	session->setPagingInvite(data);   // retained so we can CANCEL losers later
+
+	int targets = 0;
+	for (auto& [number, client] : _clients)
+	{
+		if (number == caller->getNumber())
+		{
+			continue;   // don't page the caller back to themselves
+		}
+		session->addPagedTarget(client);
+
+		// Forward the caller's INVITE verbatim (SDP intact) to this endpoint.
+		auto fork = std::make_shared<SipMessage>(*data);
+		fork->setContact(buildContact(caller->getNumber()));
+		_outbox.emplace_back(client->getAddress(), std::move(fork));
+		++targets;
+	}
+
+	if (targets == 0)
+	{
+		// Nobody else is registered — tell the caller there's no one to reach.
+		auto nf = std::make_shared<SipMessage>(*data);
+		nf->setHeader(SipMessageTypes::NOT_FOUND);
+		nf->setContact(buildContact(caller->getNumber()));
+		endHandle(caller->getNumber(), nf);
+		return;
+	}
+
+	_sessions.emplace(data->getCallID(), std::move(session));
+	std::cout << "Paging " << targets << " endpoint(s) on behalf of "
+	          << caller->getNumber() << " via extension " << POCKETDIAL_PAGE_EXTENSION << '\n';
 }
 
 void RequestsHandler::onTrying(std::shared_ptr<SipMessage> data)
@@ -201,6 +373,23 @@ void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 
 void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 {
+	// Issue #37: a paging call's dialog uses the virtual page extension, so route
+	// the BYE to whichever connected party did NOT send it (by source address).
+	auto session = getSession(data->getCallID());
+	if (session.has_value() && session.value()->isPaging())
+	{
+		session.value()->setState(Session::State::Bye);
+		auto src = session.value()->getSrc();
+		auto dst = session.value()->getDest();
+		std::shared_ptr<SipClient> other =
+			(src && addrEqual(src->getAddress(), data->getSource())) ? dst : src;
+		if (other)
+		{
+			_outbox.emplace_back(other->getAddress(), std::move(data));
+		}
+		return;
+	}
+
 	setCallState(data->getCallID(), Session::State::Bye);
 	endHandle(data->getToNumber(), data);
 }
@@ -221,16 +410,24 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 			return;
 		}
 
-		if (data->getCSeq().find(SipMessageTypes::INVITE) != std::string::npos) 
+		if (data->getCSeq().find(SipMessageTypes::INVITE) != std::string::npos)
 		{
+			// Issue #37: in a paging call the answerer can't be found by To-number
+			// (it's the virtual page extension) — resolve by source and fork-cancel.
+			if (session.value()->isPaging())
+			{
+				handlePagingAnswer(session.value(), std::move(data));
+				return;
+			}
+
 			auto client = findClient(data->getToNumber());
 			if (!client.has_value())
 			{
 				return;
 			}
 
-			auto sdpMessage = dynamic_cast<SipSdpMessage*>(data.get());
-			if (!sdpMessage) 
+			// Issue #42: hasSdp() virtual dispatch instead of dynamic_cast (RTTI is off on Arduino).
+			if (!data->hasSdp())
 			{
 				std::cerr << "Couldn't get SDP from: " << client.value()->getNumber() << "'s OK message.\n";
 				std::shared_ptr<SipMessage> responseObj = std::make_shared<SipMessage>(*data);
@@ -256,11 +453,75 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 	}
 }
 
+// Issue #37: first 200 OK to a page wins. Identify the answerer by source
+// address, connect it to the caller, and CANCEL every other paged endpoint.
+void RequestsHandler::handlePagingAnswer(const std::shared_ptr<Session>& session,
+	std::shared_ptr<SipMessage> data)
+{
+	auto answerer = findClientByAddress(data->getSource());
+
+	// A later endpoint answered after we already connected one: tell it to hang up.
+	if (session->getState() == Session::State::Connected)
+	{
+		if (answerer.has_value())
+		{
+			auto bye = buildPagingBye(data, answerer.value());
+			_outbox.emplace_back(answerer.value()->getAddress(), std::move(bye));
+		}
+		return;
+	}
+
+	if (!answerer.has_value() || !data->hasSdp())
+	{
+		return;   // can't attribute this 200 OK, or it carries no media
+	}
+
+	// Connect caller <-> first answerer.
+	session->setDest(answerer.value());
+	session->setState(Session::State::Connected);
+
+	// Relay the 200 OK back to the caller so their dialog completes.
+	auto response = std::make_shared<SipMessage>(*data);
+	response->setContact(buildContact(answerer.value()->getNumber()));
+	endHandle(data->getFromNumber(), std::move(response));
+
+	// CANCEL the endpoints that lost the race.
+	auto invite = session->getPagingInvite();
+	for (const auto& target : session->getPagedTargets())
+	{
+		if (addrEqual(target->getAddress(), answerer.value()->getAddress()))
+		{
+			continue;   // the winner
+		}
+		if (invite)
+		{
+			auto cancel = buildCancel(invite, target);
+			_outbox.emplace_back(target->getAddress(), std::move(cancel));
+		}
+	}
+
+	std::cout << "Page answered by " << answerer.value()->getNumber()
+	          << "; cancelling " << (session->getPagedTargets().size() - 1)
+	          << " other endpoint(s).\n";
+}
+
 void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 {
 	auto session = getSession(data->getCallID());
 	if (!session.has_value())
 	{
+		return;
+	}
+
+	// Issue #37: the ACK in a paging call is addressed to the page extension;
+	// route it to the endpoint that actually answered.
+	if (session.value()->isPaging())
+	{
+		auto dest = session.value()->getDest();
+		if (dest)
+		{
+			_outbox.emplace_back(dest->getAddress(), std::move(data));
+		}
 		return;
 	}
 
@@ -390,43 +651,74 @@ int RequestsHandler::parseRequestedExpires(const std::shared_ptr<SipMessage>& da
 void RequestsHandler::sweepExpired()
 {
 	auto now = std::chrono::steady_clock::now();
+
+	// Drop every session that involves a given extension.
+	auto eraseSessionsFor = [this](const std::string& extension) {
+		for (auto sit = _sessions.begin(); sit != _sessions.end(); )
+		{
+			const bool involved =
+				(sit->second->getSrc()  && sit->second->getSrc()->getNumber()  == extension) ||
+				(sit->second->getDest() && sit->second->getDest()->getNumber() == extension);
+			if (involved)
+				sit = _sessions.erase(sit);
+			else
+				++sit;
+		}
+	};
+
+	// ── Pass 1 (Issue #31): reap orphaned live calls ────────────────────────
+	// The server is blind to peer-to-peer RTP, so a client that loses power or
+	// walks out of range mid-call never sends BYE. Detect it by endpoint silence:
+	// any inbound packet (REGISTER refresh or a 200 OK to our OPTIONS ping) calls
+	// markActive(); an endpoint quiet past KEEPALIVE_TIMEOUT is treated as gone and
+	// its established call is torn down — without unregistering the client itself.
+	for (auto sit = _sessions.begin(); sit != _sessions.end(); )
+	{
+		const auto& session = sit->second;
+		auto silent = [&](const std::shared_ptr<SipClient>& c) {
+			return c && (now - c->getLastActiveTime() > KEEPALIVE_TIMEOUT);
+		};
+		if (isLiveCall(session->getState()) &&
+			(silent(session->getSrc()) || silent(session->getDest())))
+		{
+			std::cout << "Reaping orphaned session (endpoint silent > "
+			          << POCKETDIAL_KEEPALIVE_TIMEOUT_SECS << "s): " << sit->first << '\n';
+			sit = _sessions.erase(sit);
+		}
+		else
+		{
+			++sit;
+		}
+	}
+
+	// ── Pass 2 (Issue #47): unregister clients on REGISTER-lease expiry only ──
+	// Responding to out-of-dialog OPTIONS is a SHOULD, not a MUST. We no longer
+	// evict a client merely for ignoring our pings — that flapped live phones in
+	// and out of the registry between REGISTERs. Registration now rides the lease.
 	for (auto it = _clients.begin(); it != _clients.end(); )
 	{
-		bool keepAliveTimedOut = (now - it->second->getLastActiveTime() > std::chrono::seconds(15));
-		bool leaseExpired = it->second->isExpired(now);
-
-		if (keepAliveTimedOut || leaseExpired)
+		if (it->second->isExpired(now))
 		{
-			if (keepAliveTimedOut)
-			{
-				std::cout << "Pruning client due to missed OPTIONS keepalive pings: " << it->first << '\n';
-			}
-			else
-			{
-				std::cout << "Registration lease expired: " << it->first << '\n';
-			}
-
-			// Clean up sessions involving this client
-			std::string extension = it->first;
-			for (auto sit = _sessions.begin(); sit != _sessions.end(); )
-			{
-				bool involved = false;
-				if (sit->second->getSrc() && sit->second->getSrc()->getNumber() == extension)
-					involved = true;
-				if (sit->second->getDest() && sit->second->getDest()->getNumber() == extension)
-					involved = true;
-				if (involved)
-					sit = _sessions.erase(sit);
-				else
-					++sit;
-			}
-
+			std::cout << "Registration lease expired: " << it->first << '\n';
+			eraseSessionsFor(it->first);
 			it = _clients.erase(it);
 		}
 		else
 		{
 			++it;
 		}
+	}
+
+	// ── Pass 3 (Issue #38): evict idle rate-limit buckets to bound memory ────
+	// Critical on ESP32: without this an attacker spoofing many source IPs could
+	// grow _rateBuckets without limit. A bucket idle for 5 min is fully refilled
+	// anyway, so dropping it costs nothing.
+	for (auto it = _rateBuckets.begin(); it != _rateBuckets.end(); )
+	{
+		if (now - it->second.last > std::chrono::minutes(5))
+			it = _rateBuckets.erase(it);
+		else
+			++it;
 	}
 }
 
@@ -473,6 +765,64 @@ std::string RequestsHandler::buildContact(const std::string& number) const
 {
 	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
 	return "Contact: <sip:" + number + "@" + activeIp + ":" + std::to_string(_serverPort) + ";transport=UDP>";
+}
+
+// Issue #37: build a CANCEL that matches a forked INVITE. The header accessors
+// already include their field name ("Via: …", "From: …", …), so we reuse those
+// lines verbatim and only rewrite the request line's method and the CSeq method.
+std::shared_ptr<SipMessage> RequestsHandler::buildCancel(const std::shared_ptr<SipMessage>& invite,
+	const std::shared_ptr<SipClient>& target)
+{
+	// Request line: same Request-URI as the INVITE, method swapped to CANCEL.
+	const std::string& start = invite->getHeader();   // "INVITE <ruri> SIP/2.0"
+	auto sp = start.find(' ');
+	std::string cancelStart = (sp == std::string::npos) ? std::string("CANCEL")
+	                                                    : ("CANCEL" + start.substr(sp));
+
+	// CSeq: same sequence number as the INVITE, method CANCEL (RFC 3261 §9.1).
+	std::string cseqNum = "1";
+	{
+		const std::string& cseq = invite->getCSeq();   // "CSeq: 1 INVITE"
+		size_t i = cseq.find(':');
+		i = (i == std::string::npos) ? 0 : i + 1;
+		while (i < cseq.size() && std::isspace(static_cast<unsigned char>(cseq[i]))) ++i;
+		size_t j = i;
+		while (j < cseq.size() && std::isdigit(static_cast<unsigned char>(cseq[j]))) ++j;
+		if (j > i) cseqNum = cseq.substr(i, j - i);
+	}
+
+	std::ostringstream ss;
+	ss << cancelStart << "\r\n"
+	   << invite->getVia() << "\r\n"
+	   << invite->getFrom() << "\r\n"
+	   << invite->getTo() << "\r\n"
+	   << invite->getCallID() << "\r\n"
+	   << "CSeq: " << cseqNum << " CANCEL\r\n"
+	   << "Max-Forwards: 70\r\n"
+	   << "Content-Length: 0\r\n\r\n";
+	return std::make_shared<SipMessage>(ss.str(), target->getAddress());
+}
+
+// Issue #37: best-effort BYE to an endpoint that answered a page too late (after
+// another endpoint already won), so it doesn't sit off-hook waiting for an ACK.
+std::shared_ptr<SipMessage> RequestsHandler::buildPagingBye(const std::shared_ptr<SipMessage>& ok,
+	const std::shared_ptr<SipClient>& answerer)
+{
+	char ipBuf[INET_ADDRSTRLEN]{};
+	inet_ntop(AF_INET, &answerer->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
+	std::string ruri = "sip:" + answerer->getNumber() + "@" + ipBuf + ":"
+	                 + std::to_string(ntohs(answerer->getAddress().sin_port));
+
+	std::ostringstream ss;
+	ss << "BYE " << ruri << " SIP/2.0\r\n"
+	   << ok->getVia() << "\r\n"
+	   << ok->getFrom() << "\r\n"
+	   << ok->getTo() << "\r\n"
+	   << ok->getCallID() << "\r\n"
+	   << "CSeq: 2 BYE\r\n"
+	   << "Max-Forwards: 70\r\n"
+	   << "Content-Length: 0\r\n\r\n";
+	return std::make_shared<SipMessage>(ss.str(), answerer->getAddress());
 }
 
 // ── Dashboard query API ──────────────────────────────────────────────────────
@@ -555,6 +905,11 @@ uint64_t RequestsHandler::getPacketsProcessed() const
 	return _packetsProcessed.load(std::memory_order_relaxed);
 }
 
+uint64_t RequestsHandler::getPacketsDropped() const
+{
+	return _packetsDropped.load(std::memory_order_relaxed);
+}
+
 size_t RequestsHandler::getClientCount()
 {
 	std::lock_guard<std::mutex> lock(_mutex);
@@ -586,7 +941,7 @@ void RequestsHandler::tick()
 
 		for (auto& [number, client] : _clients)
 		{
-			if (now - client->getLastPingTime() >= std::chrono::seconds(5))
+			if (now - client->getLastPingTime() >= KEEPALIVE_PING_INTERVAL)
 			{
 				client->setLastPingTime(now);
 				auto ping = buildOptionsPing(client);

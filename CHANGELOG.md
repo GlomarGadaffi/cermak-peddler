@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Broadcast / All-Page Extension (#37)**: An `INVITE` to the virtual extension `999` (compile-time `-DPOCKETDIAL_PAGE_EXTENSION="…"`) is forked to every other registered endpoint at once. The first to answer with `200 OK` is connected to the caller and the rest receive a `CANCEL`; an endpoint that answers after the race is sent a `BYE` so it doesn't sit off-hook. In-dialog `ACK`/`BYE` for a paging call are routed by the connected peer's address rather than the (virtual) page extension. Useful for field/event/emergency deployments where an admin needs to reach *anyone* currently registered.
+- **Per-Source-IP Rate Limiting & Optional Allowlist (#38)**: `RequestsHandler` now drops UDP traffic from flooding sources via a per-IP token bucket (defaults: burst 40, sustained 20 pkt/s), evaluated before any parsing or registry work so a flood can neither consume CPU nor keep a registration artificially alive. Idle buckets are evicted during the periodic sweep to bound memory on ESP32. An optional compile-time CIDR allowlist (`-DPOCKETDIAL_ALLOW_CIDR="192.168.1.0/24"`) restricts which subnets may reach the server. Dropped-packet count is exposed on the dashboard `/api/status` as `packetsDropped`.
+- **Configurable mDNS Hostname (#47)**: The mDNS hostname is now a compile-time define (`-DPOCKETDIAL_HOSTNAME="..."`, default `pocketdial`) so two units on one LAN no longer both claim `pocketdial.local`.
+- **Configurable Keepalive Cadence (#47)**: OPTIONS ping interval and the endpoint-silence timeout are now compile-time tunables (`POCKETDIAL_KEEPALIVE_PING_SECS`, default 30; `POCKETDIAL_KEEPALIVE_TIMEOUT_SECS`, default 90).
+
+### Fixed
+- **Keepalive Pruning Evicted Live Clients (#47)**: Registration is no longer torn down merely because a client ignores our `OPTIONS` pings (answering out-of-dialog OPTIONS is a SHOULD, not a MUST in RFC 3261). Clients now ride their negotiated REGISTER lease; the previous 5 s/15 s defaults had been flapping live softphones in and out of the registry between REGISTERs.
+- **Orphaned Session Leak on Lost Endpoint (#31)**: Because the server is blind to peer-to-peer RTP, a client that lost power or walked out of range mid-call never sent `BYE`, leaking the session indefinitely. `sweepExpired()` now reaps an established (`Connected`) session once either endpoint has been silent past the keepalive timeout — without unregistering the client itself.
+
+### Changed
+- **RTTI-Free SDP Dispatch (#42)**: `RequestsHandler::onInvite()` and `onOk()` now probe for SDP via a virtual `SipMessage::hasSdp()` instead of `dynamic_cast<SipSdpMessage*>`, which fails silently on the Arduino ESP32 toolchain (built with `-fno-rtti`). Desktop behavior is identical; Arduino call setup is fixed.
+
 ## [v1.1.0] - 2026-05-29
 
 ### Added

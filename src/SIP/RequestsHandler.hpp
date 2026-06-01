@@ -33,6 +33,7 @@ public:
 	std::vector<std::tuple<std::string, std::string, std::string, int>> getActiveSessions();
 	void forceDisconnect(const std::string& extension);
 	uint64_t getPacketsProcessed() const;
+	uint64_t getPacketsDropped() const;   // Issue #38: rate-limited/blocked packets
 	size_t getClientCount();
 	size_t getSessionCount();
 
@@ -68,6 +69,19 @@ private:
 	std::optional<std::shared_ptr<SipClient>> findClientByAddress(const sockaddr_in& addr);
 	std::shared_ptr<SipMessage> buildOptionsPing(const std::shared_ptr<SipClient>& client);
 
+	// Broadcast / all-page extension (Issue #37). All assume the caller holds _mutex.
+	void startPaging(std::shared_ptr<SipMessage> invite, std::shared_ptr<SipClient> caller);
+	void handlePagingAnswer(const std::shared_ptr<Session>& session, std::shared_ptr<SipMessage> data);
+	std::shared_ptr<SipMessage> buildCancel(const std::shared_ptr<SipMessage>& invite,
+		const std::shared_ptr<SipClient>& target);
+	std::shared_ptr<SipMessage> buildPagingBye(const std::shared_ptr<SipMessage>& ok,
+		const std::shared_ptr<SipClient>& answerer);
+
+	// Issue #38: per-source-IP token bucket + optional allowlist. Both helpers
+	// assume the caller already holds _mutex.
+	bool ipAllowed(const sockaddr_in& src) const;
+	bool allowPacket(const sockaddr_in& src);
+
 	void endHandle(const std::string& destNumber, std::shared_ptr<SipMessage> message);
 	std::string buildContact(const std::string& number) const;
 
@@ -84,6 +98,18 @@ private:
 	int         _serverPort;
 
 	std::atomic<uint64_t> _packetsProcessed{0};
+	std::atomic<uint64_t> _packetsDropped{0};
+
+	// Issue #38: token bucket keyed by source IPv4 (network-order s_addr).
+	struct RateBucket
+	{
+		double tokens;
+		std::chrono::steady_clock::time_point last;
+	};
+	std::unordered_map<uint32_t, RateBucket> _rateBuckets;
+	// Optional CIDR allowlist (host order). _allowMask == 0 means "no allowlist".
+	uint32_t _allowNet  = 0;
+	uint32_t _allowMask = 0;
 
 	std::chrono::steady_clock::time_point _lastSweep{};
 	std::chrono::steady_clock::time_point _lastTick{};
