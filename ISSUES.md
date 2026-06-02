@@ -141,3 +141,64 @@ Stream live SIP UDP signaling packets directly to the CRT console landing page u
 #### Resolution Details
 1. Enforced strict return status validations on all `nvs_get_u8` and `nvs_get_str` calls inside `main/esp_main_display.cpp`, defaulting safely to fallback setup mode if flash keys do not exist.
 2. Added status validation on the DNS socket `sendto` syscall in `main/wifi/DnsServer.cpp`.
+
+---
+
+### 🟢 Issue #54: Session Pool Slots Permanent Exhaustion
+* **Status**: ✅ Resolved (v1.4.0 / `b5c1a1f`)
+* **Labels**: `bug`, `critical`, `regression-risk`
+
+#### Resolution Details
+1. Implemented a `release()` method on the `Session` class to clear all references (`_src`, `_dest`, `_inviteMessage`, `_pendingTargets`, and `_callID`).
+2. Configured the `RequestsHandler`'s `endCall()`, `sweepExpired()`, and `forceDisconnect()` methods to explicitly invoke `release()` on active session objects from the pre-allocated pool upon termination.
+3. Updated `allocateSession()` to scan and reclaim inactive session slots in the `_sessionPool` whose `Call-ID` is empty or no longer present in the active `_sessions` map, allowing infinite setup/teardown cycles.
+
+---
+
+### 🟢 Issue #55: Address of Record (AOR) Input Injection
+* **Status**: ✅ Resolved (v1.4.0 / `b5c1a1f`)
+* **Labels**: `bug`, `security`, `input-validation`
+
+#### Resolution Details
+1. Created `RequestsHandler::isValidAor()` which strictly whitelists alphanumeric characters and `.`, `-`, `_`, `+`.
+2. Added AOR sanitization checks inside `onRegister()` and `onInvite()`, rejecting malformed inputs with a `400 Bad Request` response.
+
+---
+
+### 🟢 Issue #56: Compile-time Gated Default-Open Mode (Option B)
+* **Status**: ✅ Resolved (v1.4.0 / `b5c1a1f`)
+* **Labels**: `security`, `configuration`
+
+#### Resolution Details
+1. Introduced compile-time guard `POCKETDIAL_OPEN_REGISTRAR` in `RequestsHandler.hpp`, defined by default so that the registrar starts "open" for easy deployment.
+2. If `POCKETDIAL_OPEN_REGISTRAR` is commented/undefined, the registrar switches to closed mode, rejecting unauthenticated or non-matching registrations and invites with a secure `403 Forbidden` response.
+
+---
+
+### 🟢 Issue #57 (B): Thread-Safe Buffered Logging Under Lock
+* **Status**: ✅ Resolved (v1.4.0 / `b5c1a1f`)
+* **Labels**: `performance`, `concurrency`
+
+#### Resolution Details
+1. Implemented a private `_logQueue` and helper `queueLog()` inside `RequestsHandler` to buffer all `std::cout`/`std::cerr` print statements inside locked critical sections.
+2. Configured `handle()`, `tick()`, and `forceDisconnect()` to capture the accumulated logs, clear the queue, release the main mutex `_mutex`, and safely output the logs to the console completely outside of the locked section.
+
+---
+
+### 🟢 Issue #58: Distributed Scanner Memory Exhaustion via Rate-Limit Buckets
+* **Status**: ✅ Resolved (v1.4.0 / `b5c1a1f`)
+* **Labels**: `bug`, `security`, `dos-prevention`
+
+#### Resolution Details
+1. Configured `RequestsHandler::tick()` to periodically sweep rate-limit buckets older than 60 seconds from the `_rateBuckets` map.
+2. Added a hard cap of `MAX_BUCKETS = 256` inside `allowPacket()`, falling back to drop additional scanning source IP packets to prevent denial-of-service memory exhaustion.
+
+---
+
+### 🟢 Issue #59: Whole-Message Header Mutations Corrupting SIP Body
+* **Status**: ✅ Resolved (v1.4.0 / `b5c1a1f`)
+* **Labels**: `bug`, `reliability`
+
+#### Resolution Details
+1. Implemented `SipMessage::findHeader()` to calculate the header-to-body boundary (`\r\n\r\n` or `\n\n`) and restrict searches strictly within the `[0, headerLimit)` range.
+2. Modified all header setters in `SipMessage.cpp` (`setVia`, `setFrom`, `setTo`, etc.) to use `findHeader()`, protecting identical substrings in the SDP media/audio body from accidental mutations.

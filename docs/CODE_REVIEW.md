@@ -1,53 +1,55 @@
 # Code Quality Review & Refactoring Recommendations
-**Project:** pocket-dial (ESP32 VoIP PBX firmware)  
+
+**Project:** pocket-dial (ESP32 VoIP PBX Firmware)  
 **Date:** June 1, 2026  
 **Auditor:** AgencyAuditSpecialist  
-**Status:** Complete — Post-Refactor Review  
+**Status:** Complete — Post-Refactor Review & Refactoring Assessment  
 
 ---
 
 ## Executive Quality Review
 
-This code review details a comprehensive pass over the post-refactor **pocket-dial** firmware codebase (`GlomarGadaffi/pocket-dial`). The focus was on evaluating style compliance, naming conventions, include file dependencies, modularity, memory footprints, and general code cleanliness.
+This code review details a comprehensive quality pass over the post-refactor and post-patch **pocket-dial** firmware codebase (`GlomarGadaffi/pocket-dial`). The assessment evaluates coding styles, naming conventions, inclusion structure, memory profiles, and algorithmic efficiency.
 
 ### Codebase Health Assessment
-Overall, the codebase is in **excellent health**. The division of labor between `HttpServer`, `UdpServer`, `RequestsHandler`, and the individual models (`SipClient`, `Session`, `SipMessage`) is highly logical and modular. The C++ code is written clearly, utilizing RAII principles (e.g., `std::lock_guard` for mutexes, `std::vector` for heap management).
+Following the recent integration of security patches (Issues #54 through #59), the codebase exhibits **exceptional health**. The separation of concerns between raw packet listening (`UdpServer`), connection management (`HttpServer`), signaling coordination (`RequestsHandler`), and message parsing (`SipMessage`) is highly logical and modular. Standard RAII wrappers are employed correctly, and the entire signaling thread path compiles without Run-Time Type Information (RTTI) support, making it perfect for microcontrollers.
 
 > [!NOTE]
-> **Key Improvement:** The refactoring team has successfully removed many high-maintenance structures. The code compiles without RTTI support (ideal for microcontrollers) and keeps standard dependencies minimal. However, there are several areas where optimizations and security fixes can easily be integrated to reduce CPU usage and clean up redundant abstractions.
+> **Key Improvement:** Standardizing on pre-allocated static pools has successfully eliminated runtime heap churn. 
+> To push the codebase to production-grade resilience across multiple target boards, the team should implement the specialized refactorings detailed below to optimize CPU utilization during signaling and prevent logging-induced memory overheads.
 
 ---
 
 ## Style, Naming, and Namespace Consistency
 
-### 1. Consistent Casing
-* **Class Names:** PascalCase is strictly and correctly used (e.g., `RequestsHandler`, `HttpServer`, `UdpServer`).
-* **Member Methods:** `RequestsHandler` uses a mix of camelCase (e.g., `onRegister`, `getActiveClients`) and lower snake_case (e.g., `ip_bytes` in DnsServer). Standardizing all member methods to camelCase would improve consistency.
-* **Member Variables:** Private class member variables consistently and correctly utilize the leading underscore prefix (e.g., `_clients`, `_mutex`, `_port`). This avoids parameter shadowing and is a highly readable convention.
+### 1. Casing Conventions
+* **Class Names:** Strictly adheres to PascalCase (e.g., `RequestsHandler`, `HttpServer`, `UdpServer`).
+* **Member Methods:** Class methods utilize a hybrid casing approach. For example, `RequestsHandler` mixes camelCase (e.g., `onRegister`, `getActiveClients`) with lower snake_case (e.g., `ipAllowed` vs `ip_bytes` elsewhere). Standardizing on camelCase across all helper functions would improve readability.
+* **Member Variables:** Consistently utilizes the leading underscore prefix (e.g., `_clients`, `_mutex`, `_clientPool`). This prevents local variable shadowing and is a highly legible convention.
 
-### 2. Missing Namespaces
-Almost all core classes (`HttpServer`, `RequestsHandler`, `Session`, `SipClient`) are defined in the global namespace. This can cause naming collisions if other libraries are linked in the future.
-* **Actionable Suggestion:** Wrap all files inside a `PocketDial` namespace.
-```cpp
-namespace PocketDial {
-    class RequestsHandler { ... };
-}
-```
+### 2. Namespace Wrapping
+Currently, all core classes reside in the global namespace. While acceptable for a standalone firmware application, this poses collision risks when linking third-party components (such as display drivers, hardware cryptography utilities, or logging bridges).
+* **Actionable Suggestion:** Enclose all PBX classes inside a unified `PocketDial` namespace:
+  ```cpp
+  namespace PocketDial {
+      class RequestsHandler { ... };
+  }
+  ```
 
 ---
 
-## Include Analysis & Cleanliness
+## Include Dependency & Cleanliness
 
-The platform-specific header inclusions (such as selecting between `<lwip/sockets.h>` for ESP32 and `<WinSock2.h>` for Windows) are duplicated across several header files:
+Platform-specific socket selections (switching between `<lwip/sockets.h>` on Espressif targets and `<WinSock2.h>` on Windows test rigs) are duplicated across several header files, including:
 * `UdpServer.hpp`
 * `HttpServer.hpp`
 * `RequestsHandler.hpp`
 * `SipClient.hpp`
 
-This duplication makes the code harder to maintain and prone to compilation errors if compile flags change.
+This duplication clutters class definitions and increases build maintenance overhead.
 
-### Recommendation
-Extract these system selections into a single, unified header named `src/Helpers/PlatformSockets.h` and include it across the project:
+### Actionable Refactoring
+Extract all platform socket routing into a single unified header `src/Helpers/PlatformSockets.h` and substitute it across all header files:
 
 ```cpp
 // src/Helpers/PlatformSockets.h
@@ -69,191 +71,117 @@ Extract these system selections into a single, unified header named `src/Helpers
 #pragma comment(lib, "ws2_32.lib")
 #endif
 
-#endif
+#endif // PLATFORM_SOCKETS_H
 ```
 
 ---
 
-## Actionable Code Quality Observations
+## Verification of Refactoring Milestones
 
-### Observation 1: Inefficient String Transformations in `HttpServer::parseRequest`
-In `HttpServer.cpp`, extracting custom headers copies and transforms the *entire* raw request string to lowercase on **every** header extraction call (e.g., twice per connection: once for `host`, once for `origin`):
+### Milestone 1: Efficient Header Extraction in `HttpServer::parseRequest`
+* **Assessment:** **Successfully Integrated.**
+* **Details:** The original implementation copied and transformed the *entire* incoming request string (up to 16 KB) to lowercase for each header extraction call. The updated parser incorporates an efficient line-by-line header scanner inside [HttpServer.cpp](../src/Helpers/HttpServer.cpp#L315-L344) that avoids full payload copying and scans offsets directly, drastically reducing heap allocation pressure.
+
+### Milestone 2: SIP Rate Limiting & CIDR Allowlist in `RequestsHandler`
+* **Assessment:** **Successfully Integrated.**
+* **Details:** The rate-limiting token bucket algorithms and CIDR validation methods are now fully implemented inside [RequestsHandler.cpp](../src/SIP/RequestsHandler.cpp#L1223-L1262) and are executed under lock at the entry point of the signaling handler, safeguarding the PBX from flooding exploits.
+
+### Milestone 3: Header Replacement Empty-Needle Validation in `SipMessage`
+* **Assessment:** **Successfully Integrated.**
+* **Details:** Safe guards checks `if (!_via.empty())` have been integrated into all header mutation methods in [SipMessage.cpp](../src/SIP/SipMessage.cpp#L190-L250), preventing empty headers from corrupting the raw message payload at index `0`.
+
+---
+
+## Actionable Code Quality Observations & Snippets
+
+### Observation 1: Uncapped Memory Growth in `_logQueue`
+In [RequestsHandler.cpp](../src/SIP/RequestsHandler.cpp#L1278-L1281), log messages generated inside locked critical sections are appended to `_logQueue` via `queueLog()` to avoid performing blocking console prints under lock.
 
 ```cpp
-auto extractHeader = [&](const std::string& name) -> std::string {
-    std::string lower = raw; // Duplicates up to 16 KB string
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-        [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
-    std::string needle = "\r\n" + name + ":";
-    size_t p = lower.find(needle);
-    // ...
+void RequestsHandler::queueLog(std::string msg, bool isError)
+{
+    _logQueue.push_back({isError, std::move(msg)});
+}
 ```
 
+However, **`_logQueue` has no size limitation.** If an attacker floods the server with invalid SIP requests that trigger error logging, and `tick()` is delayed or runs slower than the incoming rate, `_logQueue` will grow indefinitely, exhausting the ESP32 heap and causing an Out Of Memory (OOM) crash.
+
 #### Actionable Refactoring
-Scan the request string line-by-line without copying or modifying the whole payload. This drastically reduces the heap allocation pressure on the ESP32:
+Enforce a strict maximum cap (e.g. 64 entries) on the queue. If the queue is saturated, discard the oldest entries to protect system stability:
 
 ```diff
--	// Scan headers for Origin and Host
--	auto extractHeader = [&](const std::string& name) -> std::string {
--		std::string lower = raw;
--		std::transform(lower.begin(), lower.end(), lower.begin(),
--			[](unsigned char c){ return static_cast<char>(std::tolower(c)); });
--		std::string needle = "\r\n" + name + ":";
--		size_t p = lower.find(needle);
--		if (p == std::string::npos) return {};
--		size_t vs = raw.find_first_not_of(" \t", p + needle.size());
--		size_t ve = raw.find("\r\n", vs);
--		if (vs == std::string::npos) return {};
--		return raw.substr(vs, ve == std::string::npos ? std::string::npos : ve - vs);
--	};
--	req.origin = extractHeader("origin");
--	req.host   = extractHeader("host");
-
-+	// Efficient, low-overhead line-by-line header scanner
-+	size_t pos = raw.find("\r\n");
-+	if (pos != std::string::npos) {
-+		pos += 2; // Skip request line
-+		while (pos < raw.size()) {
-+			size_t lineEnd = raw.find("\r\n", pos);
-+			if (lineEnd == std::string::npos) break;
-+			if (lineEnd == pos) break; // Reached header-body boundary
-+
-+			std::string line = raw.substr(pos, lineEnd - pos);
-+			size_t colon = line.find(':');
-+			if (colon != std::string::npos) {
-+				std::string hName = line.substr(0, colon);
-+				std::transform(hName.begin(), hName.end(), hName.begin(), ::tolower);
-+				
-+				// Strip trailing whitespaces from name
-+				while (!hName.empty() && std::isspace(hName.back())) hName.pop_back();
-+
-+				if (hName == "origin" || hName == "host") {
-+					size_t valStart = colon + 1;
-+					while (valStart < line.size() && std::isspace(static_cast<unsigned char>(line[valStart]))) valStart++;
-+					std::string hVal = line.substr(valStart);
-+					if (hName == "origin") req.origin = hVal;
-+					else if (hName == "host") req.host = hVal;
-+				}
-+			}
-+			pos = lineEnd + 2;
-+		}
-+	}
-```
-
----
-
-### Observation 2: Missing Rate Limiting Implementation in `RequestsHandler`
-The "Per-Source-IP Rate Limiting & Optional Allowlist (#38)" feature is detailed in `CHANGELOG.md` and declared in `RequestsHandler.hpp` (lines 88-91, 130-139), but the actual implementations of `ipAllowed` and `allowPacket` are **completely missing** from `RequestsHandler.cpp`. As a result, the rate limiter does not function and packets are never dropped.
-
-#### Actionable Refactoring
-Provide the missing definitions in `RequestsHandler.cpp` and call them at the start of `handle()`:
-
-```cpp
-// Add to the very top of RequestsHandler::handle() in RequestsHandler.cpp:
-void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
-{
-    // Check if IP is in the CIDR allowlist and token bucket allows the packet
-    if (!ipAllowed(request->getSource()) || !allowPacket(request->getSource()))
-    {
-        _packetsDropped.fetch_add(1, std::memory_order_relaxed);
-        return; // Drop packet immediately
-    }
-    
-    _packetsProcessed.fetch_add(1, std::memory_order_relaxed);
-    // ... rest of handle logic ...
-}
-
-// Add these helper implementations at the bottom of RequestsHandler.cpp:
-bool RequestsHandler::ipAllowed(const sockaddr_in& src) const
-{
-    if (_allowMask == 0) return true; // No allowlist configured
-    uint32_t ip = ntohl(src.sin_addr.s_addr);
-    return (ip & _allowMask) == _allowNet;
-}
-
-bool RequestsHandler::allowPacket(const sockaddr_in& src)
-{
-    auto now = std::chrono::steady_clock::now();
-    uint32_t ip = src.sin_addr.s_addr; // Key by raw network-byte-order IP
-
-    auto it = _rateBuckets.find(ip);
-    if (it == _rateBuckets.end())
-    {
-        // New bucket: burst 40, sustained 20 pkt/s
-        _rateBuckets[ip] = { 40.0, now };
-        return true;
-    }
-
-    auto& bucket = it->second;
-    double elapsedSec = std::chrono::duration<double>(now - bucket.last).count();
-    bucket.last = now;
-
-    // Replenish tokens (sustained rate = 20 tokens/sec)
-    bucket.tokens = std::min(40.0, bucket.tokens + elapsedSec * 20.0);
-
-    if (bucket.tokens >= 1.0)
-    {
-        bucket.tokens -= 1.0;
-        return true;
-    }
-
-    return false; // Denied (Rate limit exceeded)
-}
-```
-
----
-
-### Observation 3: Missing Header Empty-Needle Validation
-In `SipMessage::setVia`, `setFrom`, `setTo`, `setCallID`, and `setCSeq`, string manipulation is performed using `.find()` on member variables. If any of these fields are empty in the incoming packet, `.find("")` returns `0`, which inserts the new header value at index `0`, corrupting the start of the message:
-
-```cpp
-void SipMessage::setVia(std::string value) {
-    auto viaPos = _messageStr.find(_via); // If _via is "", find("") returns 0
-    if (viaPos != std::string::npos) {
-        _messageStr.replace(viaPos, _via.length(), value); // Corrupts index 0
-    }
-    _via = std::move(value);
-}
-```
-
-#### Actionable Refactoring
-Add safe guards against empty needles, matching the protection added to `setContact`:
-
-```diff
- void SipMessage::setVia(std::string value) {
--	auto viaPos = _messageStr.find(_via);
--	if (viaPos != std::string::npos) {
--		_messageStr.replace(viaPos, _via.length(), value);
--	}
-+	if (!_via.empty()) {
-+		auto viaPos = _messageStr.find(_via);
-+		if (viaPos != std::string::npos) {
-+			_messageStr.replace(viaPos, _via.length(), value);
-+		}
-+	} else {
-+		size_t clPos = _contentLength.empty() ? std::string::npos : _messageStr.find(_contentLength);
-+		if (clPos != std::string::npos) {
-+			_messageStr.insert(clPos, value + "\r\n");
-+		} else {
-+			_messageStr += value + "\r\n";
-+		}
-+	}
- 	_via = std::move(value);
+ void RequestsHandler::queueLog(std::string msg, bool isError)
+ {
++    if (_logQueue.size() >= 64)
++    {
++        // Discard oldest log to prevent memory exhaustion under attack
++        _logQueue.erase(_logQueue.begin());
++    }
+     _logQueue.push_back({isError, std::move(msg)});
  }
 ```
 
 ---
 
-### Observation 4: Unified Compiler Warning Flags
-Hardening the compiler options prevents regression bugs on multiple target configurations (such as different cross-compilers for ESP32 and Waveshare Ethernet boards).
+### Observation 2: Redundant Boundary Scanning in `SipMessage::findHeader`
+[SipMessage::findHeader](../src/SIP/SipMessage.cpp#L499-L511) is executed inside every header setter (`setVia`, `setFrom`, `setTo`, etc.) during packet mutation sequences. On every invocation, it scans the entire raw message string to locate the header-to-body boundary (`\r\n\r\n` or `\n\n`):
 
-The root `CMakeLists.txt` is missing critical compiler warnings. We recommend expanding the compiler flag checks to ensure complete type and variable safety:
+```cpp
+size_t SipMessage::findHeader(const std::string& field) const {
+    if (field.empty()) return std::string::npos;
+    size_t pos = _messageStr.find(field);
+    if (pos != std::string::npos) {
+        size_t bodyStart = _messageStr.find("\r\n\r\n"); // <-- Redundant full search
+        if (bodyStart == std::string::npos) bodyStart = _messageStr.find("\n\n");
+        size_t headerLimit = (bodyStart != std::string::npos) ? bodyStart : _messageStr.size();
+        if (pos < headerLimit) return pos;
+    }
+    return std::string::npos;
+}
+```
+
+This redundant scanning of the entire string consumes unnecessary CPU cycles on Core 1 during packet processing blocks.
+
+#### Actionable Refactoring
+Locate the body boundary once during the initial `SipMessage::parse()` cycle and cache the limit in a protected member variable `_headerLimit` inside `SipMessage.hpp`:
+
+```diff
+// Inside SipMessage::parse() in SipMessage.cpp:
+ void SipMessage::parse() {
+     // ... initial header parse logic ...
+-    
++    size_t bodyStart = _messageStr.find("\r\n\r\n");
++    if (bodyStart == std::string::npos) bodyStart = _messageStr.find("\n\n");
++    _headerLimit = (bodyStart != std::string::npos) ? bodyStart : _messageStr.size();
+ }
+
+// Updated SipMessage::findHeader in SipMessage.cpp:
+ size_t SipMessage::findHeader(const std::string& field) const {
+     if (field.empty()) return std::string::npos;
+     size_t pos = _messageStr.find(field);
+-    if (pos != std::string::npos) {
+-        size_t bodyStart = _messageStr.find("\r\n\r\n");
+-        if (bodyStart == std::string::npos) bodyStart = _messageStr.find("\n\n");
+-        size_t headerLimit = (bodyStart != std::string::npos) ? bodyStart : _messageStr.size();
+-        if (pos < headerLimit) return pos;
+-    }
++    if (pos != std::string::npos && pos < _headerLimit) {
++        return pos;
++    }
+     return std::string::npos;
+ }
+```
+
+---
+
+### Observation 3: Hardened Compiler Warning Flags in Build Configurations
+Hardening the compiler options prevents regression bugs when compiling across multiple target setups (such as standard ESP32 boards vs display-integrated HMI modules).
+
+The root `CMakeLists.txt` does not specify strict compiler warnings. We recommend expanding the compiler flag configurations to enforce complete variable, type, and conversion safety:
 
 ```cmake
-# Expand compile warnings in CMakeLists.txt
-if (MSVC)
-    add_compile_options(/W4 /WX)
-else()
+# Recommended additions to root CMakeLists.txt
+if (NOT MSVC)
     add_compile_options(
         -Wall 
         -Wextra 
@@ -262,6 +190,7 @@ else()
         -Wconversion 
         -Wdouble-promotion 
         -Wformat=2
+        -Wno-unused-parameter
     )
 endif()
 ```
@@ -270,4 +199,4 @@ endif()
 
 ## Conclusion
 
-By implementing the actionable observations listed above, the pocket-dial firmware will benefit from **decreased memory fragmentation**, **reduced CPU usage**, and a **stronger security posture** against denial of service and packet manipulation. The overall architecture is robust, and these refinements will elevate the firmware to commercial-grade stability.
+By implementing the structural and optimization recommendations documented above, the pocket-dial firmware will benefit from **reduced CPU cycle consumption during signaling**, **guaranteed memory boundaries under heavy log triggers**, and **increased modularity** through clean namespace insulation. The post-patch codebase represents a highly performant and solid foundation.

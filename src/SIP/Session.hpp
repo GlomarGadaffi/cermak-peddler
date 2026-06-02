@@ -49,6 +49,8 @@ public:
 	std::shared_ptr<SipMessage> getInviteMessage() const { return _inviteMessage; }
 	void setInviteMessage(std::shared_ptr<SipMessage> msg) { _inviteMessage = msg; }
 
+	void release();
+
 private:
 	std::string _callID;
 	std::shared_ptr<SipClient> _src;

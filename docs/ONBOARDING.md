@@ -28,7 +28,7 @@ To load the correct compilers (`xtensa-esp32-elf-gcc`, `xtensa-esp32s3-elf-g++`)
 ### 💻 Windows (PowerShell)
 ```powershell
 # Open PowerShell and run the export script generated during installer setup
-. C:\Users\YourUsername\esp\esp-idf\export.ps1
+. ~\esp\esp-idf\export.ps1
 ```
 
 ### 🐧 Linux / 🍏 macOS
@@ -103,7 +103,32 @@ idf.py -D SIP_TRANSPORT=display build
 
 ---
 
-## 🔌 Step 4: Flash the Board
+## 🔒 Step 4: Security Customizations (Issues #54-#59)
+
+Before compiling, configure security settings according to your environment's posture:
+
+### 1. Closed Mode vs. Open Mode Authentication (Issue #56)
+By default, the SIP engine starts in **Open Mode** to facilitate rapid bench-testing and hobbyist setups. If you are deploying the firmware in a production or shared corporate network environment, you must switch the system to **Closed Mode** to block unauthorized traffic.
+* **To Enable Closed Mode:** Open `src/SIP/RequestsHandler.hpp` and comment out or remove the following line:
+  ```cpp
+  // Comment this line to switch from default-open to a secure closed registrar:
+  // #define POCKETDIAL_OPEN_REGISTRAR
+  ```
+* **Effect:** When undefined, any incoming `REGISTER` or `INVITE` transaction from an unrecognized endpoint or with non-matching credentials will be blocked immediately with a secure `403 Forbidden` response code.
+
+### 2. Address of Record (AOR) Sanitization Safeguard (Issue #55)
+The engine whitelists and sanitizes SIP Address of Record (AOR) segments during inbound packet parsing. 
+* Only alphanumeric characters and the characters `.`, `-`, `_`, `+` are allowed.
+* Malformed injection strings or script probes are instantly intercepted and rejected with a `400 Bad Request` packet, preventing potential parsing or configuration hijacking attempts.
+
+### 3. Distributed Scanner Denial-of-Service Defense (Issue #58)
+The system prevents flash/memory exhaustion exploits by network scanners via two mechanisms:
+* Old rate-limit tracking buckets (inactive for >60 seconds) are automatically swept from memory during the tick process.
+* The number of concurrent tracking source IPs is restricted to a hard cap of `MAX_BUCKETS = 256`. Scanning packets exceeding this limit are silently dropped to safeguard device stability.
+
+---
+
+## 🔌 Step 5: Flash the Board
 
 Connect your development board using a high-quality USB-C/micro-USB cable. Identify the serial port assigned to your device:
 * **Windows:** Open Device Manager and check `Ports (COM & LPT)` (e.g., `COM3`, `COM12`).
@@ -122,7 +147,7 @@ idf.py -p COM3 flash monitor
 
 ---
 
-## 🧪 Step 5: Manual HTTP API Verification
+## 🧪 Step 6: Manual HTTP API Verification
 
 Once flashing completes, the device boots and the serial monitor will show logging status. If running in **Wi-Fi SoftAP** or **Display** mode:
 
@@ -132,7 +157,7 @@ Once flashing completes, the device boots and the serial monitor will show loggi
 You can now manually query and control the firmware using standard terminal commands or by navigating your browser to `http://192.168.4.1/`.
 
 ### 1. Get Live System Status (Uptime, Registered Clients, and Sessions)
-This retrieves system metrics and registered SIP extensions.
+Retrieves system metrics and registered SIP extensions.
 
 #### Command
 ```bash

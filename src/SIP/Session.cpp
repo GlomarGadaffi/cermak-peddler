@@ -82,3 +82,14 @@ void Session::removePendingTarget(const std::string& number)
 		}
 	}
 }
+
+void Session::release()
+{
+	_callID.clear();
+	_src.reset();
+	_dest.reset();
+	_state = State::Invited;
+	_isBroadcast = false;
+	_pendingTargets.clear();
+	_inviteMessage.reset();
+}

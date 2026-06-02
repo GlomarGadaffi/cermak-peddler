@@ -60,6 +60,7 @@ public:
 protected:
 	void parse();
 	std::string extractNumber(const std::string& header) const;
+	size_t findHeader(const std::string& field) const;
 
 	std::string _type;
 	std::string _header;

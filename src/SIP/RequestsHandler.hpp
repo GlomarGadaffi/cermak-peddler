@@ -1,6 +1,9 @@
 #ifndef REQUESTS_HANDLER_HPP
 #define REQUESTS_HANDLER_HPP
 
+// Gated open mode (Issue #56). Undefine/disable to run in closed/restricted mode.
+#define POCKETDIAL_OPEN_REGISTRAR
+
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 #include <lwip/sockets.h>
 #elif defined(__linux__)
@@ -93,6 +96,9 @@ private:
 	void endHandle(const std::string& destNumber, std::shared_ptr<SipMessage> message);
 	std::string buildContact(const std::string& number) const;
 
+	bool isValidAor(const std::string& s) const;
+	void queueLog(std::string msg, bool isError = false);
+
 	std::shared_ptr<SipClient> allocateClient(std::string number, sockaddr_in address, int expiresSeconds);
 	std::shared_ptr<Session> allocateSession(std::string callID, std::shared_ptr<SipClient> src);
 	std::shared_ptr<SipClient> _dummyClient;
@@ -139,6 +145,8 @@ private:
 
 	std::chrono::steady_clock::time_point _lastSweep{};
 	std::chrono::steady_clock::time_point _lastTick{};
+
+	std::vector<std::pair<bool, std::string>> _logQueue;
 };
 
 #endif

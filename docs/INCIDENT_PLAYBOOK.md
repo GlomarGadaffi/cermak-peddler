@@ -1,6 +1,6 @@
 # ESP32 Pocket-Dial Firmware: Field Incident Playbook
 
-This document serves as the authoritative production-grade field operation and incident playbook for the pocket-dial ESP32 / ESP32-S3 firmware. It is intended for field engineers, system administrators, and core firmware maintainers to diagnose, isolate, and recover devices suffering from field anomalies.
+This document serves as the authoritative production-grade field operation and incident playbook for the pocket-dial ESP32 / ESP32-S3 firmware. It is intended for field engineers, system administrators, and core firmware maintainers to diagnose, isolate, secure, and recover devices suffering from field anomalies.
 
 ---
 
@@ -12,7 +12,10 @@ Use this matrix for rapid triage based on visible device indicators and active d
 | :--- | :--- | :--- | :--- |
 | **Watchdog Reset** | • Boot loops with `TG0WDT_SYS_RST`<br>• Logs showing `Task watchdog got triggered` | • Thread starvation on Core 1<br>• Infinite loop in SIP message parser | • Increase TWDT timeout in sdkconfig<br>• Add `vTaskDelay` yields in parsing loops |
 | **NVS / Credential Corruption** | • Core boot loops on `nvs_flash_init()` failure<br>• Constant boot loop back to factory SoftAP | • Flash sector wear-out<br>• Brownout mid-write (incomplete `nvs_commit`) | • Programmatic partition format on error<br>• Force sector erase with `esptool.py` |
-| **SIP Engine Deadlock** | • SIP endpoints unregisterable (5060 dead)<br>• HTTP Dashboard running on Core 0 (8080/80 active) | • Recursive locking of `RequestsHandler::_mutex`<br>• Lock-order inversion in paging | • Trigger CPU crash dump / JTAG stack trace<br>• Hard power cycle or remote API restart |
+| **SIP Engine Deadlock** | • SIP endpoints unregisterable (5060 dead)<br>• HTTP Dashboard running on Core 0 (80/8080 active) | • Recursive locking of `RequestsHandler::_mutex`<br>• Lock-order inversion in paging | • Trigger CPU crash dump / JTAG stack trace<br>• Hard power cycle or remote API restart |
+| **Session Pool Exhaustion** | • Device returns `503 Service Unavailable`<br>• Dashboard shows active sessions stuck at limit | • Unreleased sessions from ended calls<br>• Memory leak or failed cleanup after bye/cancel | • Trigger remote reboot via HTTP API<br>• Apply `v1.4.0` session-reclaim fix |
+| **AOR Injection Attempts** | • Console logs show `Invalid character in Address of Record`<br>• SIP client receives `400 Bad Request` | • Exploit attempt injecting bad chars into From/To AOR<br>• Malformed third-party network scans | • Input sanitized automatically. Monitor logs<br>• Restrict network CIDR range |
+| **Scanner Bucket DoS** | • Device logs drop packets from scanning IPs<br>• Metrics display high `packetsDropped` value | • Distributed botnets scanning port 5060<br>• Overflow of rate bucket lookup table | • Rate-limiter caps tables automatically at 256<br>• Standard auto-cleanup sweeps old IPs |
 | **OTA Failure / Rollback** | • Device boots old firmware after OTA update<br>• Bootloader prints `Rollback triggered...` | • Missing `esp_ota_mark_app_valid_cancel_rollback`<br>• Network dropout mid-stream | • Verify OTA validation timing<br>• Flash known working binary to active slot |
 
 ---
@@ -62,7 +65,7 @@ ESP32 chips feature both a **Hardware Watchdog Timer (WDT)** in the Timer Group 
 ### 🔬 Diagnosis Procedure
 To map raw hex addresses (like `PC : 0x400d54c8`) back to the specific line of C++ code causing the deadlock or lockup, use the ESP-IDF toolchain's backtrace decoder:
 
-```powershell
+```bash
 # For Standard ESP32 (Xtensa)
 xtensa-esp32-elf-addr2line -pfia -e build/SipServer.elf 0x400d54c8 0x400d5a1c
 
@@ -161,7 +164,7 @@ ESP_ERROR_CHECK(ret);
 
 ---
 
-## 3. SIP Engine Deadlocks
+## 3. SIP Engine Deadlocks & Thread-Safe Logging
 
 The post-refactor `RequestsHandler` manages a concurrent snapshot-based dashboard structure. An architectural deadlock occurs if recursive operations or lock-order inversion locks `RequestsHandler::_mutex` permanently, starving SIP execution.
 
@@ -171,7 +174,7 @@ The post-refactor `RequestsHandler` manages a concurrent snapshot-based dashboar
 3. **Task Monitor Frozen:** Serial console logs do not show `UdpServer` or `RequestsHandler::tick` processing notices.
 
 ### 🔬 Diagnosis Procedure
-If JTAG or an ESP-Prog adapter is connected, attach GDB to the target chip to view running backtraces:
+If JTAG or an GDB debugger is connected, attach to the target chip to view running backtraces:
 
 ```text
 (gdb) thread apply all bt
@@ -186,6 +189,11 @@ Thread 2 (sip_server_task):
 > [!IMPORTANT]
 > The `std::mutex` provided by the ESP-IDF toolchain is a **non-recursive** mutex (wraps a standard FreeRTOS binary semaphore). If a function holding the lock attempts to call another member function that also requests the lock (e.g., calling `sweepExpired()` within another locked method without passing lock ownership), the task will immediately **self-deadlock**.
 
+### 🔒 Core Thread-Safe Buffered Logging (Issue #57B)
+To avoid deadlocks arising from raw, synchronous console output operations (`std::cout`/`std::cerr`) stalling inside locked sections under intense concurrency:
+* **The Safeguard:** The engine utilizes a thread-safe, private queue `_logQueue` and helper `queueLog()` to store logging strings while inside locked sections.
+* **The Resolution:** All log statements inside `handle()`, `tick()`, and `forceDisconnect()` are queued under lock, and only output to the standard serial console *after* releasing `_mutex` completely, freeing up other threads immediately.
+
 ### 🛡️ Recovery & Prevention
 1. **Emergency Remote Restart:** Since the HTTP task on Core 0 is unaffected, use the credentials api or fallback mode reboot api to trigger a remote software restart:
    ```bash
@@ -198,7 +206,43 @@ Thread 2 (sip_server_task):
 
 ---
 
-## 4. Over-The-Air (OTA) Failures & Rollbacks
+## 4. Resource Allocation & Security Safeguards (Issues #54-#59)
+
+The firmware is reinforced against remote attacks, memory leaks, and exhaustion exploits via specific C++ logic guards implemented in Issues #54 through #59.
+
+### 💾 Session Pool Exhaustion (Issue #54)
+* **Symptom:** Endpoints cannot establish new calls and receive `503 Service Unavailable`, but the dashboard shows 0 active calls.
+* **Root Cause:** Saturated static memory pool allocation. The SIP engine pre-allocates up to 32 `SipClient` slots and 8 `Session` slots. If a session is closed but not properly dereferenced/released, the slot is leaked.
+* **C++ Safety Guard:** The system implements a robust slot-recycling `.release()` method on the `Session` class, clearing core pointers (`_src`, `_dest`, `_inviteMessage`, `_pendingTargets`, and `_callID`). 
+* **Automatic Reclamation:** On call termination (`endCall()`, `sweepExpired()`, or `forceDisconnect()`), `.release()` is explicitly triggered on active session objects. The allocation method (`allocateSession()`) automatically sweeps the pre-allocated `_sessionPool` to reclaim slot keys that are no longer actively mapped in `_sessions`.
+
+### 🛡️ Address of Record (AOR) Input Injection (Issue #55)
+* **Symptom:** Remote endpoints send malicious headers containing non-alphanumeric or command symbols, trying to hijack parsing or configuration logic.
+* **Root Cause:** Missing input bounds checks.
+* **C++ Safety Guard:** The function `RequestsHandler::isValidAor()` strictly checks Address of Record strings in incoming `REGISTER` and `INVITE` requests. It enforces a strict whitelist containing only alphanumeric characters and standard delimiters: `.`, `-`, `_`, `+`. Malformed inputs are rejected immediately with a `400 Bad Request` packet, preventing any buffer or parsing anomalies.
+
+### ⚙️ Compile-time Gated Open Registrar (Issue #56)
+* **Symptom:** Unauthenticated endpoints are allowed to register or place calls on private networks.
+* **Root Cause:** Default-open registrar behaviour.
+* **Safety Guard:** Controlled via the compile-time guard flag `#define POCKETDIAL_OPEN_REGISTRAR`. 
+  * If defined, the server is "open" and handles unregistered traffic seamlessly (development default).
+  * If commented out, the registrar switches to **Closed Mode**, strictly rejecting unauthenticated registrations or non-matching extension targets with a secure `403 Forbidden` response.
+
+### 🚫 Distributed Scanner Memory Exhaustion (Issue #58)
+* **Symptom:** Memory exhaustion crashes under intense external scanner traffic (port sweeps).
+* **Root Cause:** Unbounded allocation of rate-limiting buckets keyed by IP inside the `_rateBuckets` map.
+* **C++ Safety Guard:** Two strict protections mitigate this:
+  1. `RequestsHandler::tick()` sweeps old rate-limit entries (unused for >60 seconds) out of the map.
+  2. `allowPacket()` enforces a hard ceiling of `MAX_BUCKETS = 256` concurrently monitored IPs. Once hit, scanning packets from any newly detected foreign IPs are dropped automatically to shield CPU and heap resources.
+
+### ✂️ Whole-Message Header Mutations (Issue #59)
+* **Symptom:** Media stream (audio/video) metadata inside the SDP body is corrupted or stripped when the SIP engine rewrites message headers.
+* **Root Cause:** Standard header replacement functions searching across the entire packet string rather than isolating the header block.
+* **C++ Safety Guard:** Implemented `SipMessage::findHeader()` which parses the boundary boundary limit `\r\n\r\n` (or `\n\n`) and restricts substring searches strictly within the `[0, headerLimit)` range. This isolates header modifications from SDP body segments, ensuring reliable codecs and payload bindings.
+
+---
+
+## 5. Over-The-Air (OTA) Failures & Rollbacks
 
 OTA updates use dual application partitions (`ota_0` and `ota_1`) along with a dedicated `otadata` control partition. This configuration ensures that if a newly flashed firmware fails, the system automatically rolls back to the previous stable partition.
 
@@ -253,7 +297,7 @@ OTA updates use dual application partitions (`ota_0` and `ota_1`) along with a d
 ### 🛡️ Recovery & Prevention
 To bypass rollback logic and manually recover a device stuck in a corrupted OTA state, use direct flash operations via `esptool.py` to restore partition state:
 
-```powershell
+```bash
 # Step 1: Clear the OTA selection table (forces bootloader to return to factory partition)
 esptool.py -p COM3 -b 460800 erase_region 0xd000 0x2000
 

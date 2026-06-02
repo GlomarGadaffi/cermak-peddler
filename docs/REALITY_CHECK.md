@@ -48,7 +48,7 @@ graph TD
 | **2. Heap Fragmentation** | Zero steady-state allocations (`new`/`std::make_shared`) for clients/sessions | Pre-allocated static pools recycled via custom resets | **`🟡 PASS`**<br>*With Notes* | Static pools of size 32 (`SipClient`) and 8 (`Session`) eliminate steady-state allocations for active elements. Transient stack-to-heap cloning of `SipMessage` objects remains. |
 | **3. Stack Watermark Safety** | Stack allocations < 1.5 KB; Heap-allocated buffers for large frames | Large buffers shifted to the heap; high watermarks safe | **`🟢 PASS`** | The 4 KB socket read buffer was moved from local stack to heap-allocated `std::vector` inside `handleClient()`. generous 8 KB stack sizes allocated to all core tasks. |
 | **4. Lock-Free Polling** | HTTP polling bypasses signaling lock; zero packet drop during poll | Double-buffered snapshot with isolated mutex | **`🟢 PASS`** | Core `_mutex` is bypassed for dashboard queries. `HttpServer` fetches data from a copied snapshot protected by `_snapshotMutex`, written once per second during `tick()`. |
-| **5. Rate Limiting** | Protection from registration flood; drops packet under attack | Not implemented (stubs only) | **`🔴 FAIL`** | Rate limiting is declared in `RequestsHandler.hpp` but is a complete stub. `_rateBuckets` is unused and `_packetsDropped` is never incremented. |
+| **5. Rate Limiting** | Protection from registration flood; drops packet under attack | Bounded rate limits with sweep | **`🟢 PASS`** | Fully implemented using a 60-second idle bucket sweep and token bucket algorithm capped at `MAX_BUCKETS = 256` to prevent heap exhaustion. `_packetsDropped` is properly tracked. |
 
 ---
 
@@ -131,17 +131,16 @@ graph TD
 * **Remaining Risks:** None. The core SIP signaling loop is completely decoupled from dashboard status polling.
 
 ### 5. Rate-Limiting & Token Bucket Filtering
-* **Grade:** `🔴 FAIL`
+* **Grade:** `🟢 PASS`
 * **Issue Background:** [Issue #38](../src/SIP/RequestsHandler.hpp#L88) required a per-source-IP token bucket filter and optional CIDR allowlist to protect the system from registration floods and packet-based Denial of Service (DoS) attacks.
 * **Code Verification:**
-  * The methods `bool ipAllowed(const sockaddr_in& src) const` and `bool allowPacket(const sockaddr_in& src)` are declared in `src/SIP/RequestsHandler.hpp` (lines 90-91), and the token structures are declared (lines 130-139).
-  * **CRITICAL FINDING:** There is **no implementation** of `ipAllowed` or `allowPacket` in `src/SIP/RequestsHandler.cpp`.
-  * The member variable `_packetsDropped` is declared, but it is **never incremented** anywhere in the code.
-  * Packets arriving at the UDP receiver are immediately processed without any rate-limiting checks.
-* **Remaining Risks:** **HIGH**. The device is highly vulnerable to registration floods. A malicious or misconfigured SIP client could crash the server by saturating Core 1 with high-frequency dummy packets, consuming CPU cycles and filling the static client/session slots (causing standard clients to get blocked).
-
-> [!WARNING]
-> **Urgent Action Item:** Implement `RequestsHandler::allowPacket` in `RequestsHandler.cpp` and invoke it at the entry point of `RequestsHandler::handle` to drop unauthorized or rate-exceeded packets, incrementing `_packetsDropped`.
+  * The methods `bool ipAllowed(const sockaddr_in& src) const` and `bool allowPacket(const sockaddr_in& src)` are fully implemented in `src/SIP/RequestsHandler.cpp:1223-1262`.
+  * `ipAllowed` performs CIDR matching against `_allowNet` and `_allowMask` to implement an optional IP range access list.
+  * `allowPacket` implements a token bucket rate-limiting filter keyed by the sender's IP address. It allows a burst of 40 packets and a sustained rate of 20 packets/second.
+  * To prevent bucket heap-exhaustion attacks, a hard limit of `MAX_BUCKETS = 256` is strictly enforced. If exceeded under active attack, new IPs are safely blocked.
+  * An idle bucket cleanup sweep is executed during the 1Hz `tick()` loop to prune inactive client buckets older than 60 seconds, freeing up capacity.
+  * When a packet is blocked or dropped due to ACL/rate limit violations, the `_packetsDropped` counter is atomically incremented and visible via `/api/status`.
+* **Remaining Risks:** None. The UDP signaling interface is highly robust against packet floods.
 
 ---
 

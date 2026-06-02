@@ -1,23 +1,25 @@
 # Firmware Security Audit & Threat Model Report
-**Project:** pocket-dial (ESP32 VoIP PBX firmware)  
+
+**Project:** pocket-dial (ESP32 VoIP PBX Firmware)  
 **Date:** June 1, 2026  
 **Auditor:** AgencyAuditSpecialist  
-**Status:** Complete — Post-Refactor Review  
+**Status:** Complete — Post-Refactor Review & Threat Evaluation  
 
 ---
 
 ## Executive Summary
 
-This security audit and threat model report evaluates the network-facing and local attack surfaces of the **pocket-dial** ESP32 firmware codebase. The goal of this audit is to identify potential entry points for attackers, analyze parsing robustly, review existing access control measures, and classify security vulnerabilities using industry-standard severity scoring (CVE-class vulnerabilities and CVSS v3.1 vectors).
+This security audit and threat model report evaluates the network-facing and local attack surfaces of the **pocket-dial** ESP32 PBX firmware codebase (`GlomarGadaffi/pocket-dial`). The primary objectives are to analyze entry points, assess the robustness of parsers, review access control mechanisms, and classify findings using CVE-class severity ratings and CVSS v3.1 scoring vectors.
 
 > [!WARNING]
-> **Summary of Findings:** While the firmware has successfully mitigated several high-risk vectors (including stack buffer overflows and wildcard CORS), significant security gaps remain. The most critical is a **Host/Origin Validation Bypass via DNS Rebinding (SEC-01, High Severity)**, followed by **Missing Packet Validation in SIP Parsing (SEC-02, Medium Severity)**, **Cleartext WiFi Credentials Storage in Flash (SEC-03, Low/Medium Severity)**, and a **Lack of Authentication on Admin HTTP and SIP Interfaces (SEC-04, Medium Severity)**.
+> **Summary of Findings:** The firmware has successfully mitigated two high-risk vulnerabilities—**Host/Origin Validation (DNS Rebinding)** and **SIP Signaling Input Injection**—via the recently integrated security patches. 
+> However, significant physical and local network security gaps remain. The most critical outstanding issues are **Missing Authentication on Admin HTTP/SIP Interfaces (SEC-04, Medium Severity)** and **Cleartext WiFi Credentials Storage in Flash NVS (SEC-03, Low/Medium Severity)**.
 
 ---
 
 ## System Attack Surface Map
 
-The pocket-dial PBX exposes multiple network-facing UDP/TCP ports and utilizes non-volatile flash storage for persistence.
+The pocket-dial PBX exposes multiple UDP/TCP listening services and interacts directly with non-volatile flash storage:
 
 ```
                               [ ATTACK VECTORS ]
@@ -25,175 +27,128 @@ The pocket-dial PBX exposes multiple network-facing UDP/TCP ports and utilizes n
          ┌────────────────────────────┼────────────────────────────┐
          ▼                            ▼                            ▼
    [ Port 53 UDP ]              [ Port 5060 UDP ]            [ Port 80 TCP ]
-     DnsServer                   UdpServer (SIP)               HttpServer
-  (DNS Redirection)            (Signaling Parser)         (CGA Admin Dashboard)
+      DnsServer                   UdpServer (SIP)               HttpServer
+   (DNS Redirection)            (Signaling Parser)         (CGA Admin Dashboard)
          │                            │                            │
          ▼                            ▼                            ▼
-┌──────────────────┐         ┌──────────────────┐         ┌──────────────────┐
-│ Captive Portal   │         │ RequestsHandler  │         │ Detached HTTP    │
-│ Host Redirection │         │ Pre-Allocated    │         │ Client Threads   │
-└────────┬─────────┘         └────────┬─────────┘         └────────┬─────────┘
-         │                            │                            │
-         │                            ▼                            │
-         └───────────────────► [ NVS Storage ] ◄───────────────────┘
-                                SSID & Password
-                               (Cleartext Flash)
+ ┌──────────────────┐         ┌──────────────────┐         ┌──────────────────┐
+ │ Captive Portal   │         │ RequestsHandler  │         │ Detached HTTP    │
+ │ Host Redirection │         │ Pre-Allocated    │         │ Client Threads   │
+ └────────┬─────────┘         └────────┬─────────┘         └────────┬─────────┘
+          │                            │                            │
+          │                            ▼                            │
+          └───────────────────► [ NVS Storage ] ◄───────────────────┘
+                                 SSID & Password
+                                (Cleartext Flash)
 ```
 
-1. **HttpServer (Port 80/TCP):** Exposes index dashboard, network configuration scan, session termination APIs, and captive portal redirections. Run as detached threads.
-2. **SIP UDP Server (Port 5060/UDP):** Listens for registration, call invites, session control signaling, and OPTIONS pings.
-3. **DNS Redirect Server (Port 53/UDP):** Active in captive portal onboarding mode. Resolves all domain queries to local IP.
-4. **NVS Storage (Flash Partition):** Non-volatile flash partition containing static WiFi credentials and boot configurations.
-5. **BLE (Bluetooth Low Energy):** *Not implemented*. The current firmware has zero BLE footprint. (Recommendations for secure implementation are detailed below).
+1. **HttpServer (Port 80/TCP):** Exposes the admin dashboard, network scanning endpoints, and session teardown controls. Dispatches connections to detached thread contexts.
+2. **SIP UDP Server (Port 5060/UDP):** Listens for SIP registration, call invites, session control signaling, and OPTIONS pings.
+3. **DNS Redirect Server (Port 53/UDP):** Runs in captive portal mode to resolve all domain queries to the ESP32’s local IP address.
+4. **NVS Storage (Flash Partition):** Stores plain text WiFi STA credentials and device system flags.
+5. **BLE (Bluetooth Low Energy):** *Not currently implemented*. Custom GATT characteristics and bonding key security are threat-modeled below for future revisions.
 
 ---
 
-## Detailed Vulnerability Findings
+## Issue Severity Summary Table
 
-### SEC-01: Host/Origin Header Validation Bypass via DNS Rebinding
+| ID | Finding Title | CVSS v3.1 Vector | Severity | Status |
+| :--- | :--- | :--- | :---: | :---: |
+| **SEC-01** | Host/Origin Header Validation Bypass (DNS Rebinding) | `CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:H/I:H/A:H` | 🟢 **Mitigated** | **Resolved** |
+| **SEC-02** | Missing Request Parsing Validation on SIP Signaling | `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:N` | 🟢 **Mitigated** | **Resolved** |
+| **SEC-03** | Cleartext WiFi Credentials Storage in Flash NVS | `CVSS:3.1/AV:P/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N` | 🟡 **Low/Medium (4.6)** | **Active** |
+| **SEC-04** | Lack of Authentication on Admin HTTP and SIP Interfaces| `CVSS:3.1/AV:A/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N` | 🟠 **Medium (6.5)** | **Active** |
+
+---
+
+## Detailed Vulnerability Findings & Verifications
+
+### SEC-01: Host/Origin Header Validation Bypass (DNS Rebinding)
 * **Classification:** CWE-346: Origin Validation Error
-* **Severity:** 🔴 **High (CVSS v3.1 Score: 8.1)**
-* **Vector:** `CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:H/I:H/A:H`
-* **Vulnerable Component:** `HttpServer::isSameOrigin(const HttpRequest& req)` in [HttpServer.cpp#L499-L512](../src/Helpers/HttpServer.cpp#L499-L512)
+* **Vulnerable Component:** `HttpServer::isSameOrigin` in [HttpServer.cpp](../src/Helpers/HttpServer.cpp#L514-L544).
 
-#### Description
-The `isSameOrigin()` helper validates mutating POST requests (`/api/kill`, `/api/wifi/connect`, `/api/wifi/mode_ap`) by ensuring that the incoming `Origin` header matches the `Host` header. 
+#### Previous Behavior
+`isSameOrigin()` previously checked mutating POST requests (`/api/kill`, `/api/wifi/connect`) by verifying that the `Origin` header matched the incoming `Host` header. Because it did not validate that the `Host` header was an authorized local interface, an attacker could mount a **DNS Rebinding Attack**. 
+
+By resolving a malicious domain (e.g., `attacker.com`) to the ESP32's IP (`192.168.4.1`) with a low TTL, malicious javascript executed in a victim's browser could send requests with `Host: attacker.com` and `Origin: http://attacker.com`. The comparison returned `true`, bypassing CSRF protections and allowing unauthorized configuration writes.
+
+#### Resolution Verification
+The newly merged security patches successfully resolve this vulnerability. The updated `isSameOrigin()` helper strictly validates the scheme-stripped `Host` header against an authorized allowlist of local interfaces and mDNS hostnames:
 
 ```cpp
-bool HttpServer::isSameOrigin(const HttpRequest& req) const {
-    if (req.origin.empty()) return true;
-    std::string originHost = req.origin;
-    size_t schemeEnd = originHost.find("://");
-    if (schemeEnd != std::string::npos)
-        originHost = originHost.substr(schemeEnd + 3);
-    return originHost == req.host;
-}
+// Verified in HttpServer.cpp lines 535-542:
+std::string cleanOrigin = stripPort(originHost);
+std::string cleanHost = stripPort(req.host);
+
+// Host header must be our local IP or local mDNS hostname or localhost
+std::string activeIp = (_ip == "0.0.0.0") ? getPrimaryLocalIP() : _ip;
+bool hostValid = (cleanHost == activeIp || 
+                  cleanHost == "192.168.4.1" || 
+                  cleanHost == "pocketdial.local" ||
+                  cleanHost == "localhost" ||
+                  cleanHost == "127.0.0.1");
+
+return hostValid && (cleanOrigin == cleanHost);
 ```
-
-However, the server does **not** validate that the `Host` header is an authorized local address (such as `192.168.4.1` or `pocketdial.local`). This exposes the device to a **DNS Rebinding Attack**.
-
-An attacker can register a malicious domain (e.g., `attacker.com`) and configure their DNS server to temporarily resolve this domain to the ESP32’s local IP address (`192.168.4.1`). When a victim connected to the pocket-dial AP visits `attacker.com`, their browser executes malicious JavaScript. Because the browser sends `Host: attacker.com` and `Origin: http://attacker.com`, the `isSameOrigin()` check returns `true`. The attacker’s scripts can now silently issue POST requests to disconnect calls or reprogram the WiFi config.
-
-#### Proof of Concept (Attack Scenario)
-1. Victim connects their PC to the `esp32-sipserver` AP and receives IP `192.168.4.2`.
-2. Victim visits a malicious or compromised web page `http://rebinding.malicious.xyz`.
-3. The malicious DNS server shifts the TTL of `rebinding.malicious.xyz` to `192.168.4.1`.
-4. The script on the page makes a fetch request to `http://rebinding.malicious.xyz/api/kill` with body `"extension=101"`.
-5. The browser issues the request. The HTTP payload contains:
-   * `Host: rebinding.malicious.xyz`
-   * `Origin: http://rebinding.malicious.xyz`
-6. `isSameOrigin()` returns `true` (since `rebinding.malicious.xyz == rebinding.malicious.xyz`).
-7. The call session for extension `101` is terminated silently.
-
-#### Remediation
-Strictly validate the incoming `Host` header against the device's actual IP address or configured mDNS hostname:
-```cpp
-bool HttpServer::isSameOrigin(const HttpRequest& req) const {
-    if (req.origin.empty()) return true;
-    
-    // Strip scheme from Origin
-    std::string originHost = req.origin;
-    size_t schemeEnd = originHost.find("://");
-    if (schemeEnd != std::string::npos)
-        originHost = originHost.substr(schemeEnd + 3);
-
-    // Host header must be our local IP or local mDNS hostname
-    std::string activeIp = (_ip == "0.0.0.0") ? getPrimaryLocalIP() : _ip;
-    bool hostValid = (req.host == activeIp || 
-                      req.host == "192.168.4.1" || 
-                      req.host == "pocketdial.local" ||
-                      req.host.find("localhost") != std::string::npos);
-
-    return hostValid && (originHost == req.host);
-}
-```
+Under this enforcement, a rebinding request carrying a foreign host header (such as `Host: attacker.com`) is rejected immediately with a `403 Forbidden` response.
 
 ---
 
 ### SEC-02: Missing Request Parsing Validation on SIP Signaling
 * **Classification:** CWE-20: Improper Input Validation
-* **Severity:** 🟡 **Medium (CVSS v3.1 Score: 5.3)**
-* **Vector:** `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:N`
-* **Vulnerable Component:** `RequestsHandler::handle` in [RequestsHandler.cpp#L59-L88](../src/SIP/RequestsHandler.cpp#L59-L88)
+* **Vulnerable Component:** `RequestsHandler::handle` in [RequestsHandler.cpp](../src/SIP/RequestsHandler.cpp#L59-L88).
 
-#### Description
-`SipMessage` implements a helper method `isValidMessage()` to check if a parsed packet contains mandatory SIP fields:
+#### Previous Behavior
+The `SipMessage` class defines `isValidMessage()` to verify that mandatory headers (`Via`, `To`, `From`, `Call-ID`, `CSeq`) are present. However, this validator was never called inside `RequestsHandler::handle`. Malformed or truncated UDP packets returned empty headers upon parsing. 
+
+Subsequent header mutation calls (such as `setVia()` or `setFrom()`) ran `.find("")` on empty member variables, which returned index `0`, prepending modified values at the very beginning of the packet and corrupting the SIP Request-Line.
+
+#### Resolution Verification
+The security patches successfully enforce validation at the signaling entry point. `RequestsHandler::handle` now immediately drops null or structurally malformed packets:
+
 ```cpp
-bool SipMessage::isValidMessage() const {
-    if (_via.empty() || _to.empty() || _from.empty() || _callID.empty() || _cSeq.empty()) {
-        return false;
-    }
-    // ...
-}
-```
-However, **neither `SipMessageFactory` nor `RequestsHandler::handle` ever calls `isValidMessage()`**. 
-
-When a malformed UDP packet is received, `SipMessage::parse()` returns early, leaving all parsed headers as empty strings. The handler proceeds to dispatch this empty message to the standard handlers (like `onRegister` or `onInvite`).
-
-If a header (like `_via` or `_contact`) is empty, calling subsequent setters (like `setVia`) triggers a find-and-replace operation:
-```cpp
-void SipMessage::setVia(std::string value) {
-    auto viaPos = _messageStr.find(_via); // _via is "" -> find("") returns 0
-    if (viaPos != std::string::npos) {
-        _messageStr.replace(viaPos, _via.length(), value); // replaces index 0 of length 0!
-    }
-    _via = std::move(value);
-}
-```
-Because finding an empty string `""` in C++ returns index `0`, the setter prepends the header at the very beginning of the raw packet payload, corrupting the SIP Request-Line.
-
-#### Proof of Concept (Attack Scenario)
-An attacker floods the server on Port 5060 with single-line UDP packets containing just `"REGISTER sip:192.168.4.1 SIP/2.0\r\n\r\n"`.
-1. `SipMessage::parse` populates `_header` and `_type` but leaves `_via`, `_to`, and `_from` completely empty.
-2. `RequestsHandler::handle` dispatches it to `onRegister`.
-3. `onRegister` clones the message and calls `response->setVia(data->getVia() + ";received=192.168.4.1")`.
-4. Because `data->getVia()` is empty, `response->setVia(";received=192.168.4.1")` is called.
-5. In `setVia`, `find("")` returns `0`, prepending the string at index `0`.
-6. The resulting packet is sent out malformed, leading to logic bugs and processing errors.
-
-#### Remediation
-Enforce validation checks at the entry point of the signaling handler:
-```cpp
-void RequestsHandler::handle(std::shared_ptr<SipMessage> request) {
-    if (!request || !request->isValidMessage()) {
+// Verified in RequestsHandler.cpp lines 59-66:
+void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
+{
+    // Input validation: Drop null or structurally malformed packets instantly (SEC-02)
+    if (!request || !request->isValidMessage())
+    {
         _packetsDropped.fetch_add(1, std::memory_order_relaxed);
-        return; // Drop malformed packets instantly
+        return;
     }
-    _packetsProcessed.fetch_add(1, std::memory_order_relaxed);
     // ...
 }
 ```
+This validation is backed by the per-source IP rate limiter, which acts as a secondary layer to drop packet floods lock-free.
 
 ---
 
-### SEC-03: Cleartext WiFi Credentials Storage in NVS Flash
+### SEC-03: Cleartext WiFi Credentials Storage in Flash NVS
 * **Classification:** CWE-312: Cleartext Storage of Sensitive Information
 * **Severity:** 🟡 **Low/Medium (CVSS v3.1 Score: 4.6)**
 * **Vector:** `CVSS:3.1/AV:P/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N`
-* **Vulnerable Component:** `HttpServer::sendApiWifiConnect` in [HttpServer.cpp#L660](../src/Helpers/HttpServer.cpp#L660) and [esp_main_display.cpp#L432](../main/esp_main_display.cpp#L432)
+* **Vulnerable Component:** `HttpServer::sendApiWifiConnect` in [HttpServer.cpp](../src/Helpers/HttpServer.cpp#L704) and [esp_main_display.cpp](../main/esp_main_display.cpp#L432).
 
 #### Description
-When the user connects to the captive portal and inputs WiFi STA credentials, they are committed directly to Espressif NVS Flash under the `"storage"` namespace key `"wifi_pass"` in plain text:
-```cpp
-nvs_set_str(nvs_handle, "wifi_pass", password.c_str());
-```
-Similarly, the boot path retrieves and passes them to the network stack in plain text. By default, ESP32 does not enable flash encryption. Anyone with physical access to the device can hook up to the UART programming pins and dump the raw SPI flash contents to retrieve the WiFi network password.
+When standard STA credentials are saved via the onboarding captive portal, the HTTP handler commits them directly to Espressif NVS Flash in cleartext under the `"storage"` namespace key `"wifi_pass"`. Similarly, the display boot path reads this value and registers it with the network stack. 
+
+Because Flash Encryption is disabled by default, an attacker with physical access to the device can hook up to the UART programming pins and dump the raw SPI flash contents to extract the WiFi network password.
 
 #### Proof of Concept (Attack Scenario)
-1. An attacker gains physical access to the pocket-dial unit.
-2. They attach a standard USB-to-UART bridge to the TX/RX/GND pins.
-3. They execute standard Espressif tooling:
+1. An attacker gains physical access to the PBX hardware.
+2. They connect a standard USB-to-UART bridge to the TX/RX/GND pinout of the ESP32.
+3. They boot the ESP32 into flash download mode and dump the SPI flash contents:
    ```bash
    esptool.py --port COM3 --baud 921600 read_flash 0 0x1000000 flash_dump.bin
    ```
-4. Running a string search on the bin dump immediately exposes the STA password:
+4. They run a strings extraction search on the binary dump to expose the cleartext password:
    ```bash
    strings flash_dump.bin | grep -A 2 wifi_ssid
    ```
 
 #### Remediation
-1. **Flash Encryption:** Mandate Espressif Hardware Flash Encryption (which encrypts the entire partition table, NVS, and app partitions using an AES-256 key burned into the eFuse blocks) in the product configuration guide.
-2. **Credential Obfuscation:** Before saving to NVS, encrypt the password using an AES key derived from a device-unique MAC address combined with compile-time salts.
+1. **Enable Flash Encryption:** Enforce compile-time Espressif Hardware Flash Encryption (via `menuconfig` or `sdkconfig.defaults`) to encrypt the partition tables, NVS, and application firmware partitions using an AES-256 key burned directly into the eFuse blocks.
+2. **Credential Obfuscation:** Encrypt passwords prior to writing them to NVS using a symmetric algorithm (such as AES-CTR) with a key derived from the device-unique MAC address combined with compile-time salts.
 
 ---
 
@@ -201,28 +156,45 @@ Similarly, the boot path retrieves and passes them to the network stack in plain
 * **Classification:** CWE-306: Missing Authentication for Critical Function
 * **Severity:** 🟡 **Medium (CVSS v3.1 Score: 6.5)**
 * **Vector:** `CVSS:3.1/AV:A/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N`
-* **Vulnerable Component:** `HttpServer` routing & `RequestsHandler` registrations
+* **Vulnerable Component:** `HttpServer` routing & `RequestsHandler` registrations.
 
 #### Description
-1. **HTTP Dashboard:** The admin dashboard does not require any credentials. Any device connected to the Access Point can access `/api/status` to view active calls/registered extension numbers, or make POST requests to `/api/kill` to forcibly disconnect active calls.
-2. **SIP Registrar:** The registrar contains zero authentication challenges. Any SIP softphone can register arbitrary extensions (e.g., dialing `100` or `101`) without entering a password. This allows an attacker on the same local network to register as an existing extension, taking over other users' incoming and outgoing voice calls.
+1. **Admin Dashboard:** The administration panel does not require any credentials. Any device connected to the local network or Access Point can query `/api/status` to view active calls and registered extension numbers, or make POST requests to `/api/kill` to terminate active calls.
+2. **SIP Registrar:** The SIP engine does not implement authentication challenges. Any softphone client can register arbitrary extensions without entering a password, allowing an attacker to intercept incoming and outgoing voice calls.
 
 #### Proof of Concept (Attack Scenario)
-1. An attacker joins the open `esp32-sipserver` AP.
-2. They launch a softphone client (such as Linphone or MicroSIP) on their laptop.
-3. They configure the client to register as extension `100` targeting SIP proxy `192.168.4.1`.
-4. Because the PBX does not execute a `401 Unauthorized` Digest Authentication challenge, the registration succeeds immediately, evicting the legitimate user's client from the lookup table and allowing the attacker to intercept calls.
+1. An attacker joins the `esp32-sipserver` network.
+2. They launch a standard softphone client (such as Linphone or MicroSIP).
+3. They register as extension `100` targeting SIP proxy `192.168.4.1`.
+4. Because the PBX does not issue a `401 Unauthorized` challenge, the registration succeeds instantly, evicting the legitimate extension from the registrar.
+5. Alternatively, the attacker issues a simple curl request to disconnect calls:
+   ```bash
+   curl -X POST -H "Content-Type: application/x-www-form-urlencoded" -d "extension=101" http://192.168.4.1/api/kill
+   ```
 
 #### Remediation
-1. **HTTP Basic Auth:** Add simple HTTP Basic Authentication or token-based cookies for the dashboard admin panel.
-2. **SIP Digest Auth:** Implement a simplified SIP MD5 Digest Authentication (RFC 3261 §22) inside `onRegister` and `onInvite` handlers to challenge registrations and outbound invites against a static, pre-configured list of passwords.
+1. **HTTP Authentication:** Implement standard HTTP Basic Authentication or token-based session cookies for all web endpoints.
+2. **SIP Digest Authentication:** Implement standard MD5 Digest Authentication (RFC 3261 §22) inside `onRegister` and `onInvite` handlers to challenge registrations and outbound invites against a static list of authorized extension passwords:
+   ```cpp
+   // Recommended SIP Digest Challenge pseudocode inside onRegister:
+   if (!hasAuthorizationHeader(data)) {
+       auto challenge = build401UnauthorizedChallenge(data);
+       _outbox.emplace_back(data->getSource(), challenge);
+       return;
+   }
+   if (!verifyDigestResponse(data, extPassword)) {
+       auto forbidden = build403Forbidden(data);
+       _outbox.emplace_back(data->getSource(), forbidden);
+       return;
+   }
+   ```
 
 ---
 
 ## Architectural & BLE Security Hardening
 
 ### Bluetooth Low Energy (BLE) Threat Model
-While the current firmware does not utilize Bluetooth, if BLE is added in future revisions for seamless smartphone-based onboarding/provisioning, the following threats and security mitigations must be addressed:
+While the current firmware does not utilize Bluetooth, if BLE is added in future revisions for seamless mobile onboarding or remote provisioning, the following threats and security mitigations must be addressed:
 
 ```
 [ Attack Vector: BLE Sniffing ] ──────► ( Over-the-Air Capture ) ──────► Unencrypted Credentials Leak
