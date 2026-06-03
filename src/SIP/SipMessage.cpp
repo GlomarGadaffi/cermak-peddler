@@ -111,49 +111,18 @@ void SipMessage::parse()
 		}
 
 		size_t nameEnd = colonPos;
-		while (nameEnd > 0 && std::isspace(static_cast<unsigned char>(line[nameEnd - 1])))
-		{
-			nameEnd--;
+		while (nameEnd > 0 && std::isspace(static_cast<unsigned char>(line[nameEnd - 1]))) --nameEnd;
+		std::string name(line.substr(0, nameEnd));
+		// Lowercase name
+		std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+		std::string full(fullHdr);
+		std::transform(full.begin(), full.end(), full.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+		if (name == full) return true;
+		if (!compactHdr.empty()) {
+			std::string compact(compactHdr);
+			std::transform(compact.begin(), compact.end(), compact.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+			if (name == compact) return true;
 		}
-
-		std::string_view name = line.substr(0, nameEnd);
-		if (name.length() != fullHdr.length() && (compactHdr.empty() || name.length() != compactHdr.length()))
-		{
-			return false;
-		}
-
-		auto charToLowerEquals = [](char c1, char c2) {
-			return std::tolower(static_cast<unsigned char>(c1)) == std::tolower(static_cast<unsigned char>(c2));
-		};
-
-		bool matchFull = (name.length() == fullHdr.length());
-		if (matchFull)
-		{
-			for (size_t i = 0; i < name.length(); ++i)
-			{
-				if (!charToLowerEquals(name[i], fullHdr[i]))
-				{
-					matchFull = false;
-					break;
-				}
-			}
-		}
-		if (matchFull) return true;
-
-		if (!compactHdr.empty() && name.length() == compactHdr.length())
-		{
-			bool matchCompact = true;
-			for (size_t i = 0; i < name.length(); ++i)
-			{
-				if (!charToLowerEquals(name[i], compactHdr[i]))
-				{
-					matchCompact = false;
-					break;
-				}
-			}
-			if (matchCompact) return true;
-		}
-
 		return false;
 	};
 
