@@ -1,6 +1,10 @@
 #include <gtest/gtest.h>
 #include "SipMessage.hpp"
+#ifdef _WIN32
+#include <winsock2.h>
+#else
 #include <arpa/inet.h>
+#endif
 
 TEST(SipMessage, HeaderMatchingRobustness) {
     sockaddr_in dummy = {}; 

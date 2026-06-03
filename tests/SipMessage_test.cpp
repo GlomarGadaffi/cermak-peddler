@@ -1,6 +1,10 @@
 #include <gtest/gtest.h>
 #include "SipMessage.hpp"
+#ifdef _WIN32
+#include <winsock2.h>
+#else
 #include <arpa/inet.h>
+#endif
 
 TEST(SipMessage, BasicParse) {
     sockaddr_in s; s.sin_addr.s_addr = inet_addr("127.0.0.1");
