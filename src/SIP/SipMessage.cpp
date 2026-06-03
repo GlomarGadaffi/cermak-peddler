@@ -224,11 +224,15 @@ void SipMessage::setType(std::string value)
 {
 	if (!_header.empty())
 	{
-		size_t spacePos = _header.find(' ');
-		if (spacePos != std::string_view::npos)
+		// Find header position safely using findHeader instead of pointer arithmetic
+		size_t pos = findHeader(_header);
+		if (pos != std::string::npos)
 		{
-			size_t headerOffset = _header.data() - _messageStr.data();
-			_messageStr.replace(headerOffset, spacePos, value);
+			size_t spacePos = _header.find(' ');
+			if (spacePos != std::string_view::npos)
+			{
+				_messageStr.replace(pos, spacePos, value);
+			}
 		}
 	}
 	reparse();
