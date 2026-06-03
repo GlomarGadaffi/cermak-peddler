@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ main, master ]
 
+permissions:
+  contents: read
+
 jobs:
   # Job 1: Build and simulate the host desktop application, run static analysis and unit/smoke tests.
   # This serves as our simulation-based test suite, validating SIP and HTTP server logic on host runners.
