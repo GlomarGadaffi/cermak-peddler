@@ -29,7 +29,7 @@ jobs:
                    --inline-suppr \
                    --suppress=missingIncludeSystem \
                    --suppress=unmatchedSuppression \
-                   -I src/Helpers -I src/SIP \
+                   -I src/Helpers -I src/SIP -I main \
                    src/ main/
 
       - name: Configure CMake (Host Build)
