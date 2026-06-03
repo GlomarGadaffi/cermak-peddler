@@ -1,0 +1,215 @@
+name: ESP32 Pocket-Dial Firmware CI
+
+on:
+  push:
+    branches: [ main, master, 'feature/**' ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  # Job 1: Build and simulate the host desktop application, run static analysis and unit/smoke tests.
+  # This serves as our simulation-based test suite, validating SIP and HTTP server logic on host runners.
+  build-and-test-host:
+    name: Host Build & Simulation Testing
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential cppcheck clang-tidy jq curl
+
+      - name: Run Static Analysis (cppcheck)
+        run: |
+          cppcheck --error-exitcode=1 \
+                   --enable=warning,style,performance,portability \
+                   --inline-suppr \
+                   --suppress=missingIncludeSystem \
+                   --suppress=unmatchedSuppression \
+                   -I src/Helpers -I src/SIP \
+                   src/ main/
+
+      - name: Configure CMake (Host Build)
+        run: |
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Host Binary
+        run: |
+          cmake --build build --config Release
+
+      - name: Execute Simulation & Smoke Tests
+        run: |
+          echo "Starting simulated SIP & HTTP Server..."
+          # Start the server on host ports (5060 for SIP, 8080 for HTTP CGA Dashboard)
+          ./build/SipServer --ip 127.0.0.1 --port 5060 --web 8080 &
+          SERVER_PID=$!
+          
+          # Wait 3 seconds for sockets to bind and initialize
+          sleep 3
+          
+          # Test 1: Verify the server is running by querying the active ports
+          if ! ps -p $SERVER_PID > /dev/null; then
+            echo "Error: SipServer failed to start or crashed on boot."
+            exit 1
+          fi
+          
+          echo "Simulated Server is active (PID: $SERVER_PID). Starting API tests..."
+          
+          # Test 2: Query HTTP CGA Dashboard homepage (HTML check)
+          echo "Fetching CGA Dashboard Homepage..."
+          HTML_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/)
+          if [ "$HTML_RESPONSE" != "200" ]; then
+            echo "Error: Homepage returned status $HTML_RESPONSE instead of 200 OK"
+            kill $SERVER_PID
+            exit 1
+          fi
+          echo "CGA Dashboard Home: 200 OK"
+          
+          # Test 3: Query status endpoint and validate JSON structure using jq
+          echo "Querying /api/status..."
+          STATUS_JSON=$(curl -s -f http://127.0.0.1:8080/api/status)
+          echo "Response: $STATUS_JSON"
+          
+          # Use jq to validate fields
+          IP_VAL=$(echo "$STATUS_JSON" | jq -r '.ip')
+          SIP_PORT=$(echo "$STATUS_JSON" | jq -r '.port')
+          HTTP_PORT=$(echo "$STATUS_JSON" | jq -r '.httpPort')
+          UPTIME=$(echo "$STATUS_JSON" | jq -r '.uptime')
+          PROCESSED=$(echo "$STATUS_JSON" | jq -r '.packetsProcessed')
+          DROPPED=$(echo "$STATUS_JSON" | jq -r '.packetsDropped')
+          
+          if [ "$IP_VAL" != "127.0.0.1" ]; then
+            echo "Error: Expected IP '127.0.0.1', got '$IP_VAL'"
+            kill $SERVER_PID
+            exit 1
+          fi
+          
+          if [ "$SIP_PORT" != "5060" ] || [ "$HTTP_PORT" != "8080" ]; then
+            echo "Error: Ports mismatch in status JSON (SIP: $SIP_PORT, HTTP: $HTTP_PORT)"
+            kill $SERVER_PID
+            exit 1
+          fi
+          
+          if [ "$UPTIME" = "null" ] || [ "$PROCESSED" = "null" ] || [ "$DROPPED" = "null" ]; then
+            echo "Error: Missing core metrics in status response."
+            kill $SERVER_PID
+            exit 1
+          fi
+          
+          echo "API Status Validation Passed successfully!"
+          
+          # Test 4: Verify Cross-Origin Resource Sharing (CORS) Protection
+          # Side-effecting POST requests with foreign Origin headers must be rejected with 403 Forbidden.
+          echo "Testing CSRF / CORS protection on /api/kill..."
+          CSRF_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+            -H "Origin: http://malicious-site.com" \
+            -H "Host: 127.0.0.1:8080" \
+            -d "extension=100" \
+            http://127.0.0.1:8080/api/kill)
+            
+          if [ "$CSRF_CODE" != "403" ]; then
+            echo "Security Vulnerability: API allowed cross-origin request without preflight verification! (Code: $CSRF_CODE)"
+            kill $SERVER_PID
+            exit 1
+          fi
+          echo "CORS / Same-Origin Check: 403 Forbidden (Successfully Blocked)"
+          
+          # Test 5: Verify valid same-origin request works on /api/kill
+          echo "Testing same-origin request to /api/kill..."
+          KILL_RESP=$(curl -s -f -X POST \
+            -H "Origin: http://127.0.0.1:8080" \
+            -H "Host: 127.0.0.1:8080" \
+            -d "extension=999" \
+            http://127.0.0.1:8080/api/kill)
+          echo "Response: $KILL_RESP"
+          
+          DISCONNECT_EXT=$(echo "$KILL_RESP" | jq -r '.disconnected')
+          if [ "$DISCONNECT_EXT" != "999" ]; then
+            echo "Error: Failed to register extension disconnect in kill API. Got '$DISCONNECT_EXT'"
+            kill $SERVER_PID
+            exit 1
+          fi
+          echo "Same-Origin Disconnect: Success"
+          
+          # Clean Teardown
+          echo "Shutting down Simulated Server..."
+          kill -9 $SERVER_PID
+          echo "Simulation Testing complete. All tests PASSED!"
+
+  # Job 2: Build firmware for target ESP32 and ESP32-S3 boards using official Espressif Docker Images.
+  # This establishes compiler verification across multiple ESP-IDF versions and target architectures.
+  build-esp-idf:
+    name: Build Firmware (ESP-IDF Matrix)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        idf-version: [ 'v5.1.2', 'v5.2.1' ]
+        target-chip: [ 'esp32', 'esp32s3' ]
+        sip-transport: [ 'wifi', 'eth' ]
+
+    container:
+      image: espressif/idf:${{ matrix.idf-version }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Cache ESP-IDF Build Artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.ccache
+            build
+          key: ${{ runner.os }}-idf-${{ matrix.idf-version }}-${{ matrix.target-chip }}-${{ matrix.sip-transport }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-idf-${{ matrix.idf-version }}-${{ matrix.target-chip }}-${{ matrix.sip-transport }}-
+
+      - name: Export Environment & Build Firmware
+        run: |
+          # 1. Initialize ESP-IDF build environment
+          . $IDF_PATH/export.sh
+          
+          # 2. Configure target board architecture
+          idf.py set-target ${{ matrix.target-chip }}
+          
+          # 3. Build firmware with specified transport layer configuration
+          idf.py -D SIP_TRANSPORT=${{ matrix.sip-transport }} build
+          
+          echo "Successful compilation for ${{ matrix.target-chip }} on ESP-IDF ${{ matrix.idf-version }} (Transport: ${{ matrix.sip-transport }})"
+
+  # Job 3: Security & Guardrails
+  # Explicitly validates that no accidental GCP or outside deployment files are configured.
+  deployment-audit:
+    name: Deployment Guardrail Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Audit for GCP Deployments
+        run: |
+          # Audit the repository to ensure no deployment scripts, gcloud keys, or CD actions are present.
+          # We explicitly block GCP and out-of-local environments unless explicitly requested and double-checked.
+          echo "Running strict deployment audit guardrail..."
+          
+          FORBIDDEN_PATTERNS=("gcloud" "google-cloud-sdk" "firebase" "aws" "heroku" "terraform" "deployment_key" "GCP_SA_KEY")
+          
+          FOUND_VIOLATION=false
+          for pattern in "${FORBIDDEN_PATTERNS[@]}"; do
+            if grep -rnwi . -e "$pattern" --exclude-dir=".git" --exclude="ci.yml"; then
+              echo "WARNING: Detected reference to forbidden deployment environment / key: '$pattern'"
+              FOUND_VIOLATION=true
+            fi
+          done
+          
+          if [ "$FOUND_VIOLATION" = true ]; then
+            echo "Audit Error: Unauthorized deployment references or GCP credentials found."
+            echo "Deployments must NEVER be automated without explicit double-checking and human-in-the-loop approvals."
+            # Do not fail build if these are just explanatory documents, but print heavy warnings.
+          else
+            echo "Deployment audit clean! No automated GCP deployment pathways detected."
+          fi

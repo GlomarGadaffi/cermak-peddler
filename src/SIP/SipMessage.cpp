@@ -174,7 +174,7 @@ void SipMessage::setType(std::string value)
 
 void SipMessage::setHeader(std::string value)
 {
-	auto headerPos = _messageStr.find(_header);
+	auto headerPos = findHeader(_header);
 	if (headerPos != std::string::npos)
 	{
 		_messageStr.replace(headerPos, _header.length(), value);
@@ -189,20 +189,50 @@ void SipMessage::setHeader(std::string value)
 
 void SipMessage::setVia(std::string value)
 {
-	auto viaPos = _messageStr.find(_via);
-	if (viaPos != std::string::npos)
+	if (!_via.empty())
 	{
-		_messageStr.replace(viaPos, _via.length(), value);
+		auto viaPos = findHeader(_via);
+		if (viaPos != std::string::npos)
+		{
+			_messageStr.replace(viaPos, _via.length(), value);
+		}
+	}
+	else
+	{
+		size_t clPos = _contentLength.empty() ? std::string::npos : findHeader(_contentLength);
+		if (clPos != std::string::npos)
+		{
+			_messageStr.insert(clPos, value + "\r\n");
+		}
+		else
+		{
+			_messageStr += value + "\r\n";
+		}
 	}
 	_via = std::move(value);
 }
 
 void SipMessage::setFrom(std::string value)
 {
-	auto fromPos = _messageStr.find(_from);
-	if (fromPos != std::string::npos)
+	if (!_from.empty())
 	{
-		_messageStr.replace(fromPos, _from.length(), value);
+		auto fromPos = findHeader(_from);
+		if (fromPos != std::string::npos)
+		{
+			_messageStr.replace(fromPos, _from.length(), value);
+		}
+	}
+	else
+	{
+		size_t clPos = _contentLength.empty() ? std::string::npos : findHeader(_contentLength);
+		if (clPos != std::string::npos)
+		{
+			_messageStr.insert(clPos, value + "\r\n");
+		}
+		else
+		{
+			_messageStr += value + "\r\n";
+		}
 	}
 	_fromNumber = extractNumber(value);
 	_from = std::move(value);
@@ -210,10 +240,25 @@ void SipMessage::setFrom(std::string value)
 
 void SipMessage::setTo(std::string value)
 {
-	auto toPos = _messageStr.find(_to);
-	if (toPos != std::string::npos)
+	if (!_to.empty())
 	{
-		_messageStr.replace(toPos, _to.length(), value);
+		auto toPos = findHeader(_to);
+		if (toPos != std::string::npos)
+		{
+			_messageStr.replace(toPos, _to.length(), value);
+		}
+	}
+	else
+	{
+		size_t clPos = _contentLength.empty() ? std::string::npos : findHeader(_contentLength);
+		if (clPos != std::string::npos)
+		{
+			_messageStr.insert(clPos, value + "\r\n");
+		}
+		else
+		{
+			_messageStr += value + "\r\n";
+		}
 	}
 	_toNumber = extractNumber(value);
 	_to = std::move(value);
@@ -221,20 +266,50 @@ void SipMessage::setTo(std::string value)
 
 void SipMessage::setCallID(std::string value)
 {
-	auto callIdPos = _messageStr.find(_callID);
-	if (callIdPos != std::string::npos)
+	if (!_callID.empty())
 	{
-		_messageStr.replace(callIdPos, _callID.length(), value);
+		auto callIdPos = findHeader(_callID);
+		if (callIdPos != std::string::npos)
+		{
+			_messageStr.replace(callIdPos, _callID.length(), value);
+		}
+	}
+	else
+	{
+		size_t clPos = _contentLength.empty() ? std::string::npos : findHeader(_contentLength);
+		if (clPos != std::string::npos)
+		{
+			_messageStr.insert(clPos, value + "\r\n");
+		}
+		else
+		{
+			_messageStr += value + "\r\n";
+		}
 	}
 	_callID = std::move(value);
 }
 
 void SipMessage::setCSeq(std::string value)
 {
-	auto cSeqPos = _messageStr.find(_cSeq);
-	if (cSeqPos != std::string::npos)
+	if (!_cSeq.empty())
 	{
-		_messageStr.replace(cSeqPos, _cSeq.length(), value);
+		auto cSeqPos = findHeader(_cSeq);
+		if (cSeqPos != std::string::npos)
+		{
+			_messageStr.replace(cSeqPos, _cSeq.length(), value);
+		}
+	}
+	else
+	{
+		size_t clPos = _contentLength.empty() ? std::string::npos : findHeader(_contentLength);
+		if (clPos != std::string::npos)
+		{
+			_messageStr.insert(clPos, value + "\r\n");
+		}
+		else
+		{
+			_messageStr += value + "\r\n";
+		}
 	}
 	_cSeq = std::move(value);
 }
@@ -242,7 +317,7 @@ void SipMessage::setCSeq(std::string value)
 void SipMessage::setContact(std::string value)
 {
 	if (!_contact.empty()) {
-		auto contactPos = _messageStr.find(_contact);
+		auto contactPos = findHeader(_contact);
 		if (contactPos != std::string::npos) {
 			_messageStr.replace(contactPos, _contact.length(), value);
 		}
@@ -251,7 +326,7 @@ void SipMessage::setContact(std::string value)
 		// which would insert before the start-line and corrupt the entire message.
 		size_t clPos = _contentLength.empty()
 		               ? std::string::npos
-		               : _messageStr.find(_contentLength);
+		               : findHeader(_contentLength);
 		if (clPos != std::string::npos) {
 			_messageStr.insert(clPos, value + "\r\n");
 		} else {
@@ -263,7 +338,7 @@ void SipMessage::setContact(std::string value)
 
 void SipMessage::setContentLength(std::string value)
 {
-	auto contentLengthPos = _messageStr.find(_contentLength);
+	auto contentLengthPos = findHeader(_contentLength);
 	if (contentLengthPos != std::string::npos)
 	{
 		_messageStr.replace(contentLengthPos, _contentLength.length(), value);
@@ -275,7 +350,7 @@ void SipMessage::addHeader(std::string name, std::string value)
 {
 	size_t clPos = _contentLength.empty()
 	               ? std::string::npos
-	               : _messageStr.find(_contentLength);
+	               : findHeader(_contentLength);
 	if (clPos != std::string::npos) {
 		_messageStr.insert(clPos, name + ": " + value + "\r\n");
 	} else {
@@ -419,4 +494,18 @@ std::string SipMessage::extractNumber(const std::string& header) const
 		return {};
 
 	return header.substr(start, atPos - start);
+}
+
+size_t SipMessage::findHeader(const std::string& field) const
+{
+	if (field.empty()) return std::string::npos;
+	size_t pos = _messageStr.find(field);
+	if (pos != std::string::npos)
+	{
+		size_t bodyStart = _messageStr.find("\r\n\r\n");
+		if (bodyStart == std::string::npos) bodyStart = _messageStr.find("\n\n");
+		size_t headerLimit = (bodyStart != std::string::npos) ? bodyStart : _messageStr.size();
+		if (pos < headerLimit) return pos;
+	}
+	return std::string::npos;
 }

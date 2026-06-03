@@ -55,11 +55,12 @@ public:
 	virtual bool hasSdp() const { return false; }
 
 	std::string toString() const;
+	bool isValidMessage() const;
 
 protected:
 	void parse();
-	bool isValidMessage() const;
 	std::string extractNumber(const std::string& header) const;
+	size_t findHeader(const std::string& field) const;
 
 	std::string _type;
 	std::string _header;

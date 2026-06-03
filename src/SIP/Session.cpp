@@ -1,10 +1,27 @@
 // Session.cpp: Issue #28 resolved.
 #include "Session.hpp"
 
+Session::Session()
+	: _state(State::Invited), _startTime(std::chrono::steady_clock::now())
+{
+}
+
 Session::Session(std::string callID, std::shared_ptr<SipClient> src) :
 	_callID(std::move(callID)), _src(src), _state(State::Invited),
 	_startTime(std::chrono::steady_clock::now())
 {
+}
+
+void Session::reset(std::string callID, std::shared_ptr<SipClient> src)
+{
+	_callID = std::move(callID);
+	_src = src;
+	_dest.reset();
+	_state = State::Invited;
+	_startTime = std::chrono::steady_clock::now();
+	_isBroadcast = false;
+	_pendingTargets.clear();
+	_inviteMessage.reset();
 }
 
 void Session::setState(State state)
@@ -64,4 +81,15 @@ void Session::removePendingTarget(const std::string& number)
 			break;
 		}
 	}
+}
+
+void Session::release()
+{
+	_callID.clear();
+	_src.reset();
+	_dest.reset();
+	_state = State::Invited;
+	_isBroadcast = false;
+	_pendingTargets.clear();
+	_inviteMessage.reset();
 }

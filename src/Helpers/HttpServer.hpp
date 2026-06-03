@@ -25,7 +25,7 @@ class RequestsHandler;
 class HttpServer
 {
 public:
-	HttpServer(const std::string& ip, int port, RequestsHandler& handler);
+	HttpServer(const std::string& ip, int port, RequestsHandler* handler = nullptr);
 	~HttpServer();
 
 	void start();
@@ -67,7 +67,7 @@ private:
 	std::string _ip;
 	int _port;
 	int _listenSock;
-	RequestsHandler& _handler;
+	RequestsHandler* _handler;
 	std::atomic<bool> _running;
 	std::thread _acceptThread;
 

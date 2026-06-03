@@ -24,7 +24,10 @@ public:
 	};
 
 
+	Session();
 	Session(std::string callID, std::shared_ptr<SipClient> src);
+
+	void reset(std::string callID, std::shared_ptr<SipClient> src);
 
 	void setState(State state);
 	void setDest(std::shared_ptr<SipClient> dest);
@@ -45,6 +48,8 @@ public:
 
 	std::shared_ptr<SipMessage> getInviteMessage() const { return _inviteMessage; }
 	void setInviteMessage(std::shared_ptr<SipMessage> msg) { _inviteMessage = msg; }
+
+	void release();
 
 private:
 	std::string _callID;

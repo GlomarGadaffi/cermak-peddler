@@ -17,7 +17,7 @@
 #include "esp_system.h"
 #endif
 
-HttpServer::HttpServer(const std::string& ip, int port, RequestsHandler& handler)
+HttpServer::HttpServer(const std::string& ip, int port, RequestsHandler* handler)
 	: _ip(ip), _port(port), _listenSock(-1), _handler(handler), _running(false)
 {
 	_startTime = currentTimeMs();
@@ -85,6 +85,26 @@ void HttpServer::acceptLoop()
 {
 	while (_running)
 	{
+		fd_set readfds;
+		FD_ZERO(&readfds);
+		FD_SET(static_cast<unsigned int>(_listenSock), &readfds);
+
+		timeval tv{};
+		tv.tv_sec = 0;
+		tv.tv_usec = 250000; // 250ms timeout
+
+		int activity = select(_listenSock + 1, &readfds, nullptr, nullptr, &tv);
+		if (activity < 0)
+		{
+			if (!_running) break;
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			continue;
+		}
+		if (activity == 0)
+		{
+			continue; // Timeout, loop and check _running
+		}
+
 		sockaddr_in clientAddr{};
 #if defined _WIN32 || defined _WIN64
 		int addrLen = sizeof(clientAddr);
@@ -100,9 +120,10 @@ void HttpServer::acceptLoop()
 			continue;
 		}
 
-		// Handle each request synchronously on the accept thread.
-		// For an embedded device serving a single admin, this is fine.
-		handleClient(clientSock);
+		// Dispatch client handling in a detached thread context to prevent DoS connection stalls.
+		std::thread([this, clientSock]() {
+			handleClient(clientSock);
+		}).detach();
 	}
 }
 
@@ -291,21 +312,36 @@ HttpServer::HttpRequest HttpServer::parseRequest(const std::string& raw)
 		req.path = req.path.substr(0, queryPos);
 	}
 
-	// Scan headers for Origin and Host
-	auto extractHeader = [&](const std::string& name) -> std::string {
-		std::string lower = raw;
-		std::transform(lower.begin(), lower.end(), lower.begin(),
-			[](unsigned char c){ return static_cast<char>(std::tolower(c)); });
-		std::string needle = "\r\n" + name + ":";
-		size_t p = lower.find(needle);
-		if (p == std::string::npos) return {};
-		size_t vs = raw.find_first_not_of(" \t", p + needle.size());
-		size_t ve = raw.find("\r\n", vs);
-		if (vs == std::string::npos) return {};
-		return raw.substr(vs, ve == std::string::npos ? std::string::npos : ve - vs);
-	};
-	req.origin = extractHeader("origin");
-	req.host   = extractHeader("host");
+	// Efficient, low-overhead line-by-line header scanner (Observation 1)
+	size_t pos = raw.find("\r\n");
+	if (pos != std::string::npos) {
+		pos += 2; // Skip request line
+		while (pos < raw.size()) {
+			size_t lineEnd = raw.find("\r\n", pos);
+			if (lineEnd == std::string::npos) break;
+			if (lineEnd == pos) break; // Reached header-body boundary
+
+			std::string line = raw.substr(pos, lineEnd - pos);
+			size_t colon = line.find(':');
+			if (colon != std::string::npos) {
+				std::string hName = line.substr(0, colon);
+				std::transform(hName.begin(), hName.end(), hName.begin(), ::tolower);
+				
+				// Strip trailing whitespaces from name
+				while (!hName.empty() && std::isspace(static_cast<unsigned char>(hName.back()))) hName.pop_back();
+
+				if (hName == "origin" || hName == "host") {
+					size_t valStart = colon + 1;
+					while (valStart < line.size() && std::isspace(static_cast<unsigned char>(line[valStart]))) valStart++;
+					std::string hVal = line.substr(valStart);
+					while (!hVal.empty() && std::isspace(static_cast<unsigned char>(hVal.back()))) hVal.pop_back();
+					if (hName == "origin") req.origin = hVal;
+					else if (hName == "host") req.host = hVal;
+				}
+			}
+			pos = lineEnd + 2;
+		}
+	}
 
 	// Find body (after \r\n\r\n)
 	size_t bodyStart = raw.find("\r\n\r\n");
@@ -377,10 +413,18 @@ void HttpServer::sendApiStatus(int sock)
 	uint64_t uptimeMs = currentTimeMs() - _startTime;
 	uint64_t uptimeSec = uptimeMs / 1000;
 
-	auto clients = _handler.getActiveClients();
-	auto sessions = _handler.getActiveSessions();
-	uint64_t packets = _handler.getPacketsProcessed();
-	uint64_t dropped = _handler.getPacketsDropped();   // Issue #38
+	std::vector<std::pair<std::string, std::string>> clients;
+	std::vector<std::tuple<std::string, std::string, std::string, int>> sessions;
+	uint64_t packets = 0;
+	uint64_t dropped = 0;
+
+	if (_handler != nullptr)
+	{
+		clients = _handler->getActiveClients();
+		sessions = _handler->getActiveSessions();
+		packets = _handler->getPacketsProcessed();
+		dropped = _handler->getPacketsDropped();   // Issue #38
+	}
 
 	std::string displayIp = _ip;
 	if (displayIp == "0.0.0.0")
@@ -459,7 +503,10 @@ void HttpServer::sendApiKill(int sock, const std::string& body)
 		return;
 	}
 
-	_handler.forceDisconnect(ext);
+	if (_handler != nullptr)
+	{
+		_handler->forceDisconnect(ext);
+	}
 	sendResponse(sock, 200, "OK", "application/json",
 	             "{\"status\":\"ok\",\"disconnected\":\"" + jsonEscape(ext) + "\"}");
 }
@@ -475,8 +522,25 @@ bool HttpServer::isSameOrigin(const HttpRequest& req) const
 	if (schemeEnd != std::string::npos)
 		originHost = originHost.substr(schemeEnd + 3);
 
-	// Compare against the Host header the client sent.
-	return originHost == req.host;
+	// Strip port numbers from both originHost and req.host for comparison (if any)
+	auto stripPort = [](const std::string& h) -> std::string {
+		size_t colon = h.find(':');
+		if (colon != std::string::npos) return h.substr(0, colon);
+		return h;
+	};
+
+	std::string cleanOrigin = stripPort(originHost);
+	std::string cleanHost = stripPort(req.host);
+
+	// Host header must be our local IP or local mDNS hostname or localhost
+	std::string activeIp = (_ip == "0.0.0.0") ? getPrimaryLocalIP() : _ip;
+	bool hostValid = (cleanHost == activeIp || 
+	                  cleanHost == "192.168.4.1" || 
+	                  cleanHost == "pocketdial.local" ||
+	                  cleanHost == "localhost" ||
+	                  cleanHost == "127.0.0.1");
+
+	return hostValid && (cleanOrigin == cleanHost);
 }
 
 void HttpServer::send404(int sock)

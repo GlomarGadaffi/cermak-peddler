@@ -13,7 +13,7 @@ Now with **native touch display support** and **W5500 wired-Ethernet capability*
 ## Developer Roadmap & Issue Tracker
 
 > [!NOTE]
-> We maintain an active architectural roadmap and issue tracker documenting concurrency challenges, task pinning, and socket-blocking mitigations. Review our planned performance updates in [ISSUES.md](file:///C:/Users/desmo/Documents/antigravity/vibrant-bose/ISSUES.md).
+> We maintain an active architectural roadmap and issue tracker documenting concurrency challenges, task pinning, and socket-blocking mitigations. Review our planned performance updates in [ISSUES.md](ISSUES.md).
 
 ---
 
