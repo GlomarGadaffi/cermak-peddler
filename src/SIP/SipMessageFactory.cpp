@@ -1,13 +1,14 @@
 #include "SipMessageFactory.hpp"
+#include "RequestsHandler.hpp"
 
 std::optional<std::shared_ptr<SipMessage>> SipMessageFactory::createMessage(std::string message, sockaddr_in src)
 {
-	if (containsSdp(message))
+	auto msg = RequestsHandler::getMessageFromPool(std::move(message), src);
+	if (!msg)
 	{
-		return std::make_shared<SipSdpMessage>(std::move(message), std::move(src));
+		return std::nullopt;
 	}
-
-	return std::make_shared<SipMessage>(std::move(message), std::move(src));
+	return msg;
 }
 
 bool SipMessageFactory::containsSdp(const std::string& message) const

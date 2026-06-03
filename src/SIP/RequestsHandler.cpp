@@ -9,6 +9,8 @@
 #include "IDGen.hpp"
 #include "IPHelper.hpp"
 
+std::vector<std::shared_ptr<SipMessage>> RequestsHandler::_messagePool;
+
 namespace
 {
 	// Default lease granted when a REGISTER does not request one (seconds).
@@ -37,7 +39,28 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	{
 		_sessionPool.push_back(std::make_shared<Session>());
 	}
+	if (_messagePool.empty())
+	{
+		for (int i = 0; i < 32; ++i)
+		{
+			_messagePool.push_back(std::make_shared<SipSdpMessage>("", sockaddr_in{}));
+		}
+	}
 	_dummyClient = std::make_shared<SipClient>();
+}
+
+std::shared_ptr<SipMessage> RequestsHandler::getMessageFromPool(std::string message, sockaddr_in src)
+{
+	for (auto& msg : _messagePool)
+	{
+		if (msg.use_count() == 1)
+		{
+			msg->reset(std::move(message), src);
+			return msg;
+		}
+	}
+	std::cerr << "[WARNING] SIP Message pool exhausted! Fallback to heap allocation.\n";
+	return std::make_shared<SipSdpMessage>(std::move(message), src);
 }
 
 void RequestsHandler::initHandlers()
@@ -87,7 +110,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 		}
 
 		maybeSweep();
-		auto it = _handlers.find(request->getType());
+		auto it = _handlers.find(std::string(request->getType()));
 		if (it != _handlers.end())
 		{
 			it->second(std::move(request));
@@ -113,9 +136,9 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 	}
 }
 
-std::optional<std::shared_ptr<Session>> RequestsHandler::getSession(const std::string& callID)
+std::optional<std::shared_ptr<Session>> RequestsHandler::getSession(std::string_view callID)
 {
-	auto sessionIt = _sessions.find(callID);
+	auto sessionIt = _sessions.find(std::string(callID));
 	if (sessionIt != _sessions.end())
 	{
 		return sessionIt->second;
@@ -131,10 +154,11 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 
 	if (!isValidAor(fromNumber))
 	{
-		auto response = std::make_shared<SipMessage>(*data);
+		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader("SIP/2.0 400 Bad Request");
+		response->clearBody();
 		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
-		response->setVia(data->getVia() + ";received=" + activeIp);
+		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
 	}
@@ -142,10 +166,11 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 #ifndef POCKETDIAL_OPEN_REGISTRAR
 	// Closed mode: reject registrations as unauthenticated/forbidden since we don't have registered credentials.
 	{
-		auto response = std::make_shared<SipMessage>(*data);
+		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader("SIP/2.0 403 Forbidden");
+		response->clearBody();
 		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
-		response->setVia(data->getVia() + ";received=" + activeIp);
+		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
 	}
@@ -160,7 +185,7 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	{
 		grantedExpires = (std::max)(MIN_EXPIRES, (std::min)(requestedExpires, MAX_EXPIRES));
 		// Always update address so re-REGISTER after a NAT rebind works correctly
-		auto newClient = allocateClient(data->getFromNumber(), data->getSource(), grantedExpires);
+		auto newClient = allocateClient(std::string(data->getFromNumber()), data->getSource(), grantedExpires);
 		if (newClient)
 		{
 			registerClient(newClient);
@@ -168,20 +193,21 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 		else
 		{
 			// Server full: reply with 503 Service Unavailable
-			auto response = std::make_shared<SipMessage>(*data);
+			auto response = getMessageFromPool(data->toString(), data->getSource());
 			response->setHeader("SIP/2.0 503 Service Unavailable");
+			response->clearBody();
 			std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
-			response->setVia(data->getVia() + ";received=" + activeIp);
+			response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 			_outbox.emplace_back(data->getSource(), std::move(response));
 			return;
 		}
 	}
 
-	auto response = std::make_shared<SipMessage>(*data);
+	auto response = getMessageFromPool(data->toString(), data->getSource());
 	response->setHeader(SipMessageTypes::OK);
 	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
-	response->setVia(data->getVia() + ";received=" + activeIp);
-	response->setTo(data->getTo() + ";tag=" + IDGen::GenerateID(9));
+	response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	// Echo the granted lease back in the Contact so the client knows when to refresh.
 	response->setContact(buildContact(fromNumber) + ";expires=" + std::to_string(grantedExpires));
 	endHandle(fromNumber, response);
@@ -189,18 +215,18 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 
 void RequestsHandler::onOptions(std::shared_ptr<SipMessage> data)
 {
-	auto response = std::make_shared<SipMessage>(*data);
+	auto response = getMessageFromPool(data->toString(), data->getSource());
 	response->setHeader(SipMessageTypes::OK);
 	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
-	response->setVia(data->getVia() + ";received=" + activeIp);
-	response->setTo(data->getTo() + ";tag=" + IDGen::GenerateID(9));
+	response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	response->setContact(buildContact(data->getFromNumber()));
 	_outbox.emplace_back(data->getSource(), std::move(response));
 }
 
 void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 {
-	std::string destNumber = data->getToNumber();
+	std::string destNumber(data->getToNumber());
 	if (destNumber == "777")
 	{
 		endCall(data->getCallID(), data->getFromNumber(), "777");
@@ -214,7 +240,7 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 		{
 			std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
 			std::string serverIpPort = activeIp + ":" + std::to_string(_serverPort);
-			std::string originalCSeq = data->getCSeq();
+			std::string originalCSeq(data->getCSeq());
 			size_t invitePos = originalCSeq.find("INVITE");
 			if (invitePos != std::string::npos)
 			{
@@ -223,7 +249,7 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 
 			for (const auto& target : session.value()->getPendingTargets())
 			{
-				auto cancelMsg = std::make_shared<SipMessage>(*data);
+				auto cancelMsg = getMessageFromPool(data->toString(), data->getSource());
 				char ipBuf[INET_ADDRSTRLEN]{};
 				inet_ntop(AF_INET, &target->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
 				std::string targetIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(target->getAddress().sin_port));
@@ -258,10 +284,11 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 {
 	if (!isValidAor(data->getFromNumber()) || !isValidAor(data->getToNumber()))
 	{
-		auto response = std::make_shared<SipMessage>(*data);
+		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader("SIP/2.0 400 Bad Request");
+		response->clearBody();
 		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
-		response->setVia(data->getVia() + ";received=" + activeIp);
+		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
 	}
@@ -270,38 +297,39 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	auto caller = findClient(data->getFromNumber());
 	if (!caller.has_value())
 	{
-		auto response = std::make_shared<SipMessage>(*data);
+		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader("SIP/2.0 403 Forbidden");
+		response->clearBody();
 		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
-		response->setVia(data->getVia() + ";received=" + activeIp);
+		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
 	}
 
-	std::string destNumber = data->getToNumber();
+	std::string destNumber(data->getToNumber());
 	if (destNumber == "777")
 	{
 		// SDP loopback echo test
-		auto ringing = std::make_shared<SipMessage>(*data);
+		auto ringing = getMessageFromPool(data->toString(), data->getSource());
 		ringing->setHeader("SIP/2.0 180 Ringing");
 		ringing->clearBody();
 		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
-		ringing->setVia(data->getVia() + ";received=" + activeIp);
+		ringing->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		std::string toTag = IDGen::GenerateID(9);
-		ringing->setTo(data->getTo() + ";tag=" + toTag);
+		ringing->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 		ringing->setContact(buildContact("777"));
 		_outbox.emplace_back(data->getSource(), std::move(ringing));
 
-		auto okResponse = std::make_shared<SipMessage>(*data);
+		auto okResponse = getMessageFromPool(data->toString(), data->getSource());
 		okResponse->setHeader(SipMessageTypes::OK);
-		okResponse->setVia(data->getVia() + ";received=" + activeIp);
-		okResponse->setTo(data->getTo() + ";tag=" + toTag);
+		okResponse->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		okResponse->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 		okResponse->setContact(buildContact("777"));
 		okResponse->enforceG711();
 		_outbox.emplace_back(data->getSource(), std::move(okResponse));
 
 		_dummyClient->reset("777", data->getSource(), 3600);
-		auto newSession = allocateSession(data->getCallID(), caller.value());
+		auto newSession = allocateSession(std::string(data->getCallID()), caller.value());
 		if (newSession)
 		{
 			newSession->setDest(_dummyClient);
@@ -325,18 +353,20 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 
 		if (targets.empty())
 		{
-			std::shared_ptr<SipMessage> responseObj = std::make_shared<SipMessage>(*data);
+			std::shared_ptr<SipMessage> responseObj = getMessageFromPool(data->toString(), data->getSource());
 			responseObj->setHeader(SipMessageTypes::NOT_FOUND);
+			responseObj->clearBody();
 			responseObj->setContact(buildContact(caller.value()->getNumber()));
 			_outbox.emplace_back(data->getSource(), std::move(responseObj));
 			return;
 		}
 
-		auto newSession = allocateSession(data->getCallID(), caller.value());
+		auto newSession = allocateSession(std::string(data->getCallID()), caller.value());
 		if (!newSession)
 		{
-			std::shared_ptr<SipMessage> responseObj = std::make_shared<SipMessage>(*data);
+			std::shared_ptr<SipMessage> responseObj = getMessageFromPool(data->toString(), data->getSource());
 			responseObj->setHeader("SIP/2.0 503 Service Unavailable");
+			responseObj->clearBody();
 			responseObj->setContact(buildContact(caller.value()->getNumber()));
 			_outbox.emplace_back(data->getSource(), std::move(responseObj));
 			return;
@@ -346,18 +376,18 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		newSession->setInviteMessage(data);
 		_sessions.emplace(data->getCallID(), newSession);
 
-		auto ringing = std::make_shared<SipMessage>(*data);
+		auto ringing = getMessageFromPool(data->toString(), data->getSource());
 		ringing->setHeader("SIP/2.0 180 Ringing");
 		ringing->clearBody();
 		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
-		ringing->setVia(data->getVia() + ";received=" + activeIp);
-		ringing->setTo(data->getTo() + ";tag=" + IDGen::GenerateID(9));
+		ringing->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		ringing->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 		ringing->setContact(buildContact("999"));
 		_outbox.emplace_back(data->getSource(), std::move(ringing));
 
 		for (auto& target : targets)
 		{
-			auto inviteFork = std::make_shared<SipMessage>(*data);
+			auto inviteFork = getMessageFromPool(data->toString(), data->getSource());
 			inviteFork->setContact(buildContact(caller.value()->getNumber()));
 
 			char ipBuf[INET_ADDRSTRLEN]{};
@@ -384,8 +414,9 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	if (!called.has_value())
 	{
 		// Send "SIP/2.0 404 Not Found"
-		std::shared_ptr<SipMessage> responseObj = std::make_shared<SipMessage>(*data);
+		std::shared_ptr<SipMessage> responseObj = getMessageFromPool(data->toString(), data->getSource());
 		responseObj->setHeader(SipMessageTypes::NOT_FOUND);
+		responseObj->clearBody();
 		responseObj->setContact(buildContact(caller.value()->getNumber()));
 		endHandle(data->getFromNumber(), responseObj);
 		return;
@@ -398,26 +429,28 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	}
 	if (!message) 
 	{
-		queueLog("Couldn't get SDP from " + data->getFromNumber() + "'s INVITE request.", true);
-		std::shared_ptr<SipMessage> responseObj = std::make_shared<SipMessage>(*data);
+		queueLog("Couldn't get SDP from " + std::string(data->getFromNumber()) + "'s INVITE request.", true);
+		std::shared_ptr<SipMessage> responseObj = getMessageFromPool(data->toString(), data->getSource());
 		responseObj->setHeader(SipMessageTypes::BAD_REQUEST);
+		responseObj->clearBody();
 		responseObj->setContact(buildContact(caller.value()->getNumber()));
 		endHandle(data->getFromNumber(), responseObj);
 		return;
 	}
 
-	auto newSession = allocateSession(data->getCallID(), caller.value());
+	auto newSession = allocateSession(std::string(data->getCallID()), caller.value());
 	if (!newSession)
 	{
-		std::shared_ptr<SipMessage> responseObj = std::make_shared<SipMessage>(*data);
+		std::shared_ptr<SipMessage> responseObj = getMessageFromPool(data->toString(), data->getSource());
 		responseObj->setHeader("SIP/2.0 503 Service Unavailable");
+		responseObj->clearBody();
 		responseObj->setContact(buildContact(caller.value()->getNumber()));
 		endHandle(data->getFromNumber(), responseObj);
 		return;
 	}
 	_sessions.emplace(data->getCallID(), newSession);
 
-	auto response = std::make_shared<SipMessage>(*data);
+	auto response = getMessageFromPool(data->toString(), data->getSource());
 	response->setContact(buildContact(caller.value()->getNumber()));
 	endHandle(data->getToNumber(), response);
 }
@@ -447,7 +480,7 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 	auto session = getSession(data->getCallID());
 	if (session.has_value() && session.value()->isBroadcast())
 	{
-		session.value()->removePendingTarget(data->getFromNumber());
+		session.value()->removePendingTarget(std::string(data->getFromNumber()));
 		if (session.value()->getPendingTargets().empty() && session.value()->getState() == Session::State::Invited)
 		{
 			endHandle(session.value()->getSrc()->getNumber(), data);
@@ -464,7 +497,7 @@ void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 	auto session = getSession(data->getCallID());
 	if (session.has_value() && session.value()->isBroadcast())
 	{
-		session.value()->removePendingTarget(data->getFromNumber());
+		session.value()->removePendingTarget(std::string(data->getFromNumber()));
 		if (session.value()->getPendingTargets().empty() && session.value()->getState() == Session::State::Invited)
 		{
 			endHandle(session.value()->getSrc()->getNumber(), data);
@@ -479,13 +512,13 @@ void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 {
 	auto session = getSession(data->getCallID());
-	std::string destNumber = data->getToNumber();
+	std::string destNumber(data->getToNumber());
 	if (destNumber == "777")
 	{
-		auto response = std::make_shared<SipMessage>(*data);
+		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader(SipMessageTypes::OK);
 		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
-		response->setVia(data->getVia() + ";received=" + activeIp);
+		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		endCall(data->getCallID(), data->getFromNumber(), destNumber);
 		return;
@@ -493,10 +526,10 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 
 	if (destNumber == "999")
 	{
-		auto response = std::make_shared<SipMessage>(*data);
+		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader(SipMessageTypes::OK);
 		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
-		response->setVia(data->getVia() + ";received=" + activeIp);
+		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 
 		if (session.has_value())
@@ -504,7 +537,7 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 			auto answeringClient = session.value()->getDest();
 			if (answeringClient)
 			{
-				auto byeFork = std::make_shared<SipMessage>(*data);
+				auto byeFork = getMessageFromPool(data->toString(), data->getSource());
 				std::string serverIpPort = activeIp + ":" + std::to_string(_serverPort);
 
 				char ipBuf[INET_ADDRSTRLEN]{};
@@ -513,7 +546,7 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 
 				byeFork->setHeader("BYE sip:" + answeringClient->getNumber() + "@" + targetIpPort + " SIP/2.0");
 
-				std::string originalTo = data->getTo();
+				std::string originalTo(data->getTo());
 				std::string newTo = "To: <sip:" + answeringClient->getNumber() + "@" + serverIpPort + ">";
 				size_t tagPos = originalTo.find(";tag=");
 				if (tagPos != std::string::npos)
@@ -578,13 +611,13 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 
 					auto inviteMsg = session.value()->getInviteMessage();
 
-					auto response = std::make_shared<SipMessage>(*data);
+					auto response = getMessageFromPool(data->toString(), data->getSource());
 					response->setContact(buildContact(answeringClient->getNumber()));
 
 					if (inviteMsg)
 					{
-						std::string originalTo = inviteMsg->getTo();
-						std::string bTo = data->getTo();
+						std::string originalTo(inviteMsg->getTo());
+						std::string bTo(data->getTo());
 						size_t tagPos = bTo.find(";tag=");
 						if (tagPos != std::string::npos)
 						{
@@ -598,7 +631,7 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 
 					if (inviteMsg)
 					{
-						std::string originalCSeq = inviteMsg->getCSeq();
+						std::string originalCSeq(inviteMsg->getCSeq());
 						size_t invitePos = originalCSeq.find("INVITE");
 						if (invitePos != std::string::npos)
 						{
@@ -609,7 +642,7 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 						{
 							if (target->getNumber() != answeringClient->getNumber())
 							{
-								auto cancelMsg = std::make_shared<SipMessage>(*inviteMsg);
+								auto cancelMsg = getMessageFromPool(inviteMsg->toString(), inviteMsg->getSource());
 								char ipBuf[INET_ADDRSTRLEN]{};
 								inet_ntop(AF_INET, &target->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
 								std::string targetIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(target->getAddress().sin_port));
@@ -638,8 +671,9 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 			if (!sdpMessage) 
 			{
 				queueLog("Couldn't get SDP from: " + client.value()->getNumber() + "'s OK message.", true);
-				std::shared_ptr<SipMessage> responseObj = std::make_shared<SipMessage>(*data);
+				std::shared_ptr<SipMessage> responseObj = getMessageFromPool(data->toString(), data->getSource());
 				responseObj->setHeader(SipMessageTypes::BAD_REQUEST);
+				responseObj->clearBody();
 				responseObj->setContact(buildContact(data->getToNumber()));
 				endHandle(data->getToNumber(), responseObj);
 				endCall(data->getCallID(), data->getFromNumber(), data->getToNumber(), "SDP parse error.");
@@ -647,7 +681,7 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 			}
 			session->get()->setDest(client.value());
 			session->get()->setState(Session::State::Connected);
-			auto response = std::make_shared<SipMessage>(*data);
+			auto response = getMessageFromPool(data->toString(), data->getSource());
 			response->setContact(buildContact(data->getToNumber()));
 			endHandle(data->getFromNumber(), std::move(response));
 			return;
@@ -669,7 +703,7 @@ void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	std::string destNumber = data->getToNumber();
+	std::string destNumber(data->getToNumber());
 	if (destNumber == "777")
 	{
 		return;
@@ -680,7 +714,7 @@ void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 		auto answeringClient = session.value()->getDest();
 		if (answeringClient)
 		{
-			auto ackFork = std::make_shared<SipMessage>(*data);
+			auto ackFork = getMessageFromPool(data->toString(), data->getSource());
 			std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
 			std::string serverIpPort = activeIp + ":" + std::to_string(_serverPort);
 
@@ -690,7 +724,7 @@ void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 
 			ackFork->setHeader("ACK sip:" + answeringClient->getNumber() + "@" + targetIpPort + " SIP/2.0");
 
-			std::string originalTo = data->getTo();
+			std::string originalTo(data->getTo());
 			std::string newTo = "To: <sip:" + answeringClient->getNumber() + "@" + serverIpPort + ">";
 			size_t tagPos = originalTo.find(";tag=");
 			if (tagPos != std::string::npos)
@@ -710,27 +744,27 @@ void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 	std::string endReason;
 	if (sessionState == Session::State::Busy)
 	{
-		endReason = data->getToNumber() + " is busy.";
+		endReason = std::string(data->getToNumber()) + " is busy.";
 		endCall(data->getCallID(), data->getFromNumber(), data->getToNumber(), endReason);
 		return;
 	}
 
 	if (sessionState == Session::State::Unavailable)
 	{
-		endReason = data->getToNumber() + " is unavailable.";
+		endReason = std::string(data->getToNumber()) + " is unavailable.";
 		endCall(data->getCallID(), data->getFromNumber(), data->getToNumber(), endReason);
 		return;
 	}
 
 	if (sessionState == Session::State::Cancel)
 	{
-		endReason = data->getFromNumber() + " canceled the session.";
+		endReason = std::string(data->getFromNumber()) + " canceled the session.";
 		endCall(data->getCallID(), data->getFromNumber(), data->getToNumber(), endReason);
 		return;
 	}
 }
 
-bool RequestsHandler::setCallState(const std::string& callID, Session::State state)
+bool RequestsHandler::setCallState(std::string_view callID, Session::State state)
 {
 	auto session = getSession(callID);
 	if (session)
@@ -742,9 +776,9 @@ bool RequestsHandler::setCallState(const std::string& callID, Session::State sta
 	return false;
 }
 
-void RequestsHandler::endCall(const std::string& callID, const std::string& srcNumber, const std::string& destNumber, const std::string& reason)
+void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumber, std::string_view destNumber, std::string_view reason)
 {
-	if (_sessions.erase(callID) > 0)
+	if (_sessions.erase(std::string(callID)) > 0)
 	{
 		std::ostringstream message;
 		message << "Session has been disconnected between " << srcNumber << " and " << destNumber;
@@ -773,10 +807,10 @@ bool RequestsHandler::registerClient(std::shared_ptr<SipClient> client)
 	return true;
 }
 
-void RequestsHandler::unregisterClient(const std::string& number)
+void RequestsHandler::unregisterClient(std::string_view number)
 {
-	queueLog("Unregistered client: " + number);
-	_clients.erase(number);
+	queueLog("Unregistered client: " + std::string(number));
+	_clients.erase(std::string(number));
 }
 
 int RequestsHandler::parseRequestedExpires(const std::shared_ptr<SipMessage>& data) const
@@ -797,7 +831,7 @@ int RequestsHandler::parseRequestedExpires(const std::shared_ptr<SipMessage>& da
 	};
 
 	// 1. expires= parameter on the Contact header (most common form).
-	const std::string& contact = data->getContact();
+	std::string contact(data->getContact());
 	auto cpos = contact.find("expires=");
 	if (cpos != std::string::npos)
 	{
@@ -908,9 +942,9 @@ void RequestsHandler::maybeSweep()
 	sweepExpired();
 }
 
-std::optional<std::shared_ptr<SipClient>> RequestsHandler::findClient(const std::string& number)
+std::optional<std::shared_ptr<SipClient>> RequestsHandler::findClient(std::string_view number)
 {
-	auto it = _clients.find(number);
+	auto it = _clients.find(std::string(number));
 	if (it != _clients.end())
 	{
 		return it->second;
@@ -919,7 +953,7 @@ std::optional<std::shared_ptr<SipClient>> RequestsHandler::findClient(const std:
 	return {};
 }
 
-void RequestsHandler::endHandle(const std::string& destNumber, std::shared_ptr<SipMessage> message)
+void RequestsHandler::endHandle(std::string_view destNumber, std::shared_ptr<SipMessage> message)
 {
 	auto destClient = findClient(destNumber);
 	if (destClient.has_value())
@@ -929,17 +963,18 @@ void RequestsHandler::endHandle(const std::string& destNumber, std::shared_ptr<S
 	else
 	{
 		// Clone the message so we don't mutate a shared object's header
-		auto notFound = std::make_shared<SipMessage>(*message);
+		auto notFound = getMessageFromPool(message->toString(), message->getSource());
 		notFound->setHeader(SipMessageTypes::NOT_FOUND);
+		notFound->clearBody();
 		auto src = message->getSource();
 		_outbox.emplace_back(src, std::move(notFound));
 	}
 }
 
-std::string RequestsHandler::buildContact(const std::string& number) const
+std::string RequestsHandler::buildContact(std::string_view number) const
 {
 	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
-	return "Contact: <sip:" + number + "@" + activeIp + ":" + std::to_string(_serverPort) + ";transport=UDP>";
+	return "Contact: <sip:" + std::string(number) + "@" + activeIp + ":" + std::to_string(_serverPort) + ";transport=UDP>";
 }
 
 // ── Dashboard query API ──────────────────────────────────────────────────────
@@ -1168,7 +1203,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_
 	   << "User-Agent: pocket-dial\r\n"
 	   << "Content-Length: 0\r\n\r\n";
 
-	return std::make_shared<SipMessage>(ss.str(), client->getAddress());
+	return getMessageFromPool(ss.str(), client->getAddress());
 }
 
 std::shared_ptr<SipClient> RequestsHandler::allocateClient(std::string number, sockaddr_in address, int expiresSeconds)
@@ -1261,7 +1296,7 @@ bool RequestsHandler::allowPacket(const sockaddr_in& src)
 	return false; // Denied (Rate limit exceeded)
 }
 
-bool RequestsHandler::isValidAor(const std::string& s) const
+bool RequestsHandler::isValidAor(std::string_view s) const
 {
 	if (s.empty()) return false;
 	for (char c : s)

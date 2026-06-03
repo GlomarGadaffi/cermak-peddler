@@ -60,3 +60,11 @@ Thumbs.db
 
 # Archives
 *.zip
+
+# Build output, managed deps, and scratch (added 2026-06-03)
+build_desktop/
+managed_components/
+dependencies.lock
+scratch/
+serial_log.txt
+post_issue_comments.ps1

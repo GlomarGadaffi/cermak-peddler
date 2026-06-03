@@ -36,8 +36,8 @@
 #include <Wire.h>
 #include "qrcode.h"       // ricmoo/QRCode
 #include <WiFi.h>
-#include "SipServer.hpp"
-#include "HttpServer.hpp"
+#include "../../src/SIP/SipServer.hpp"
+#include "../../src/Helpers/HttpServer.hpp"
 
 // ── Bring-up diagnostics (Issue #40) ─────────────────────────────────────────
 // The full app bootlooped with no serial output after the display migration,

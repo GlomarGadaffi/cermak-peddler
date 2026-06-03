@@ -34,10 +34,12 @@ public:
 	RequestsHandler(std::string serverIp, int serverPort,
 		OnHandledEvent onHandledEvent);
 
+	static std::shared_ptr<SipMessage> getMessageFromPool(std::string message, sockaddr_in src);
+
 	void handle(std::shared_ptr<SipMessage> request);
 	void tick();
 
-	std::optional<std::shared_ptr<Session>> getSession(const std::string& callID);
+	std::optional<std::shared_ptr<Session>> getSession(std::string_view callID);
 
 	// ── Dashboard query API (thread-safe) ────────────────────────────
 	std::vector<std::pair<std::string, std::string>> getActiveClients();
@@ -65,18 +67,18 @@ private:
 	void onOk(std::shared_ptr<SipMessage> data);
 	void onAck(std::shared_ptr<SipMessage> data);
 
-	bool setCallState(const std::string& callID, Session::State state);
-	void endCall(const std::string& callID, const std::string& srcNumber, const std::string& destNumber, const std::string& reason = "");
+	bool setCallState(std::string_view callID, Session::State state);
+	void endCall(std::string_view callID, std::string_view srcNumber, std::string_view destNumber, std::string_view reason = "");
 
 	bool registerClient(std::shared_ptr<SipClient> client);
-	void unregisterClient(const std::string& number);
+	void unregisterClient(std::string_view number);
 
 	// Registration-lease handling (RFC 3261 §10.2.1)
 	int parseRequestedExpires(const std::shared_ptr<SipMessage>& data) const;
 	void sweepExpired();   // evict expired bindings; caller must hold _mutex
 	void maybeSweep();     // throttled sweep; caller must hold _mutex
 
-	std::optional<std::shared_ptr<SipClient>> findClient(const std::string& number);
+	std::optional<std::shared_ptr<SipClient>> findClient(std::string_view number);
 	std::optional<std::shared_ptr<SipClient>> findClientByAddress(const sockaddr_in& addr);
 	std::shared_ptr<SipMessage> buildOptionsPing(const std::shared_ptr<SipClient>& client);
 
@@ -93,10 +95,10 @@ private:
 	bool ipAllowed(const sockaddr_in& src) const;
 	bool allowPacket(const sockaddr_in& src);
 
-	void endHandle(const std::string& destNumber, std::shared_ptr<SipMessage> message);
-	std::string buildContact(const std::string& number) const;
+	void endHandle(std::string_view destNumber, std::shared_ptr<SipMessage> message);
+	std::string buildContact(std::string_view number) const;
 
-	bool isValidAor(const std::string& s) const;
+	bool isValidAor(std::string_view s) const;
 	void queueLog(std::string msg, bool isError = false);
 
 	std::shared_ptr<SipClient> allocateClient(std::string number, sockaddr_in address, int expiresSeconds);
@@ -131,6 +133,7 @@ private:
 	// Pre-allocated static memory pools (Issue #53)
 	std::vector<std::shared_ptr<SipClient>> _clientPool;
 	std::vector<std::shared_ptr<Session>> _sessionPool;
+	static std::vector<std::shared_ptr<SipMessage>> _messagePool;
 
 	// Issue #38: token bucket keyed by source IPv4 (network-order s_addr).
 	struct RateBucket
