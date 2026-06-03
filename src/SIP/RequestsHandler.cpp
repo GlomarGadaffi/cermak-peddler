@@ -1285,7 +1285,7 @@ bool RequestsHandler::allowPacket(const sockaddr_in& src)
 	bucket.last = now;
 
 	// Replenish tokens (sustained rate = 20 tokens/sec)
-	bucket.tokens = std::min(40.0, bucket.tokens + elapsedSec * 20.0);
+	bucket.tokens = (std::min)(40.0, bucket.tokens + elapsedSec * 20.0);
 
 	if (bucket.tokens >= 1.0)
 	{

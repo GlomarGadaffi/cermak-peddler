@@ -112,7 +112,9 @@ void SipMessage::parse()
 
 		size_t nameEnd = colonPos;
 		while (nameEnd > 0 && std::isspace(static_cast<unsigned char>(line[nameEnd - 1]))) --nameEnd;
-		std::string name(line.substr(0, nameEnd));
+		size_t nameStart = 0;
+		while (nameStart < nameEnd && std::isspace(static_cast<unsigned char>(line[nameStart]))) ++nameStart;
+		std::string name(line.substr(nameStart, nameEnd - nameStart));
 		// Lowercase name
 		std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
 		std::string full(fullHdr);

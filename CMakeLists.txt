@@ -43,4 +43,6 @@ else()
 
     source_group("Helpers"  FILES ${HELPERS_SRC_FILES})
     source_group("SIP"      FILES ${SIP_SRC_FILES})
+    
+    add_subdirectory(tests)
 endif()
