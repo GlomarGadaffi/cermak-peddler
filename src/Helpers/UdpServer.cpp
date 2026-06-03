@@ -96,7 +96,7 @@ void UdpServer::receiveLoop()
 	while (_keepRunning)
 	{
 		senderEndPoint = {};
-		int bytesReceived;
+		int bytesReceived = 0;
 #if defined(__linux__) || defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 		bytesReceived = static_cast<int>(recvfrom(_sockfd, buffer, BUFFER_SIZE, 0,
 			reinterpret_cast<struct sockaddr*>(&senderEndPoint), reinterpret_cast<socklen_t*>(&len)));

@@ -26,6 +26,7 @@
 #include "HttpServer.hpp"
 #include "DnsServer.hpp"
 #include "IPHelper.hpp"
+#include "host_compat.h"
 
 static const char *TAG = "main_display";
 

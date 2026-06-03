@@ -188,20 +188,23 @@ void DnsServer::dns_task(void* pvParameters) {
                 tx_len += 4;
 
                 // Send back reply to source address
-                int sent = sendto(self->_socketFd, tx_buffer, tx_len, 0, (struct sockaddr *)&source_addr, socklen);
-                if (sent < 0) {
-                    ESP_LOGE(TAG, "DNS sendto failed: errno %d", errno);
-                }
-            }
-        }
-    }
+-                int sent = sendto(self->_socketFd, tx_buffer, tx_len, 0, (struct sockaddr *)&source_addr, socklen);
++                int sent = sendto(self->_socketFd, tx_buffer, tx_len, 0,
++                                  reinterpret_cast<struct sockaddr *>(&source_addr),
++                                  socklen);
+                 if (sent < 0) {
+                     ESP_LOGE(TAG, "DNS sendto failed: errno %d", errno);
+                 }
+             }
+         }
+     }
 
-    if (self->_socketFd != -1) {
-        close(self->_socketFd);
-        self->_socketFd = -1;
-    }
-    self->_running = false;
-    self->_taskHandle = nullptr;
-    ESP_LOGI(TAG, "DNS server task completed.");
-    vTaskDelete(NULL);
-}
+     if (self->_socketFd != -1) {
+         close(self->_socketFd);
+         self->_socketFd = -1;
+     }
+     self->_running = false;
+     self->_taskHandle = nullptr;
+     ESP_LOGI(TAG, "DNS server task completed.");
+     vTaskDelete(NULL);
+ }

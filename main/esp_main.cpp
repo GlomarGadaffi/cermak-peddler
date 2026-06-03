@@ -11,6 +11,7 @@
 
 #include "SipServer.hpp"
 #include "HttpServer.hpp"
+#include "host_compat.h"
 
 #define EXAMPLE_ESP_WIFI_SSID      "esp32-sipserver"
 #define EXAMPLE_ESP_WIFI_PASS      ""
