@@ -479,7 +479,8 @@ R"rawhtml(
 }
 
 #wifi-connect-form input[type="text"],
-#wifi-connect-form input[type="password"] {
+#wifi-connect-form input[type="password"],
+#admin-section input[type="password"] {
   width: 100%;
   background: var(--black);
   border: 1px solid var(--dk-cyan);
@@ -490,7 +491,8 @@ R"rawhtml(
   margin-bottom: 8px;
   outline: none;
 }
-#wifi-connect-form input:focus {
+#wifi-connect-form input:focus,
+#admin-section input:focus {
   border-color: var(--cyan);
   box-shadow: 0 0 6px rgba(85,255,255,0.3);
 }
@@ -722,6 +724,23 @@ R"rawhtml(
       <div style="margin-top:6px;">
         <button class="btn-retro" onclick="connectWifi()">⚡ Connect</button>
         <button class="btn-retro btn-danger" onclick="cancelWifiConnect()">Cancel</button>
+      </div>
+    </div>
+    <div id="admin-section" style="margin-top:12px; border-top:1px dashed var(--dk-yellow); padding-top:8px;">
+      <div style="font-size:14px; color:var(--dk-yellow); margin-bottom:4px;">&#128274; Admin Access:</div>
+      <div id="admin-status" style="font-size:13px; color:var(--gray); margin-bottom:6px;">Checking&#8230;</div>
+      <div id="admin-setpin-form" style="display:none;">
+        <label style="color:var(--cyan); display:block; margin-bottom:4px; font-size:14px;">No PIN set &mdash; control actions are unprotected. Set an admin PIN (min 4 chars):</label>
+        <input type="password" id="admin-newpin" placeholder="New PIN&#8230;" autocomplete="new-password">
+        <div style="margin-top:6px;"><button class="btn-retro" onclick="adminSetPin()">&#128274; Set PIN</button></div>
+      </div>
+      <div id="admin-login-form" style="display:none;">
+        <label style="color:var(--cyan); display:block; margin-bottom:4px; font-size:14px;">Enter admin PIN to unlock control actions:</label>
+        <input type="password" id="admin-pin" placeholder="Admin PIN&#8230;" autocomplete="current-password">
+        <div style="margin-top:6px;"><button class="btn-retro" onclick="adminLogin()">&#9889; Log In</button></div>
+      </div>
+      <div id="admin-logout-form" style="display:none;">
+        <button class="btn-retro" onclick="adminLogout()">&#9099; Log Out</button>
       </div>
     </div>
     <div style="margin-top:12px; border-top:1px dashed var(--dk-cyan); padding-top:8px;">
@@ -1166,7 +1185,7 @@ function showHelp() { document.getElementById('help-modal').style.display = 'blo
 function closeHelp() { document.getElementById('help-modal').style.display = 'none'; }
 
 // ─── WIFI MODAL ───
-function showWifi() { document.getElementById('wifi-modal').style.display = 'block'; }
+function showWifi() { document.getElementById('wifi-modal').style.display = 'block'; refreshAdminStatus(); }
 function closeWifi() { document.getElementById('wifi-modal').style.display = 'none'; }
 
 function scanWifi() {
@@ -1306,6 +1325,72 @@ function factoryReset() {
   }).catch(e => termPrint(' RESET ERROR: ' + e.message, 'var(--red)'));
 }
 
+// ─── ADMIN ACCESS (PIN + session) ───
+// The control endpoints (kill / wifi / factory-reset) enforce auth server-side
+// once a PIN is set; this panel lets an operator set the PIN and log in/out.
+function refreshAdminStatus() {
+  const stat = document.getElementById('admin-status');
+  if (!stat) return;
+  const setF = document.getElementById('admin-setpin-form');
+  const logF = document.getElementById('admin-login-form');
+  const outF = document.getElementById('admin-logout-form');
+  fetch('/api/admin/status').then(r => r.json()).then(d => {
+    setF.style.display = 'none'; logF.style.display = 'none'; outF.style.display = 'none';
+    if (!d.provisioned) {
+      stat.textContent = '⚠ Unprotected — no admin PIN set.';
+      stat.style.color = 'var(--dk-red)';
+      setF.style.display = 'block';
+    } else if (d.authenticated) {
+      stat.textContent = '✓ Authenticated — control actions unlocked.';
+      stat.style.color = 'var(--green)';
+      outF.style.display = 'block';
+    } else {
+      stat.textContent = '🔒 Locked — log in to use control actions.';
+      stat.style.color = 'var(--yellow)';
+      logF.style.display = 'block';
+    }
+  }).catch(e => {
+    stat.textContent = 'Status unavailable: ' + e.message;
+    stat.style.color = 'var(--red)';
+  });
+}
+
+function adminSetPin() {
+  const pin = document.getElementById('admin-newpin').value;
+  if (pin.length < 4) { termPrint(' ADMIN: PIN must be at least 4 characters.', 'var(--red)'); return; }
+  fetch('/api/admin/set-pin', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'pin=' + encodeURIComponent(pin)
+  }).then(r => {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    document.getElementById('admin-newpin').value = '';
+    termPrint(' ADMIN: PIN set — control actions are now protected.', 'var(--green)');
+    refreshAdminStatus();
+  }).catch(e => termPrint(' ADMIN ERROR: ' + e.message, 'var(--red)'));
+}
+
+function adminLogin() {
+  const pin = document.getElementById('admin-pin').value;
+  fetch('/api/admin/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'pin=' + encodeURIComponent(pin)
+  }).then(r => {
+    if (r.status === 429) throw new Error('locked out — too many attempts, wait and retry');
+    if (!r.ok) throw new Error('invalid PIN');
+    document.getElementById('admin-pin').value = '';
+    termPrint(' ADMIN: Logged in.', 'var(--green)');
+    refreshAdminStatus();
+  }).catch(e => termPrint(' ADMIN: Login failed — ' + e.message, 'var(--red)'));
+}
+
+function adminLogout() {
+  fetch('/api/admin/logout', { method: 'POST' })
+    .then(() => { termPrint(' ADMIN: Logged out.', 'var(--cyan)'); refreshAdminStatus(); })
+    .catch(e => termPrint(' ADMIN ERROR: ' + e.message, 'var(--red)'));
+}
+
 // ─── 3D WIREFRAME ROTATING TESSERACT ───
 (function() {
   const canvas = document.getElementById('retro-canvas');
@@ -1437,6 +1522,7 @@ function factoryReset() {
 // ─── INIT ───
 bootSequence();
 fetchStatus();
+refreshAdminStatus();
 setInterval(fetchStatus, 3000);
 oracleInterval = setInterval(updateOracle, 12000);
 
