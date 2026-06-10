@@ -578,6 +578,10 @@ namespace AdminAuth
 			// Constant-time compare against each live token.
 			if (constantTimeEquals(sess.token, token))
 			{
+				// Sliding expiry: an actively-used session is kept alive. Each
+				// successful validation pushes the absolute deadline out by the
+				// full TTL so a working admin isn't logged out mid-session.
+				sess.expiresAtMs = now + AdminAuth::kSessionTtlMs;
 				return true;
 			}
 		}

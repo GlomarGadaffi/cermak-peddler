@@ -200,6 +200,52 @@ namespace
 		return out;
 	}
 
+	// HMAC-MD5 (RFC 2104) -> 32-char lowercase hex. A real HMAC, NOT the
+	// length-extension-forgeable MD5(secret || message) construction. Used to tag
+	// the stateless nonce so an attacker who observes a nonce cannot forge a valid
+	// tag for a different timestamp.
+	std::string hmacMd5Hex(const std::string& key, const std::string& msg)
+	{
+		constexpr size_t BLOCK = 64;
+		uint8_t k[BLOCK] = {0};
+		if (key.size() > BLOCK)
+		{
+			Md5 kh;
+			uint8_t kd[16];
+			kh.update(key);
+			kh.finalize(kd);
+			std::memcpy(k, kd, sizeof(kd));
+		}
+		else
+		{
+			std::memcpy(k, key.data(), key.size());
+		}
+
+		uint8_t ipad[BLOCK];
+		uint8_t opad[BLOCK];
+		for (size_t i = 0; i < BLOCK; ++i)
+		{
+			ipad[i] = static_cast<uint8_t>(k[i] ^ 0x36);
+			opad[i] = static_cast<uint8_t>(k[i] ^ 0x5c);
+		}
+
+		uint8_t inner[16];
+		{
+			Md5 h;
+			h.update(ipad, BLOCK);
+			h.update(reinterpret_cast<const uint8_t*>(msg.data()), msg.size());
+			h.finalize(inner);
+		}
+		uint8_t outer[16];
+		{
+			Md5 h;
+			h.update(opad, BLOCK);
+			h.update(inner, sizeof(inner));
+			h.finalize(outer);
+		}
+		return toHex(outer, sizeof(outer));
+	}
+
 	// Cryptographically-strong (on ESP) random bytes; on host, a PRNG seeded from
 	// random_device (host is a developer/CI simulator). Mirrors AdminAuth.
 	void fillRandom(uint8_t* buf, size_t len)
@@ -451,10 +497,11 @@ namespace SipDigest
 	{
 		std::string nonceTag(uint64_t tsMs)
 		{
-			// Keyed MD5 over the timestamp. Not a true HMAC, but adequate as an
-			// integrity tag for a server-issued, short-lived nonce (the secret is
-			// never transmitted and rotates on reboot).
-			return md5Hex(nonceServerSecret() + ":" + std::to_string(tsMs));
+			// HMAC-MD5 over the timestamp, keyed by the process-lifetime server
+			// secret. A true HMAC (not MD5(secret || msg)) so the tag is not
+			// length-extension forgeable. The secret is never transmitted and
+			// rotates on reboot.
+			return hmacMd5Hex(nonceServerSecret(), std::to_string(tsMs));
 		}
 
 		std::string toHexU64(uint64_t v)

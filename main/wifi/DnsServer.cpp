@@ -1,5 +1,6 @@
 #include "DnsServer.hpp"
 #include <cstring>
+#include <errno.h>
 #include <sys/param.h>
 #include "lwip/sockets.h"
 #include "lwip/err.h"
@@ -27,41 +28,59 @@ struct DnsAnswerHeader {
 };
 #pragma pack(pop)
 
-DnsServer::DnsServer() : _resolvedIp("192.168.4.1"), _taskHandle(nullptr), _socketFd(-1), _running(false) {}
+DnsServer::DnsServer()
+    : _resolvedIp("192.168.4.1"), _taskHandle(nullptr), _socketFd(-1), _running(false),
+      _exitSem(xSemaphoreCreateBinary()) {}
 
 DnsServer::~DnsServer() {
     stop();
+    if (_exitSem) {
+        vSemaphoreDelete(_exitSem);
+        _exitSem = nullptr;
+    }
 }
 
 bool DnsServer::start(const std::string& resolvedIp) {
-    if (_running) return true;
-    
-    _resolvedIp = resolvedIp;
-    _running = true;
-    
+    if (_running.load(std::memory_order_acquire)) return true;
+
+    _resolvedIp = resolvedIp;   // read once by dns_task at startup (after task create)
+    _running.store(true, std::memory_order_release);
+    // Drain any stale exit signal left by a previous run so stop()'s join is honest.
+    if (_exitSem) xSemaphoreTake(_exitSem, 0);
+
     BaseType_t ret = xTaskCreatePinnedToCore(&DnsServer::dns_task, "dns_task", 4096, this, 5, &_taskHandle, 0);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create DNS task");
-        _running = false;
+        _running.store(false, std::memory_order_release);
         return false;
     }
-    
+    _taskStarted = true;
     return true;
 }
 
 void DnsServer::stop() {
-    if (!_running) return;
-    
-    _running = false;
-    if (_socketFd != -1) {
-        close(_socketFd);
-        _socketFd = -1;
+    bool wasRunning = _running.exchange(false, std::memory_order_acq_rel);
+
+    // Close the socket to unblock a parked recvfrom() immediately. exchange() makes
+    // the close single-owner: whichever of stop()/dns_task gets the real fd closes
+    // it once; the other gets -1 and skips, so there is no double close.
+    int fd = _socketFd.exchange(-1, std::memory_order_acq_rel);
+    if (fd != -1) {
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
     }
-    
-    // DNS server task will terminate on its own when _running is false or socket is closed.
-    // Clean up task handle if still valid.
+
+    // Join dns_task before returning so a caller that destroys this object right
+    // after stop() cannot race a still-running task touching our members (UAF).
+    // The ~1 s cap backstops a wedged task. Only wait if a task was actually created.
+    if (_taskStarted && _exitSem) {
+        xSemaphoreTake(_exitSem, pdMS_TO_TICKS(1000));
+        _taskStarted = false;
+    }
     _taskHandle = nullptr;
-    ESP_LOGI(TAG, "DNS server stopped.");
+    if (wasRunning) {
+        ESP_LOGI(TAG, "DNS server stopped.");
+    }
 }
 
 void DnsServer::dns_task(void* pvParameters) {
@@ -73,20 +92,31 @@ void DnsServer::dns_task(void* pvParameters) {
     dest_addr.sin_family = AF_INET;
     dest_addr.sin_port = htons(53); // Standard DNS port
 
-    self->_socketFd = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    if (self->_socketFd < 0) {
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) {
         ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
-        self->_running = false;
+        self->_running.store(false, std::memory_order_release);
+        if (self->_exitSem) xSemaphoreGive(self->_exitSem);
         vTaskDelete(NULL);
         return;
     }
+    self->_socketFd.store(sock, std::memory_order_release);
 
-    int err = bind(self->_socketFd, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    // Bounded recv timeout (M-2): lets the loop observe _running even if the socket
+    // close in stop() does not unblock recvfrom() on this lwIP build, and bounds a
+    // silent sender. Mirrors UdpServer / RtpReceiver's 500 ms SO_RCVTIMEO pattern.
+    struct timeval tv;
+    tv.tv_sec  = 0;
+    tv.tv_usec = 500000;   // 500 ms
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    int err = bind(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
     if (err < 0) {
         ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
-        close(self->_socketFd);
-        self->_socketFd = -1;
-        self->_running = false;
+        int fd = self->_socketFd.exchange(-1, std::memory_order_acq_rel);
+        if (fd != -1) close(fd);
+        self->_running.store(false, std::memory_order_release);
+        if (self->_exitSem) xSemaphoreGive(self->_exitSem);
         vTaskDelete(NULL);
         return;
     }
@@ -107,17 +137,20 @@ void DnsServer::dns_task(void* pvParameters) {
         }
     }
 
-    while (self->_running) {
-        int len = recvfrom(self->_socketFd, rx_buffer, sizeof(rx_buffer), 0, (struct sockaddr *)&source_addr, &socklen);
+    while (self->_running.load(std::memory_order_acquire)) {
+        int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer), 0, (struct sockaddr *)&source_addr, &socklen);
         if (len < 0) {
-            if (self->_running) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;   // SO_RCVTIMEO expiry: re-check _running and loop
+            }
+            if (self->_running.load(std::memory_order_acquire)) {
                 ESP_LOGE(TAG, "recvfrom failed: errno %d", errno);
             }
-            break;
+            break;          // real error, or socket closed by stop()
         }
 
         // Process only if it looks like a valid DNS query (at least a header)
-        if (len < sizeof(DnsHeader)) {
+        if (len < (int)sizeof(DnsHeader)) {
             continue;
         }
 
@@ -139,7 +172,7 @@ void DnsServer::dns_task(void* pvParameters) {
             // Copy queries section from rx to tx
             // Finding the end of queries section
             int query_offset = sizeof(DnsHeader);
-            
+
             // Re-read questions section to find boundaries safely
             bool valid_query = true;
             for (int q = 0; q < qdcount; q++) {
@@ -153,7 +186,7 @@ void DnsServer::dns_task(void* pvParameters) {
                     }
                     query_offset += 1 + label_len;
                 }
-                
+
                 if (!valid_query) break;
                 query_offset += 1; // skip null byte
 
@@ -165,7 +198,7 @@ void DnsServer::dns_task(void* pvParameters) {
                 query_offset += 4;
             }
 
-            if (!valid_query || query_offset > sizeof(tx_buffer)) {
+            if (!valid_query || query_offset > (int)sizeof(tx_buffer)) {
                 continue;
             }
 
@@ -181,29 +214,32 @@ void DnsServer::dns_task(void* pvParameters) {
             answer.rdlength = htons(4);      // IPv4 length (4 bytes)
 
             int tx_len = query_offset;
-            if (tx_len + sizeof(DnsAnswerHeader) + 4 <= sizeof(tx_buffer)) {
+            if (tx_len + (int)sizeof(DnsAnswerHeader) + 4 <= (int)sizeof(tx_buffer)) {
                 memcpy(tx_buffer + tx_len, &answer, sizeof(DnsAnswerHeader));
                 tx_len += sizeof(DnsAnswerHeader);
                 memcpy(tx_buffer + tx_len, ip_bytes, 4);
                 tx_len += 4;
 
                 // Send back reply to source address
-                int sent = sendto(self->_socketFd, tx_buffer, tx_len, 0,
+                int sent = sendto(sock, tx_buffer, tx_len, 0,
                                   reinterpret_cast<struct sockaddr *>(&source_addr),
                                   socklen);
-                 if (sent < 0) {
-                     ESP_LOGE(TAG, "DNS sendto failed: errno %d", errno);
-                 }
-             }
-         }
-     }
+                if (sent < 0) {
+                    ESP_LOGE(TAG, "DNS sendto failed: errno %d", errno);
+                }
+            }
+        }
+    }
 
-     if (self->_socketFd != -1) {
-         close(self->_socketFd);
-         self->_socketFd = -1;
-     }
-     self->_running = false;
-     self->_taskHandle = nullptr;
-     ESP_LOGI(TAG, "DNS server task completed.");
-     vTaskDelete(NULL);
- }
+    // This task owns the socket close unless stop() raced in first; exchange() makes
+    // it single-owner so the fd is closed exactly once.
+    int fd = self->_socketFd.exchange(-1, std::memory_order_acq_rel);
+    if (fd != -1) {
+        close(fd);
+    }
+    self->_running.store(false, std::memory_order_release);
+    ESP_LOGI(TAG, "DNS server task completed.");
+    // LAST access to `self`: signal stop()/destructor that we have fully exited.
+    if (self->_exitSem) xSemaphoreGive(self->_exitSem);
+    vTaskDelete(NULL);
+}

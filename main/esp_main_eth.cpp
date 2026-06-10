@@ -16,6 +16,7 @@
 
 #include <cstring>
 #include <string>
+#include <atomic>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -112,8 +113,11 @@ static EventGroupHandle_t s_eth_event_group = nullptr;
 static esp_netif_t*       s_eth_netif       = nullptr;
 static std::string        s_ip_addr;
 
-// Global SIP server pointer so the HTTP dashboard task can reach the handler
-static SipServer*         g_sipServer = nullptr;
+// Global SIP server pointer so the HTTP dashboard task (Core 0) can reach the
+// handler built by the SIP task. Atomic with acquire/release: a plain pointer is a
+// cross-core data race on the SMP Xtensa (stale-null / half-built-object read, and
+// the compiler could hoist the poll out of the attach loop).
+static std::atomic<SipServer*> g_sipServer{nullptr};
 
 #define HTTP_DASHBOARD_PORT 80
 
@@ -236,16 +240,17 @@ static void sip_server_task(void* pvParameters)
 {
     ESP_LOGI(TAG, "Starting SipServer on %s:%d", s_ip_addr.c_str(), SIP_PORT);
 
-    g_sipServer = new SipServer(s_ip_addr, SIP_PORT);
+    SipServer* srv = new SipServer(s_ip_addr, SIP_PORT);
+    // Publish with release so the HTTP task's acquire-load sees a fully-constructed
+    // object the moment it observes the non-null pointer.
+    g_sipServer.store(srv, std::memory_order_release);
     ESP_LOGI(TAG, "SIP server is RUNNING.  Point softphones at %s:%d",
              s_ip_addr.c_str(), SIP_PORT);
 
     unsigned long lastHeartbeat = 0;
     while (true)
     {
-        if (g_sipServer) {
-            g_sipServer->getHandler().tick();
-        }
+        srv->getHandler().tick();
         vTaskDelay(pdMS_TO_TICKS(1000));
         unsigned long nowSec = (unsigned long)(esp_timer_get_time() / 1000000);
         if (nowSec - lastHeartbeat >= 30)
@@ -283,9 +288,10 @@ static void http_server_task(void* pvParameters)
     while (true)
     {
         vTaskDelay(pdMS_TO_TICKS(1000));
-        if (!handlerAttached && g_sipServer != nullptr)
+        SipServer* srv = g_sipServer.load(std::memory_order_acquire);
+        if (!handlerAttached && srv != nullptr)
         {
-            http.attachHandler(&g_sipServer->getHandler());
+            http.attachHandler(&srv->getHandler());
             handlerAttached = true;
             ESP_LOGI(TAG, "Dashboard: live SIP registrar attached");
         }
@@ -339,10 +345,13 @@ extern "C" void app_main(void)
     s_eth_event_group = xEventGroupCreate();
 
     // ── Register event handlers ─────────────────────────────────────────
-    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID,
-                                               &eth_event_handler, nullptr));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP,
-                                               &ip_event_handler, nullptr));
+    // Use the _instance_ form (the bare esp_event_handler_register is deprecated
+    // since IDF v4.2 and returns no instance handle, so a re-init path would stack
+    // duplicate handlers → double dispatch). Matches the wifi/display builds.
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(ETH_EVENT, ESP_EVENT_ANY_ID,
+                                               &eth_event_handler, nullptr, nullptr));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_ETH_GOT_IP,
+                                               &ip_event_handler, nullptr, nullptr));
 
     // ── Create default netif for Ethernet ───────────────────────────────
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
@@ -352,7 +361,16 @@ extern "C" void app_main(void)
     esp_eth_handle_t eth_handle = eth_init_w5500();
 
     // ── Glue driver to netif ────────────────────────────────────────────
-    esp_netif_attach(s_eth_netif, esp_eth_new_netif_glue(eth_handle));
+    // Both calls can fail (glue alloc on OOM; attach returns esp_err_t). Discarding
+    // them left the driver installed but unconnected to lwIP, so the board waited
+    // forever for a DHCP lease that could never arrive — fail loudly instead.
+    auto eth_glue = esp_eth_new_netif_glue(eth_handle);
+    if (eth_glue == nullptr) {
+        ESP_LOGE(TAG, "FATAL: esp_eth_new_netif_glue failed (out of memory)");
+        if (s_eth_event_group) { vEventGroupDelete(s_eth_event_group); s_eth_event_group = nullptr; }
+        return;
+    }
+    ESP_ERROR_CHECK(esp_netif_attach(s_eth_netif, eth_glue));
 
     // ── Static IP (optional) ────────────────────────────────────────────
 #if USE_STATIC_IP
@@ -377,6 +395,7 @@ extern "C" void app_main(void)
     if (!(bits & ETH_GOT_IP_BIT))
     {
         ESP_LOGE(TAG, "FATAL: No IP after 30 s.  Check cable / PoE / DHCP.");
+        if (s_eth_event_group) { vEventGroupDelete(s_eth_event_group); s_eth_event_group = nullptr; }
         return;
     }
 
@@ -419,8 +438,18 @@ extern "C" void app_main(void)
     if (!is_provisioned) {
         ESP_LOGW(TAG, "[boot] device unprovisioned — SIP stack held dark until credential committed");
 
+        // Bounded wait (see esp_main.cpp): reboot to retry if no credential arrives
+        // within the cap rather than hang forever with no watchdog on this gate.
+        constexpr int kMaxCredentialWaitSec = 1800;   // 30 minutes
+        int credentialWaitSec = 0;
         while (!AdminAuth::credentialIsSet()) {
             vTaskDelay(pdMS_TO_TICKS(2000));
+            credentialWaitSec += 2;
+            if (credentialWaitSec >= kMaxCredentialWaitSec) {
+                ESP_LOGE(TAG, "[boot] no admin credential after %d s — rebooting to retry",
+                         kMaxCredentialWaitSec);
+                esp_restart();
+            }
             ESP_LOGI(TAG, "[boot] waiting for admin credential...");
         }
 

@@ -195,9 +195,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        idf-version: [ 'v5.1.2', 'v5.2.1' ]
+        # v6.0.1 added so the v6-only code paths (the standalone espressif/w5500
+        # managed component, the ESP_IDF_VERSION >= 6 includes in esp_main_eth.cpp,
+        # and the wolfSSL patcher) get compiled in CI instead of staying dark.
+        idf-version: [ 'v5.1.2', 'v5.2.1', 'v6.0.1' ]
         target-chip: [ 'esp32', 'esp32s3' ]
         sip-transport: [ 'wifi', 'eth' ]
+        # The W5500 'eth' transport's default board pin maps (LilyGO T-ETH-ELITE /
+        # Waveshare ESP32-S3-ETH) use ESP32-S3-only GPIOs (47/48 on the Elite), so an
+        # esp32 + eth build is meaningless and only gave false coverage — exclude it.
+        # (Internal-EMAC Ethernet on the classic ESP32 is the separate 'lan8720'
+        # transport, not 'eth'.)
+        exclude:
+          - target-chip: 'esp32'
+            sip-transport: 'eth'
         # The "display" transport is esp32s3-only and pulls heavy managed
         # components (lvgl ^8.3.11, esp_lcd_touch, the AXS15231B driver — see
         # main/idf_component.yml). Verified to build on esp32s3 + ESP-IDF v5.2.1

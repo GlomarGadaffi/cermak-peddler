@@ -81,7 +81,6 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 			_messagePool.push_back(std::make_shared<SipSdpMessage>("", sockaddr_in{}));
 		}
 	}
-	_dummyClient = std::make_shared<SipClient>();
 
 	// Reload persisted PBX config (call-forward / ring groups) and the CDR ring from
 	// NVS so they survive reboot. No-ops on host. Construction is single-threaded
@@ -143,17 +142,23 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 		return;
 	}
 
-	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> localOutbox;
-	std::vector<std::pair<bool, std::string>> localLogs;
+	// Per-source IP rate limiting (Issue #38 / SEC-02) runs under its OWN lock,
+	// BEFORE the big handler _mutex, so a flood from blocked IPs is dropped without
+	// ever serializing on _mutex against legitimate signaling. ipAllowed/allowPacket
+	// touch only the rate state, which _rateMutex now guards.
 	{
-		std::lock_guard<std::mutex> lock(_mutex);
-
-		// Per-source IP Rate Limiting (Issue #38 / SEC-02)
+		std::lock_guard<std::mutex> rlock(_rateMutex);
 		if (!ipAllowed(request->getSource()) || !allowPacket(request->getSource()))
 		{
 			_packetsDropped.fetch_add(1, std::memory_order_relaxed);
 			return;
 		}
+	}
+
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> localOutbox;
+	std::vector<std::pair<bool, std::string>> localLogs;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
 
 		_packetsProcessed.fetch_add(1, std::memory_order_relaxed);
 		_outbox.clear();
@@ -357,7 +362,9 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 		auto newClient = allocateClient(std::string(data->getFromNumber()), data->getSource(), grantedExpires);
 		if (newClient)
 		{
-			registerClient(newClient);
+			// allocateClient() has already placed the binding in the client pool;
+			// the registrar keeps no separate index, so there is nothing more to do
+			// here (this was previously a no-op registerClient() hook).
 			// Register beep: on a brand-new binding ONLY (never a lease refresh —
 			// phones re-REGISTER every lease period), send the registering phone a
 			// brief intercom auto-answer INVITE so it plays its own tone, then tear
@@ -529,11 +536,16 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		okResponse->enforceG711();
 		_outbox.emplace_back(data->getSource(), std::move(okResponse));
 
-		_dummyClient->reset("777", data->getSource(), 3600);
+		// Per-session dummy dest (never the old shared _dummyClient): a concurrent
+		// 777/440 call must not overwrite this session's destination identity. The
+		// shared_ptr lives as long as the session references it (released on
+		// teardown / pool reuse) — bounded by the session pool, not the packet path.
+		auto dummy777 = std::make_shared<SipClient>();
+		dummy777->reset("777", data->getSource(), 3600);
 		auto newSession = allocateSession(std::string(data->getCallID()), caller.value());
 		if (newSession)
 		{
-			newSession->setDest(_dummyClient);
+			newSession->setDest(dummy777);
 			_sessions.emplace(data->getCallID(), newSession);
 			newSession->setState(Session::State::Connected);
 		}
@@ -839,6 +851,46 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 		return;
 	}
 
+	// Start the RTP tone stream FIRST. Sending 200 OK before the stream is up risks
+	// answering the call (caller hears nothing) when the socket/task fails to start,
+	// recoverable only by the caller hanging up. On failure answer 500 instead.
+	if (!_rtpSender.start(destIp, destPort, std::string(data->getCallID())))
+	{
+		auto err = getMessageFromPool(data->toString(), data->getSource());
+		err->setHeader("SIP/2.0 500 Server Internal Error");
+		err->clearBody();
+		err->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		err->setContact(buildContact("440"));
+		_outbox.emplace_back(data->getSource(), std::move(err));
+		queueLog("440 media: RTP stream failed to start to " + destIp + ":"
+			+ std::to_string(destPort), true);
+		return;
+	}
+
+	// Track a Session so the dashboard shows the call and CDR is recorded on teardown.
+	// Per-session dummy dest (never a shared client) so a concurrent 777/440 can't
+	// overwrite this call's destination identity. If the session pool is full, stop
+	// the stream we just started and answer 503 rather than streaming an untracked
+	// call that nothing can later tear down.
+	auto dummy440 = std::make_shared<SipClient>();
+	dummy440->reset("440", data->getSource(), 3600);
+	auto newSession = allocateSession(std::string(data->getCallID()), caller);
+	if (!newSession)
+	{
+		_rtpSender.stop(std::string(data->getCallID()));
+		auto busy = getMessageFromPool(data->toString(), data->getSource());
+		busy->setHeader("SIP/2.0 503 Service Unavailable");
+		busy->clearBody();
+		busy->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		busy->setContact(buildContact("440"));
+		_outbox.emplace_back(data->getSource(), std::move(busy));
+		queueLog("440 media: session pool full, rejected " + std::string(data->getFromNumber()), true);
+		return;
+	}
+	newSession->setDest(dummy440);
+	_sessions.emplace(data->getCallID(), newSession);
+	newSession->setState(Session::State::Connected);
+
 	// Build the 200 OK carrying the SERVER's own SDP. We rebuild the message body
 	// directly (there is no generic body setter): take the INVITE clone, strip its
 	// body, then append our SDP and the SDP Content-Type, and resync Content-Length
@@ -881,29 +933,8 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 	ok->syncContentLength();             // belt-and-suspenders: length == body bytes
 	_outbox.emplace_back(data->getSource(), std::move(ok));
 
-	// Track a Session so the dashboard shows the call and CDR is recorded on teardown.
-	_dummyClient->reset("440", data->getSource(), 3600);
-	auto newSession = allocateSession(std::string(data->getCallID()), caller);
-	if (newSession)
-	{
-		newSession->setDest(_dummyClient);
-		_sessions.emplace(data->getCallID(), newSession);
-		newSession->setState(Session::State::Connected);
-	}
-
-	// Start the RTP tone stream to the caller. If it fails to start (socket/task),
-	// we have already sent 200 OK; the caller's later BYE/CANCEL tears the session
-	// down. Log it so the failure is visible.
-	if (_rtpSender.start(destIp, destPort, std::string(data->getCallID())))
-	{
-		queueLog("440 media: streaming tone to " + destIp + ":" + std::to_string(destPort)
-			+ " (callID=" + std::string(data->getCallID()) + ")");
-	}
-	else
-	{
-		queueLog("440 media: RTP stream failed to start to " + destIp + ":"
-			+ std::to_string(destPort), true);
-	}
+	queueLog("440 media: streaming tone to " + destIp + ":" + std::to_string(destPort)
+		+ " (callID=" + std::string(data->getCallID()) + ")");
 }
 
 void RequestsHandler::onTrying(std::shared_ptr<SipMessage> data)
@@ -1642,16 +1673,13 @@ std::shared_ptr<SipMessage> RequestsHandler::buildCancel(const std::shared_ptr<S
 	return cancelMsg;
 }
 
-bool RequestsHandler::setCallState(std::string_view callID, Session::State state)
+void RequestsHandler::setCallState(std::string_view callID, Session::State state)
 {
 	auto session = getSession(callID);
 	if (session)
 	{
 		session->get()->setState(state);
-		return true;
 	}
-
-	return false;
 }
 
 void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumber, std::string_view destNumber, std::string_view reason)
@@ -1765,11 +1793,6 @@ void RequestsHandler::recordCdr(const std::shared_ptr<Session>& session,
 	// Persist the ring so records survive reboot (write-through on teardown; no-op
 	// on host). Caller (endCall) holds _mutex. See persistCdrRing() for the wear note.
 	persistCdrRing();
-}
-
-bool RequestsHandler::registerClient(std::shared_ptr<SipClient>)
-{
-	return true;
 }
 
 void RequestsHandler::unregisterClient(std::string_view number)
@@ -2763,16 +2786,22 @@ void RequestsHandler::tick()
 			}
 		}
 
-		// Sweep rate-limit buckets older than 60 seconds (Issue #58)
-		for (auto rit = _rateBuckets.begin(); rit != _rateBuckets.end(); )
+		// Sweep rate-limit buckets older than 60 seconds (Issue #58). The bucket map
+		// now lives under _rateMutex (so per-packet admission never serializes on the
+		// big _mutex), so take it here too. Nesting order is _mutex → _rateMutex;
+		// handle() only ever holds them disjointly, so there is no deadlock.
 		{
-			if (now - rit->second.last > std::chrono::seconds(60))
+			std::lock_guard<std::mutex> rlock(_rateMutex);
+			for (auto rit = _rateBuckets.begin(); rit != _rateBuckets.end(); )
 			{
-				rit = _rateBuckets.erase(rit);
-			}
-			else
-			{
-				++rit;
+				if (now - rit->second.last > std::chrono::seconds(60))
+				{
+					rit = _rateBuckets.erase(rit);
+				}
+				else
+				{
+					++rit;
+				}
 			}
 		}
 
@@ -3841,9 +3870,12 @@ void RequestsHandler::onDtmfInfo(std::shared_ptr<SipMessage> data)
 			auto session = getSession(callId);
 			if (session.has_value())
 			{
-				_dummyClient->reset("777", session.value()->getSrc()
+				// Per-session dummy dest (never a shared client) so concurrent
+				// star-code/777/440 calls can't clobber each other's destination.
+				auto dummy = std::make_shared<SipClient>();
+				dummy->reset("777", session.value()->getSrc()
 					? session.value()->getSrc()->getAddress() : sockaddr_in{}, 3600);
-				session.value()->setDest(_dummyClient);
+				session.value()->setDest(dummy);
 			}
 		}
 		else
@@ -3863,8 +3895,10 @@ void RequestsHandler::onDtmfInfo(std::shared_ptr<SipMessage> data)
 			auto src = session.value()->getSrc();
 			if (src)
 			{
-				_dummyClient->reset("777", src->getAddress(), 3600);
-				session.value()->setDest(_dummyClient);
+				// Per-session dummy dest (never a shared client) — see *69 above.
+				auto dummy = std::make_shared<SipClient>();
+				dummy->reset("777", src->getAddress(), 3600);
+				session.value()->setDest(dummy);
 				queueLog("*11 echo loopback for call " + callId);
 			}
 		}

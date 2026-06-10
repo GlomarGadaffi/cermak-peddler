@@ -26,6 +26,13 @@
 #     append-mostly with a known frame size, so a filesystem buys little. If random-
 #     access named-file management is later needed, reformat this same region as SPIFFS
 #     (subtype 0x82) WITHOUT moving the app slots — the OTA layout stays compatible.
+#   * WRITE DISCIPLINE (raw subtype 0x40 has NO filesystem and NO wear-leveling):
+#     any future writer MUST esp_partition_erase_range() the target sectors before
+#     esp_partition_write() — raw writes only clear bits, so writing without erasing
+#     first silently ORs garbage into existing audio. Distribute writes across the
+#     region rather than rewriting one spot: NOR flash endures only ~100K erase
+#     cycles per sector and nothing levels that here. The synth-tone beachhead writes
+#     nothing today; this note is the contract for when prompt/voicemail code lands.
 #
 # Name,     Type, SubType,  Offset,    Size
 nvs,        data, nvs,      0x9000,    0x6000
