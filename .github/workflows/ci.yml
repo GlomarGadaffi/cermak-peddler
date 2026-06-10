@@ -195,10 +195,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # v6.0.1 added so the v6-only code paths (the standalone espressif/w5500
-        # managed component, the ESP_IDF_VERSION >= 6 includes in esp_main_eth.cpp,
-        # and the wolfSSL patcher) get compiled in CI instead of staying dark.
-        idf-version: [ 'v5.1.2', 'v5.2.1', 'v6.0.1' ]
+        # v6.0.1 only: the managed components (espressif/w5500, espressif/lan87xx,
+        # wolfSSL/wolfSSH) and the source guards have moved to the v6 APIs, so the
+        # older v5.1.2/v5.2.1 legs no longer build. v6.0.1 is the single supported
+        # toolchain.
+        idf-version: [ 'v6.0.1' ]
         target-chip: [ 'esp32', 'esp32s3' ]
         sip-transport: [ 'wifi', 'eth' ]
         # The W5500 'eth' transport's default board pin maps (LilyGO T-ETH-ELITE /
@@ -209,13 +210,12 @@ jobs:
         exclude:
           - target-chip: 'esp32'
             sip-transport: 'eth'
-        # The "display" transport is esp32s3-only and pulls heavy managed
-        # components (lvgl ^8.3.11, esp_lcd_touch, the AXS15231B driver — see
-        # main/idf_component.yml). Verified to build on esp32s3 + ESP-IDF v5.2.1
-        # (set-target + build, app image ~1.5 MB), so it is added as a single
-        # include leg rather than expanding the full matrix.
+        # The "display" transport is esp32s3-only and pulls heavy managed components
+        # (lvgl ^8.3.11, esp_lcd_touch, the AXS15231B driver, wolfSSL/wolfSSH — see
+        # main/idf_component.yml). Added as a single include leg rather than expanding
+        # the full matrix.
         include:
-          - idf-version: 'v5.2.1'
+          - idf-version: 'v6.0.1'
             target-chip: 'esp32s3'
             sip-transport: 'display'
 

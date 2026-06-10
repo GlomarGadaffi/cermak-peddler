@@ -68,11 +68,13 @@ changes are compile-gated by the CI ESP-IDF matrix.
   wear-leveling contract comment on the raw `prompts` partition (`partitions.csv`).
 
 ### CI
-- Added ESP-IDF **v6.0.1** to the firmware build matrix so the v6-only code paths
-  (split `espressif/w5500` component, `ESP_IDF_VERSION >= 6` includes, wolfSSL patcher)
-  are compiled in CI; excluded the meaningless `esp32 + eth` leg (the W5500 default pin
-  maps use ESP32-S3-only GPIOs — internal-EMAC Ethernet on the classic ESP32 is the
-  separate `lan8720` transport).
+- Switched the firmware build matrix to **ESP-IDF v6.0.1 only** — the managed
+  components (espressif/w5500, espressif/lan87xx, wolfSSL/wolfSSH) and the source
+  guards have moved to the v6 APIs, so the old v5.1.2/v5.2.1 legs no longer build.
+  Excluded the meaningless `esp32 + eth` leg (the W5500 default pin maps use
+  ESP32-S3-only GPIOs — internal-EMAC Ethernet on the classic ESP32 is the separate
+  `lan8720` transport). All three esp32s3 transports (display, eth, wifi) were verified
+  building locally on v6.0.1 with these changes (`SipServer.bin` generated for each).
 
 ### Deliberately not changed (reviewed, declined)
 - **RTP task core affinity**: the media TX/RX tasks stay on Core 0 — on the display
