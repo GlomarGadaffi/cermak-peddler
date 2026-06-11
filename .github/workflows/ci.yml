@@ -31,6 +31,7 @@ jobs:
                    --suppress=unmatchedSuppression \
                    --suppress=*:main/ui/qrcode.c \
                    --suppress=*:main/ui/qrcode.h \
+                   --suppress=unknownMacro:main/ui/ui.cpp \
                    -I src/Helpers -I src/SIP -I main \
                    src/ main/
 

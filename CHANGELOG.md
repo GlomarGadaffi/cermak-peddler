@@ -75,6 +75,11 @@ changes are compile-gated by the CI ESP-IDF matrix.
   ESP32-S3-only GPIOs — internal-EMAC Ethernet on the classic ESP32 is the separate
   `lan8720` transport). All three esp32s3 transports (display, eth, wifi) were verified
   building locally on v6.0.1 with these changes (`SipServer.bin` generated for each).
+- Suppressed a pre-existing cppcheck `unknownMacro` false-positive on
+  `main/ui/ui.cpp` (the LVGL `LV_SYMBOL_RIGHT` glyph macro — cppcheck can't see
+  LVGL's headers). This had been failing the host CI job since the Learn-mode
+  display work landed; the suppression is scoped to `unknownMacro` on that one file
+  so genuine warnings there still fire.
 
 ### Deliberately not changed (reviewed, declined)
 - **RTP task core affinity**: the media TX/RX tasks stay on Core 0 — on the display
