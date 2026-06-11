@@ -1521,7 +1521,7 @@ void Tui::drawMonitorFrame()
                     const RosterRow& rr = ms.roster[idx];
                     std::string lbl = rr.ext;
                     if (!rr.name.empty()) lbl += " " + rr.name;
-                    if ((int)lbl.size() > width) lbl = lbl.substr(0, width);
+                    if ((int)lbl.size() > width) lbl.resize((size_t)width);
                     char b[40]; std::snprintf(b, sizeof(b), " %-*s ", width, lbl.c_str());
                     body += col(Role::Text, b);
                     int vis = 0; appendStateChip(rr.state, body, vis);
@@ -5374,7 +5374,7 @@ void Tui::onKeyPbxGroupEdit(Key k, unsigned char ch)
                 // Extract the bare ext (the label may be "101 Maria").
                 std::string ext = _grpMembers[i];
                 size_t sp = ext.find(' ');
-                if (sp != std::string::npos) ext = ext.substr(0, sp);
+                if (sp != std::string::npos) ext.resize(sp);
                 int ord = (i < _grpOrder.size()) ? _grpOrder[i] : 0;
                 picked.push_back({ ord > 0 ? ord : 1000000 + (int)i, ext });
             }

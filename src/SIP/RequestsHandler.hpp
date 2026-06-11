@@ -232,7 +232,7 @@ private:
 	// and one forked INVITE per target. Caller holds _mutex.
 	void startBroadcastFork(std::shared_ptr<SipMessage> invite,
 		std::shared_ptr<SipClient> caller,
-		std::vector<std::shared_ptr<SipClient>> targets,
+		const std::vector<std::shared_ptr<SipClient>>& targets,
 		bool intercom);
 
 	// Build and queue a single INVITE fork toward one target, re-pointing the

@@ -1494,7 +1494,7 @@ void RequestsHandler::buildInviteFork(const std::shared_ptr<SipMessage>& invite,
 
 void RequestsHandler::startBroadcastFork(std::shared_ptr<SipMessage> invite,
 	std::shared_ptr<SipClient> caller,
-	std::vector<std::shared_ptr<SipClient>> targets,
+	const std::vector<std::shared_ptr<SipClient>>& targets,
 	bool intercom)
 {
 	// Shared fan-out core: build the broadcast Session, send 180 Ringing to the
