@@ -548,8 +548,9 @@ namespace SipDigest
 		{
 			return false;
 		}
-		std::string_view tsHex(nonce.data(), dot);
-		std::string_view tag(nonce.data() + dot + 1, nonce.size() - dot - 1);
+		std::string_view nonceView(nonce);
+		std::string_view tsHex = nonceView.substr(0, dot);
+		std::string_view tag = nonceView.substr(dot + 1);
 
 		uint64_t ts = 0;
 		if (!fromHexU64(tsHex, ts))

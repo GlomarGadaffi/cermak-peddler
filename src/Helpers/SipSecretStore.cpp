@@ -116,8 +116,9 @@ namespace
 		{
 			return out;
 		}
-		// len includes the NUL; build lines from the C-string content.
-		std::string s(buf.c_str());
+		// len includes the trailing NUL; trim it to get the stored text.
+		if (len > 0) buf.resize(len - 1);
+		std::string s = std::move(buf);
 		size_t start = 0;
 		while (start < s.size())
 		{

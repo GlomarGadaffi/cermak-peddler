@@ -80,6 +80,13 @@ changes are compile-gated by the CI ESP-IDF matrix.
   LVGL's headers). This had been failing the host CI job since the Learn-mode
   display work landed; the suppression is scoped to `unknownMacro` on that one file
   so genuine warnings there still fire.
+- Cleared the five pre-existing cppcheck `performance` findings that had also been
+  failing the host job (real fixes, not suppressions): `SipDigest.cpp` nonce split now
+  uses `string_view::substr` instead of pointer/length construction; `SipSecretStore.cpp`
+  trims the NVS buffer via `resize(len-1)` + move instead of copying through `c_str()`;
+  two `Tui.cpp` self-prefix `substr` assignments became `resize()`; and
+  `RequestsHandler::startBroadcastFork` takes its `targets` vector by const reference.
+  Host build + GoogleTest suite re-verified green.
 
 ### Deliberately not changed (reviewed, declined)
 - **RTP task core affinity**: the media TX/RX tasks stay on Core 0 — on the display
