@@ -1,5 +1,6 @@
 #include <cstring>
 #include <string>
+#include <atomic>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -35,8 +36,11 @@
 
 static const char *TAG = "wifi softAP";
 
-// Global pointers so the HTTP task can reach the SIP engine
-static SipServer* g_sipServer = nullptr;
+// Global pointer so the HTTP task (Core 0) can reach the SIP engine built by the
+// SIP task (Core 1). Atomic with acquire/release: a plain pointer is a cross-core
+// data race on the SMP Xtensa (the reader could see a stale null or a half-built
+// object, and the compiler could hoist the poll out of the loop).
+static std::atomic<SipServer*> g_sipServer{nullptr};
 
 // ── Event bits for STA connect ────────────────────────────────────────────────
 #define STA_GOT_IP_BIT BIT0
@@ -180,11 +184,12 @@ void sip_server_task(void *pvParameters)
     int port = 5060;
     ESP_LOGI("SipServerTask", "Starting SipServer on %s:%d", s_sip_ip.c_str(), port);
 
-    g_sipServer = new SipServer(s_sip_ip, port);
+    SipServer* srv = new SipServer(s_sip_ip, port);
+    // Publish with release so the HTTP task's acquire-load sees a fully-constructed
+    // object (not a half-initialised one) the moment it observes the non-null pointer.
+    g_sipServer.store(srv, std::memory_order_release);
     while (1) {
-        if (g_sipServer) {
-            g_sipServer->getHandler().tick();
-        }
+        srv->getHandler().tick();
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
@@ -213,8 +218,9 @@ void http_server_task(void *pvParameters)
     bool handlerAttached = false;
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
-        if (!handlerAttached && g_sipServer != nullptr) {
-            http.attachHandler(&g_sipServer->getHandler());
+        SipServer* srv = g_sipServer.load(std::memory_order_acquire);
+        if (!handlerAttached && srv != nullptr) {
+            http.attachHandler(&srv->getHandler());
             handlerAttached = true;
             ESP_LOGI("HttpTask", "Dashboard: live SIP registrar attached");
         }
@@ -287,6 +293,10 @@ extern "C" void app_main(void)
             // and the ESP_ERROR_CHECK inside wifi_init_softap() would abort → boot loop.
             esp_wifi_stop();    // returns ESP_ERR_WIFI_NOT_STARTED if STA never started; ignored
             esp_wifi_deinit();
+            // Free the STA event group created by wifi_init_sta(); after deinit no
+            // more Wi-Fi events fire, so it can't be referenced again (the handler
+            // null-checks it). Prevents a small FreeRTOS-heap leak on this fallback.
+            if (s_sta_event_group) { vEventGroupDelete(s_sta_event_group); s_sta_event_group = nullptr; }
             topology_mode = TOPOLOGY_INFRA;
         }
     }
@@ -321,11 +331,21 @@ extern "C" void app_main(void)
     if (!is_provisioned) {
         ESP_LOGW(TAG, "[boot] device unprovisioned — SIP stack held dark until credential committed");
 
-        // Spin-wait: poll AdminAuth every 2 s until a credential is set via the
-        // HTTP dashboard. The drain task runs at priority 1 and will flush logs
-        // to UART during the delays.
+        // Bounded wait: poll AdminAuth every 2 s until a credential is set via the
+        // HTTP dashboard. The drain task (priority 1) flushes logs during the delays.
+        // If nothing arrives within the cap — e.g. the HTTP stack failed to come up —
+        // reboot to retry from a clean state rather than hang here forever (no
+        // watchdog covers this provisioning gate, so an unbounded spin is unrecoverable).
+        constexpr int kMaxCredentialWaitSec = 1800;   // 30 minutes
+        int credentialWaitSec = 0;
         while (!AdminAuth::credentialIsSet()) {
             vTaskDelay(pdMS_TO_TICKS(2000));
+            credentialWaitSec += 2;
+            if (credentialWaitSec >= kMaxCredentialWaitSec) {
+                ESP_LOGE(TAG, "[boot] no admin credential after %d s — rebooting to retry",
+                         kMaxCredentialWaitSec);
+                esp_restart();
+            }
             ESP_LOGI(TAG, "[boot] waiting for admin credential...");
         }
 

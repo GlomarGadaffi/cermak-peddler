@@ -1000,25 +1000,38 @@ bool HttpServer::isSameOrigin(const HttpRequest& req) const
 	if (schemeEnd != std::string::npos)
 		originHost = originHost.substr(schemeEnd + 3);
 
-	// Strip port numbers from both originHost and req.host for comparison (if any)
-	auto stripPort = [](const std::string& h) -> std::string {
+	// Split "host:port" (port optional → empty string when absent).
+	auto splitHostPort = [](const std::string& h) -> std::pair<std::string, std::string> {
 		size_t colon = h.find(':');
-		if (colon != std::string::npos) return h.substr(0, colon);
-		return h;
+		if (colon != std::string::npos) return { h.substr(0, colon), h.substr(colon + 1) };
+		return { h, std::string() };
 	};
 
-	std::string cleanOrigin = stripPort(originHost);
-	std::string cleanHost = stripPort(req.host);
+	auto originParts = splitHostPort(originHost);
+	auto hostParts   = splitHostPort(req.host);
+	const std::string& cleanOrigin = originParts.first;
+	const std::string& cleanHost   = hostParts.first;
 
 	// Host header must be our local IP or local mDNS hostname or localhost
 	std::string activeIp = (_ip == "0.0.0.0") ? getPrimaryLocalIP() : _ip;
-	bool hostValid = (cleanHost == activeIp || 
-	                  cleanHost == "192.168.4.1" || 
+	bool hostValid = (cleanHost == activeIp ||
+	                  cleanHost == "192.168.4.1" ||
 	                  cleanHost == "pocketdial.local" ||
 	                  cleanHost == "localhost" ||
 	                  cleanHost == "127.0.0.1");
 
-	return hostValid && (cleanOrigin == cleanHost);
+	if (!hostValid || cleanOrigin != cleanHost) return false;
+
+	// When BOTH carry an explicit port, they must match — a page served from a
+	// different port is a different origin. If either omits the port we fall back
+	// to the host-only check (browsers elide the default :80/:443, so requiring a
+	// port there would reject otherwise-legitimate same-origin requests).
+	if (!originParts.second.empty() && !hostParts.second.empty() &&
+	    originParts.second != hostParts.second)
+	{
+		return false;
+	}
+	return true;
 }
 
 std::string HttpServer::cookieValue(const HttpRequest& req, const std::string& name)
@@ -1107,15 +1120,20 @@ static std::string urlDecode(const std::string& src)
 
 static std::string getFormParam(const std::string& body, const std::string& key)
 {
-	std::string prefix = key + "=";
-	size_t pos = body.find(prefix);
-	if (pos == std::string::npos)
+	const std::string needle = key + "=";
+	// Match the key only at a parameter boundary: the start of the body, or
+	// immediately after an '&'. A bare find() mis-matches a key that is a suffix
+	// of an earlier one — e.g. searching "on=" inside "extension=101&on=1" finds
+	// the "n=" of "extensio[n=]101" and returns "101", so DND silently inverted.
+	size_t pos = 0;
+	for (;;)
 	{
-		prefix = "&" + key + "=";
-		pos = body.find(prefix);
+		pos = body.find(needle, pos);
 		if (pos == std::string::npos) return "";
+		if (pos == 0 || body[pos - 1] == '&') break;   // real token boundary
+		pos += needle.length();                        // false hit — keep scanning
 	}
-	size_t start = pos + prefix.length();
+	size_t start = pos + needle.length();
 	size_t end = body.find('&', start);
 	std::string val;
 	if (end == std::string::npos) {

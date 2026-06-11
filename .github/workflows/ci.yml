@@ -31,6 +31,7 @@ jobs:
                    --suppress=unmatchedSuppression \
                    --suppress=*:main/ui/qrcode.c \
                    --suppress=*:main/ui/qrcode.h \
+                   --suppress=unknownMacro:main/ui/ui.cpp \
                    -I src/Helpers -I src/SIP -I main \
                    src/ main/
 
@@ -195,16 +196,27 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        idf-version: [ 'v5.1.2', 'v5.2.1' ]
+        # v6.0.1 only: the managed components (espressif/w5500, espressif/lan87xx,
+        # wolfSSL/wolfSSH) and the source guards have moved to the v6 APIs, so the
+        # older v5.1.2/v5.2.1 legs no longer build. v6.0.1 is the single supported
+        # toolchain.
+        idf-version: [ 'v6.0.1' ]
         target-chip: [ 'esp32', 'esp32s3' ]
         sip-transport: [ 'wifi', 'eth' ]
-        # The "display" transport is esp32s3-only and pulls heavy managed
-        # components (lvgl ^8.3.11, esp_lcd_touch, the AXS15231B driver — see
-        # main/idf_component.yml). Verified to build on esp32s3 + ESP-IDF v5.2.1
-        # (set-target + build, app image ~1.5 MB), so it is added as a single
-        # include leg rather than expanding the full matrix.
+        # The W5500 'eth' transport's default board pin maps (LilyGO T-ETH-ELITE /
+        # Waveshare ESP32-S3-ETH) use ESP32-S3-only GPIOs (47/48 on the Elite), so an
+        # esp32 + eth build is meaningless and only gave false coverage — exclude it.
+        # (Internal-EMAC Ethernet on the classic ESP32 is the separate 'lan8720'
+        # transport, not 'eth'.)
+        exclude:
+          - target-chip: 'esp32'
+            sip-transport: 'eth'
+        # The "display" transport is esp32s3-only and pulls heavy managed components
+        # (lvgl ^8.3.11, esp_lcd_touch, the AXS15231B driver, wolfSSL/wolfSSH — see
+        # main/idf_component.yml). Added as a single include leg rather than expanding
+        # the full matrix.
         include:
-          - idf-version: 'v5.2.1'
+          - idf-version: 'v6.0.1'
             target-chip: 'esp32s3'
             sip-transport: 'display'
 

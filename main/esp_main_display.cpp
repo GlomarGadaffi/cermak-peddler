@@ -1,5 +1,6 @@
 #include <cstring>
 #include <cstdio>
+#include <atomic>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -66,8 +67,11 @@ static const char *TAG = "main_display";
 #define ONBOARDING_SSID "My-Ap"
 #define ONBOARDING_PASS "12345678"
 
-// Active server objects
-static SipServer* g_sipServer = nullptr;
+// Active server objects. g_sipServer is built by sip_server_task and read by the
+// http/status tasks; atomic with acquire/release so a reader never observes a
+// half-built object or a hoisted-out-of-loop poll (it also future-proofs the read
+// against a cross-core move).
+static std::atomic<SipServer*> g_sipServer{nullptr};
 static HttpServer* g_httpServer = nullptr;
 static DnsServer* g_dnsServer = nullptr;
 static QueueHandle_t s_log_queue = NULL;
@@ -142,8 +146,17 @@ extern "C" {
                 buf[len-1] = '\0';
                 len--;
             }
-            if (len > 0) {
-                xQueueSend(s_log_queue, buf, 0);  // non-blocking; drop if full
+            if (len > 0 && s_log_queue) {
+                // esp_log_set_vprintf hooks ALL ESP_LOGx, including any logged from
+                // ISR context. The plain xQueueSend must never run in an ISR, so
+                // dispatch the FromISR variant when we are in one (M-3).
+                if (xPortInIsrContext()) {
+                    BaseType_t hp = pdFALSE;
+                    xQueueSendFromISR(s_log_queue, buf, &hp);
+                    if (hp) portYIELD_FROM_ISR();
+                } else {
+                    xQueueSend(s_log_queue, buf, 0);  // non-blocking; drop if full
+                }
             }
         }
         if (original_log_vprintf) {
@@ -394,16 +407,17 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
 // ─── Server Tasks on Core 0 ───
 static void sip_server_task(void *pvParameters) {
     ESP_LOGI("SipTask", "Starting SipServer engine on Core 0 IP %s:%d", g_localIp.c_str(), 5060);
-    g_sipServer = new SipServer(g_localIp, 5060);
+    SipServer* srv = new SipServer(g_localIp, 5060);
     // Plumb the live registrar into the SSH sysop-terminal TUI so its hub status
     // line + title-bar clock show real extension/call counts (thread-safe: the
     // handler's dashboard getters snapshot-copy under their own mutex). Attaching
-    // a raw pointer is safe — g_sipServer lives for the process lifetime.
-    SshServer::instance().attachHandler(&g_sipServer->getHandler());
+    // a raw pointer is safe — the SipServer lives for the process lifetime.
+    SshServer::instance().attachHandler(&srv->getHandler());
+    // Publish with release so the http/status tasks' acquire-load sees a fully
+    // constructed object the moment they observe the non-null pointer.
+    g_sipServer.store(srv, std::memory_order_release);
     while (1) {
-        if (g_sipServer) {
-            g_sipServer->getHandler().tick();
-        }
+        srv->getHandler().tick();
         vTaskDelay(pdMS_TO_TICKS(30)); // match Arduino 30ms latency cycle
     }
     vTaskDelete(NULL);
@@ -411,11 +425,20 @@ static void sip_server_task(void *pvParameters) {
 
 static void http_server_task(void *pvParameters) {
     ESP_LOGI("HttpTask", "Starting Web CGA CRT dashboard on Core 0 IP %s:80", g_localIp.c_str());
-    // block task until SipServer is fully instanced
-    while (g_sipServer == nullptr) {
+    // Block until the SIP task publishes the handler — but BOUNDED: if the SipServer
+    // failed to construct (e.g. OOM after the PSRAM frame buffers), an unbounded poll
+    // would hang this task (and the whole dashboard) forever with no watchdog. Give
+    // up after ~30 s and self-exit instead of spinning silently.
+    SipServer* srv = nullptr;
+    for (int i = 0; i < 300 && (srv = g_sipServer.load(std::memory_order_acquire)) == nullptr; ++i) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    g_httpServer = new HttpServer(g_localIp, 80, &g_sipServer->getHandler());
+    if (srv == nullptr) {
+        ESP_LOGE("HttpTask", "SipServer never came up after 30 s — dashboard task aborting");
+        vTaskDelete(NULL);
+        return;
+    }
+    g_httpServer = new HttpServer(g_localIp, 80, &srv->getHandler());
     g_httpServer->start();
     ESP_LOGI("HttpTask", "CGA Web UI Running successfully!");
 
@@ -447,9 +470,11 @@ static void system_status_task(void *pvParameters) {
         if (g_setupComplete) {
             uint32_t uptime = esp_timer_get_time() / 1000000;
 
-            // Query extensions and active VoIP call counts
-            int clientCount = g_sipServer ? g_sipServer->getHandler().getClientCount() : 0;
-            int sessionCount = g_sipServer ? g_sipServer->getHandler().getSessionCount() : 0;
+            // Query extensions and active VoIP call counts. Load the registrar
+            // pointer once (acquire) and use the snapshot for the whole tick.
+            SipServer* srv = g_sipServer.load(std::memory_order_acquire);
+            int clientCount = srv ? srv->getHandler().getClientCount() : 0;
+            int sessionCount = srv ? srv->getHandler().getSessionCount() : 0;
 
             // Free-heap % for the wallboard vitals line (internal heap; PSRAM excluded so
             // the figure reflects the constrained pool that actually matters for stability).
@@ -469,8 +494,8 @@ static void system_status_task(void *pvParameters) {
             board.extCount = 0;
             board.dndCount = 0;
             board.dndOverflow = 0;
-            if (g_sipServer) {
-                RequestsHandler& h = g_sipServer->getHandler();
+            if (srv) {
+                RequestsHandler& h = srv->getHandler();
                 auto clients  = h.getActiveClients();   // {ext, ip:port}
                 auto sessions = h.getActiveSessions();   // {a, b, stateStr, durationSec}
                 auto dndList  = h.getDndExtensions();    // {ext...}
@@ -572,9 +597,13 @@ static void captive_decay_task(void *pvParameters) {
     nvs_handle_t h;
     if (nvs_open("storage", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_u8(h, "decayed", 1);
-        nvs_commit(h);
+        nvs_commit(h);   // synchronous: the flag is on flash before this returns
         nvs_close(h);
     }
+    // Quiesce the radio before resetting so no Wi-Fi-driven flash/NVS write from
+    // another task is in flight across esp_restart() (which does not coordinate with
+    // concurrent SPI-flash operations). nvs_commit above already flushed our write.
+    esp_wifi_stop();
     vTaskDelay(pdMS_TO_TICKS(200));
     esp_restart();
 }

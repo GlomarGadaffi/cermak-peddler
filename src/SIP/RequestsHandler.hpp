@@ -204,7 +204,7 @@ private:
 	// Find the beep slot owning a Call-ID, or nullptr. Caller holds _mutex.
 	BeepDialog* findBeepByCallID(std::string_view callID);
 
-	bool setCallState(std::string_view callID, Session::State state);
+	void setCallState(std::string_view callID, Session::State state);
 	void endCall(std::string_view callID, std::string_view srcNumber, std::string_view destNumber, std::string_view reason = "");
 
 	// CDR: write one record into the ring as a call ends. Caller must hold _mutex.
@@ -268,7 +268,6 @@ private:
 	// 2nd dial while busy is rejected 486 Busy Here. Caller holds _mutex.
 	void onMediaInvite(std::shared_ptr<SipMessage> data, const std::shared_ptr<SipClient>& caller);
 
-	bool registerClient(std::shared_ptr<SipClient> client);
 	void unregisterClient(std::string_view number);
 
 	// Registration-lease handling (RFC 3261 §10.2.1)
@@ -310,7 +309,6 @@ private:
 
 	std::shared_ptr<SipClient> allocateClient(std::string number, sockaddr_in address, int expiresSeconds);
 	std::shared_ptr<Session> allocateSession(std::string callID, std::shared_ptr<SipClient> src);
-	std::shared_ptr<SipClient> _dummyClient;
 
 	// Server-side RTP media source (the 440 tone stream). One concurrent stream; the
 	// ESP-only UDP socket + 20 ms pacing task live inside it, guarded for host builds.
@@ -450,6 +448,13 @@ private:
 	// Optional CIDR allowlist (host order). _allowMask == 0 means "no allowlist".
 	uint32_t _allowNet  = 0;
 	uint32_t _allowMask = 0;
+	// Dedicated lock for the rate-limit state (_rateBuckets / allowlist), held
+	// for the per-packet admission check BEFORE the big handler _mutex so a flood
+	// from blocked IPs is dropped without ever serializing on _mutex against
+	// legitimate signaling. Lock order: never acquire _mutex while holding this;
+	// tick() may nest this inside _mutex (the only place both are held), so the
+	// one ordering is _mutex → _rateMutex and handle() holds them disjointly.
+	std::mutex _rateMutex;
 
 	std::chrono::steady_clock::time_point _lastSweep{};
 	std::chrono::steady_clock::time_point _lastTick{};
