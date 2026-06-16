@@ -84,3 +84,11 @@ host_test*.log
 
 # Shareable binary packages (built locally from build_host_ssh; never commit binaries)
 dist/
+
+# local docs — read the code
+docs/
+notes/
+*.txt
+LINEAGE.md
+*.old
+*.bak
