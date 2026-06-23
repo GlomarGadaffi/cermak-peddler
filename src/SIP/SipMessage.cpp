@@ -203,23 +203,13 @@ void SipMessage::parse()
 	}
 }
 
-void SipMessage::setType(std::string value)
-{
-	if (!_header.empty())
-	{
-		// Find header position safely using findHeader instead of pointer arithmetic
-		size_t pos = findHeader(_header);
-		if (pos != std::string::npos)
-		{
-			size_t spacePos = _header.find(' ');
-			if (spacePos != std::string_view::npos)
-			{
-				_messageStr.replace(pos, spacePos, value);
-			}
-		}
-	}
-	reparse();
-}
+// NOTE (audit #68): setType() was removed. It was dead code (zero call sites,
+// grep-confirmed across src/, main/, tests/, sketches/) and its body conflated a
+// _header-relative offset with a replace() length — a latent foot-gun if a future
+// caller ever reused it on a non-start-line header. Rather than leave a method that
+// only happens to work for the start line, the dead helper was deleted. If a
+// method-token rewrite is ever needed, mirror setHeader()'s findHeader()+length
+// pattern (replace(pos, tokenLen, value)).
 
 void SipMessage::setHeader(std::string value)
 {
@@ -484,6 +474,86 @@ void SipMessage::clearBody()
 	reparse();
 }
 
+SipMessage::SdpDirection SipMessage::getSdpDirection() const
+{
+	// Locate the body (after the header/body separator). Mirrors parse()'s
+	// tolerance for bare-LF messages.
+	size_t bodyStart = _messageStr.find("\r\n\r\n");
+	size_t sepLen = 4;
+	if (bodyStart == std::string::npos)
+	{
+		bodyStart = _messageStr.find("\n\n");
+		sepLen = 2;
+	}
+	if (bodyStart == std::string::npos)
+	{
+		return SdpDirection::None;
+	}
+
+	// Walk the body line by line; the attribute must be line-anchored ("a=..."
+	// at the start of a line) so a stray substring elsewhere can't match.
+	const std::string_view whole(_messageStr);
+	size_t pos = bodyStart + sepLen;
+	while (pos < whole.size())
+	{
+		size_t eol = whole.find('\n', pos);
+		size_t lineEnd = (eol == std::string_view::npos) ? whole.size() : eol;
+		std::string_view line = whole.substr(pos, lineEnd - pos);
+		if (!line.empty() && line.back() == '\r')
+		{
+			line.remove_suffix(1);
+		}
+		if (line == "a=sendrecv") return SdpDirection::SendRecv;
+		if (line == "a=sendonly") return SdpDirection::SendOnly;
+		if (line == "a=recvonly") return SdpDirection::RecvOnly;
+		if (line == "a=inactive") return SdpDirection::Inactive;
+		if (eol == std::string::npos)
+		{
+			break;
+		}
+		pos = eol + 1;
+	}
+	return SdpDirection::None;
+}
+
+std::string_view SipMessage::getBody() const
+{
+	size_t sep = _messageStr.find("\r\n\r\n");
+	size_t sepLen = 4;
+	if (sep == std::string::npos)
+	{
+		sep = _messageStr.find("\n\n");
+		sepLen = 2;
+	}
+	if (sep == std::string::npos)
+	{
+		return {};
+	}
+	return std::string_view(_messageStr).substr(sep + sepLen);
+}
+
+void SipMessage::setBody(const std::string& body)
+{
+	size_t sep = _messageStr.find("\r\n\r\n");
+	size_t sepLen = 4;
+	if (sep == std::string::npos)
+	{
+		sep = _messageStr.find("\n\n");
+		sepLen = 2;
+	}
+	if (sep == std::string::npos)
+	{
+		// No header/body separator yet: append one, then the body.
+		_messageStr += "\r\n\r\n";
+		sep = _messageStr.size() - 4;
+		sepLen = 4;
+	}
+	_messageStr.erase(sep + sepLen);
+	_messageStr += body;
+	syncContentLength();   // keep Content-Length honest (the 777-bug class)
+	reparse();
+}
+
 std::string SipMessage::toString() const
 {
 	return _messageStr;
@@ -543,6 +613,77 @@ std::string_view SipMessage::getCallID() const
 std::string_view SipMessage::getCSeq() const
 {
 	return _cSeq;
+}
+
+std::string_view SipMessage::getViaBranch() const
+{
+	auto pos = _via.find("branch=");
+	if (pos == std::string_view::npos) return {};
+	pos += 7;
+	auto end = _via.find(';', pos);
+	if (end == std::string_view::npos) end = _via.size();
+	return _via.substr(pos, end - pos);
+}
+
+std::string_view SipMessage::getCSeqMethod() const
+{
+	auto sp = _cSeq.rfind(' ');
+	if (sp == std::string_view::npos) return {};
+	auto method = _cSeq.substr(sp + 1);
+	while (!method.empty() && (method.back() == ' ' || method.back() == '\r' || method.back() == '\n'))
+		method.remove_suffix(1);
+	return method;
+}
+
+uint32_t SipMessage::getSessionExpiresSecs() const
+{
+	size_t sep = _messageStr.find("\r\n\r\n");
+	size_t limit = (sep != std::string::npos) ? sep : _messageStr.size();
+	std::string_view hdrs(_messageStr.data(), limit);
+	size_t pos = hdrs.find("Session-Expires:");
+	if (pos == std::string_view::npos) pos = hdrs.find("session-expires:");
+	if (pos == std::string_view::npos) return 0;
+	pos += 16; // len("Session-Expires:")
+	while (pos < limit && (hdrs[pos] == ' ' || hdrs[pos] == '\t')) ++pos;
+	uint32_t v = 0;
+	while (pos < limit && hdrs[pos] >= '0' && hdrs[pos] <= '9')
+		v = v * 10 + static_cast<uint32_t>(hdrs[pos++] - '0');
+	return v;
+}
+
+std::string_view SipMessage::getSessionExpiresRefresher() const
+{
+	size_t sep = _messageStr.find("\r\n\r\n");
+	size_t limit = (sep != std::string::npos) ? sep : _messageStr.size();
+	std::string_view hdrs(_messageStr.data(), limit);
+	size_t pos = hdrs.find("Session-Expires:");
+	if (pos == std::string_view::npos) pos = hdrs.find("session-expires:");
+	if (pos == std::string_view::npos) return {};
+	size_t eol = hdrs.find("\r\n", pos);
+	if (eol == std::string_view::npos) eol = limit;
+	std::string_view line = hdrs.substr(pos, eol - pos);
+	size_t rp = line.find("refresher=");
+	if (rp == std::string_view::npos) return {};
+	size_t vs = rp + 10;
+	size_t ve = line.find_first_of("; \t\r\n", vs);
+	if (ve == std::string_view::npos) ve = line.size();
+	return line.substr(vs, ve - vs);
+}
+
+uint32_t SipMessage::getMinSESecs() const
+{
+	size_t sep = _messageStr.find("\r\n\r\n");
+	size_t limit = (sep != std::string::npos) ? sep : _messageStr.size();
+	std::string_view hdrs(_messageStr.data(), limit);
+	size_t pos = hdrs.find("Min-SE:");
+	if (pos == std::string_view::npos) pos = hdrs.find("min-se:");
+	if (pos == std::string_view::npos) return 0;
+	pos += 7; // len("Min-SE:")
+	while (pos < limit && (hdrs[pos] == ' ' || hdrs[pos] == '\t')) ++pos;
+	uint32_t v = 0;
+	while (pos < limit && hdrs[pos] >= '0' && hdrs[pos] <= '9')
+		v = v * 10 + static_cast<uint32_t>(hdrs[pos++] - '0');
+	return v;
 }
 
 std::string_view SipMessage::getContact() const

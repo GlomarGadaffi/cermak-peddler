@@ -1,7 +1,7 @@
 #ifndef SIP_MESSAGE_HPP
 #define SIP_MESSAGE_HPP
 
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+#if defined(ESP_PLATFORM) || defined(ESP32)
 #include <lwip/sockets.h>
 #undef INADDR_NONE
 #elif defined(__linux__)
@@ -30,7 +30,8 @@ public:
 	SipMessage(const SipMessage& other);
 	SipMessage& operator=(const SipMessage& other);
 
-	void setType(std::string value);
+	// setType() removed (audit #68): dead, and conflated a header-relative offset
+	// with a replace() length. Use setHeader() to rewrite the full start line.
 	void setHeader(std::string value);
 	void setVia(std::string value);
 	void setFrom(std::string value);
@@ -42,6 +43,14 @@ public:
 	void addHeader(const std::string& name, const std::string& value);
 	void enforceG711();
 	void clearBody();
+
+	// The message body — everything after the header/body separator (the SDP for
+	// an INVITE/200 OK), or empty when there is none. The view is valid until the
+	// next mutation of this message. setBody() replaces the body and resyncs
+	// Content-Length; used by the call-park retrieve path to swap each leg's SDP
+	// onto the opposite dialog so media renegotiates peer-to-peer.
+	std::string_view getBody() const;
+	void setBody(const std::string& body);
 
 	// Recompute the Content-Length header from the actual body byte count and
 	// rewrite it in place (preserving the full/compact header-name form). Call
@@ -59,6 +68,12 @@ public:
 	std::string_view getToNumber() const;
 	std::string_view getCallID() const;
 	std::string_view getCSeq() const;
+	std::string_view getViaBranch() const;   // branch= param extracted from Via header
+	std::string_view getCSeqMethod() const;  // method token extracted from CSeq header
+	// RFC 4028 session timer headers (0 / empty when header absent).
+	uint32_t         getSessionExpiresSecs() const;
+	std::string_view getSessionExpiresRefresher() const; // "uac", "uas", or empty
+	uint32_t         getMinSESecs() const;
 	std::string_view getContact() const;
 	std::string_view getContactNumber() const;
 	std::string_view getContentLength() const;
@@ -67,6 +82,14 @@ public:
 	std::string_view getAuthorization() const;
 	sockaddr_in getSource() const;
 	std::optional<PocketDial::SipStatusInfo> getStatusInfo() const { return _statusInfo; }
+
+	// SDP media-direction attribute (RFC 4566 / RFC 3264): the line-anchored
+	// a=sendrecv / a=sendonly / a=recvonly / a=inactive attribute in the message
+	// body. Returns None when there is no body or no direction attribute (RFC
+	// 3264: an absent attribute implies sendrecv — the caller decides; we only
+	// report what is on the wire). Pure string scan, host-compilable.
+	enum class SdpDirection { None, SendRecv, SendOnly, RecvOnly, Inactive };
+	SdpDirection getSdpDirection() const;
 
 	// Issue #42: virtual SDP probe replaces dynamic_cast so call setup works
 	// on the Arduino ESP32 toolchain, which builds with RTTI disabled (-fno-rtti).

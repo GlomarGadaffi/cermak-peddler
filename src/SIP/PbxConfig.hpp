@@ -135,6 +135,39 @@ namespace pbx
 		}
 		return out;
 	}
+
+	// ── Paging zones (the 980–989 virtual extensions) ─────────────────────────
+
+	// One paging zone: an unordered member set (stored as a deduped, capped list).
+	// A dial of the zone extension forks an intercom (auto-answer) INVITE to every
+	// registered member — exactly the 999 all-page machinery, scoped to the zone.
+	struct PageZone
+	{
+		std::vector<std::string> members;
+	};
+
+	// True iff `ext` is in the reserved paging-zone dial range 980–989. Pure, so
+	// the routing predicate is unit-testable without linking the registrar.
+	inline bool isPageZoneExt(const std::string& ext)
+	{
+		return ext.size() == 3 && ext[0] == '9' && ext[1] == '8' &&
+			std::isdigit(static_cast<unsigned char>(ext[2]));
+	}
+
+	// Split a zone member list (same CSV grammar as splitMembers), then dedupe
+	// (first occurrence wins, order preserved) and clamp to POCKETDIAL_ZONE_MEMBER_CAP.
+	inline std::vector<std::string> splitZoneMembers(const std::string& csv)
+	{
+		std::vector<std::string> out;
+		for (auto& m : splitMembers(csv))
+		{
+			if (out.size() >= static_cast<size_t>(POCKETDIAL_ZONE_MEMBER_CAP))
+				break;
+			if (std::find(out.begin(), out.end(), m) == out.end())
+				out.push_back(m);
+		}
+		return out;
+	}
 }
 
 #endif

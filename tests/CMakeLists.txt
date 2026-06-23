@@ -29,8 +29,11 @@ add_executable(sip_parser_tests
     SipDigest_test.cpp
     ArpLookup_test.cpp
     Pbx_test.cpp
+    PageZone_test.cpp
     Rtp_test.cpp
     RtpReceiver_test.cpp
+    PlayoutBuffer_test.cpp
+    AnchorClient_test.cpp
     Tui_test.cpp
     # The ANSI sysop-terminal renderer is transport-agnostic and host-compilable
     # (no wolfSSH, no ESP — only an esp_timer guard, behind ESP_PLATFORM). It links
@@ -61,6 +64,12 @@ add_executable(sip_parser_tests
     # !ESP_PLATFORM so the µ-law decode + RTP-parse helpers and the single-stream
     # cap are unit-testable on the desktop build (see RtpReceiver_test.cpp).
     ../src/SIP/RtpReceiver.cpp
+    # Adaptive jitter buffer used by AnchorClient implementations. Pure C++17;
+    # no ESP/socket dependencies. Exercises write/read/overrun/underrun paths.
+    ../src/SIP/PlayoutBuffer.cpp
+    # AnchorClient reference implementation. Pure loopback (no network); exercises
+    # the AnchorClient contract: init/start/makeCall/audio/drop/stop lifecycle.
+    ../src/SIP/LoopbackAnchorClient.cpp
     ../src/SIP/RequestsHandler.cpp
     ../src/SIP/SipSdpMessage.cpp
     ../src/SIP/SipClient.cpp
