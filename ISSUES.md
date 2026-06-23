@@ -6,6 +6,28 @@ This document serves as the active issue tracker and architectural roadmap for *
 
 ## Active Issues & Backlog Roadmap
 
+### 🟡 Issue #69: Hold/resume on broadcast (ring-group) calls is not yet supported
+* **Status**: ⏳ Open / Planned
+* **Labels**: `bug`, `hold-resume`, `broadcast`
+* **Severity**: Medium
+
+#### Description
+When a phone in a ring-group (or 999 broadcast) call sends a re-INVITE to hold, the
+200 OK answer from the peer is silently discarded. The hold relay block in `onOk` is
+correctly guarded by `!isBroadcast()` to avoid looping, but there is no equivalent
+broadcast-aware relay path. As a result the phone's hold request is never forwarded, the
+re-INVITE transaction times out after 32 s (Timer D), and the phone treats hold as
+failed. Unicast hold/resume is unaffected.
+
+**Root cause (found by code review):** `onOk`'s broadcast first-answer block was guarded
+by `state != Connected`, which is also true for `Held` — so a re-INVITE 200 OK re-ran
+the connect path, overwrote the established dest, and sent CANCEL to already-gone targets.
+Fixed in this release: the guard now requires `state == Invited` so only a genuine first
+answer triggers the connect path. The 200 OK is now discarded (better than the previous
+destructive behaviour). A full relay path for broadcast hold/resume is tracked here.
+
+---
+
 ### 🟡 Issue #68: Smoke-test call parking on real hardware
 * **Status**: ⏳ Open / Planned
 * **Labels**: `hardware-testing`, `parking`
@@ -114,6 +136,113 @@ template for real connector implementations.
 ---
 
 ## Resolved Issues
+
+### 🟢 Issue #73: `Held` state CDR-logged as Failed with zero duration
+* **Status**: ✅ Resolved (sip-backport)
+* **Labels**: `bug`, `cdr`, `hold-resume`
+
+#### Resolution
+`recordCdr()` switch did not handle `Session::State::Held`; it fell to `default: Failed`
+with `durationSec = 0`. Any call torn down while on hold (e.g. session-timer expiry,
+`sweepSessionTimers`) produced a zero-duration Failed CDR record even for calls that had
+been answered and talked for minutes. Fixed by adding `Held` to the `Connected`/`Bye`
+`CdrResult::Answered` case, which also computes talk time from `_startTime` (preserved
+across hold/resume by the `prev == Held` guard in `Session::setState`).
+
+---
+
+### 🟢 Issue #72: `sweepSessionTimers` sends malformed BYE when dialog-To header is empty
+* **Status**: ✅ Resolved (sip-backport)
+* **Labels**: `bug`, `session-timers`, `sip`
+
+#### Resolution
+Both BYE guards in `sweepSessionTimers` checked only `!dFrom.empty()`. If `dTo` was
+empty (possible when `armSessionTimer` was called from `onReinvite` before dialog headers
+were fully captured by `onOk`), `buildServerBye` received an empty `toHeader`, producing
+a `To: \r\n` line that phones drop as malformed. The session then re-fired malformed BYEs
+on every sweep tick without ever freeing the slot. Fixed by requiring `!dTo.empty()` on
+both guards before building either BYE.
+
+---
+
+### 🟢 Issue #71: `onParkInvite` retrieve path cleared the park slot before checking session-pool availability
+* **Status**: ✅ Resolved (sip-backport)
+* **Labels**: `bug`, `parking`, `reliability`
+
+#### Resolution
+The retrieve path sent the re-INVITE to the parked party and pushed the Call-ID to
+`_parkPendingAcks` before calling `allocateSession` for the retriever. If the session
+pool was exhausted, `allocateSession` returned nullptr and the `slot = ParkSlot{}` clear
+ran unconditionally, leaving a live untracked parked dialog: the parked phone answered the
+re-INVITE, an ACK was sent, but there was no retriever session, so all subsequent BYEs
+returned 481 and CDR was never recorded. Fixed by allocating the retriever session first;
+on failure a `503 Service Unavailable` is returned and the slot is left intact. The 200 OK
+and re-INVITE are sent only after a successful allocation.
+
+---
+
+### 🟢 Issue #70: tick()-originated INVITE forks had no RFC 3261 §17 retransmit coverage
+* **Status**: ✅ Resolved (sip-backport)
+* **Labels**: `bug`, `transaction-layer`, `reliability`
+
+#### Resolution
+The `registerTx` outbox scan (which registers outgoing INVITEs for Timer A/B retransmit)
+existed only in `handle()`. `tick()` populates `_outbox` with new INVITEs via
+`parkSweep()` → `startParkRingback()`, `huntRingNext()` → `buildInviteFork()`, and
+`redirectInvite()` → `buildInviteFork()`, but had no equivalent scan — all three paths
+sent INVITEs fire-and-forget with no retransmit. On a lossy link (Wi-Fi, cross-VLAN)
+these silently fail: park ring-back never reaches the parker, CFNA redirect never arrives,
+hunt-group next-ring never rings the next member. Fixed by adding the same `classifyTxType`
+/ `registerTx` scan loop in `tick()` before the outbox drain.
+
+---
+
+### 🟢 Issue #69b (fix): Broadcast re-INVITE hold re-triggered the first-answer connect path
+* **Status**: ✅ Resolved (sip-backport, part of #69 fix)
+* **Labels**: `bug`, `hold-resume`, `broadcast`
+
+#### Resolution
+`onOk`'s broadcast first-answer block was guarded by
+`session.value()->getState() != Session::State::Connected`. After `onReinvite()` set state
+to `Held`, the condition was true and the block executed: it overwrote the established
+dest with `setDest(answeringClient)`, forced state back to `Connected`, and sent CANCEL to
+already-gone pending targets. The hold 200 OK was forwarded as if it were a fresh call
+answer; no ACK was sent to the answering phone; Timer D fired 32 s later. Fixed by
+changing the guard to `state == Session::State::Invited` so the first-answer path only
+fires for a genuine new answer from a pending fork.
+
+---
+
+### 🟢 Issue #68b (fix): `sendParkReinvite` emitted Call-ID without mandatory header name
+* **Status**: ✅ Resolved (sip-backport, found during #68 code review)
+* **Labels**: `bug`, `parking`, `sip`
+
+#### Resolution
+The retrieve re-INVITE assembled by `sendParkReinvite` emitted `slot.callID` as a bare
+line with no `"Call-ID: "` label (e.g. `abc123@192.168.1.1\r\n`), violating RFC 3261
+§20.8 which requires Call-ID in every request. The parked phone received an invalid SIP
+request and rejected it with 400 or dropped it silently, stranding the parked dialog even
+though the retriever had already been answered with 200 OK. Fixed by prepending `"Call-ID: "`.
+
+---
+
+### 🟢 Issue #67b (fix): `getPrimaryLocalIP()` called inside `_mutex` across 7 new functions
+* **Status**: ✅ Resolved (sip-backport, found during #67 code review)
+* **Labels**: `bug`, `performance`, `concurrency`
+
+#### Resolution
+`onReinvite`, `onUpdate`, `buildDialogNotify`, `sendParkReinvite`, `startParkRingback`,
+`handleParkOk`, and `handleTransferOk` all called `getPrimaryLocalIP()` while holding
+`_mutex` inside `handle()` or `tick()`. `getPrimaryLocalIP()` performs a
+`socket`/`connect`/`getsockname`/`close` syscall chain (plus `WSAStartup`/`WSACleanup`
+on Windows), violating CLAUDE.md's "no blocking I/O under the registrar lock" rule. The
+same functions also constructed `std::ostringstream` objects (heap allocation) in the
+hot path, violating the "zero heap in the packet hot path" rule. Fixed by resolving the
+local IP once at construction time into `_localIp` and replacing all
+`(_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp` expressions with `_localIp`
+throughout `RequestsHandler.cpp`.
+
+---
 
 ### 🟢 Issue #48: `RequestsHandler` Mutex Lock Contention under Status Polling
 * **Status**: ✅ Resolved (v1.3.0 / `32166b5` & `f09a98c`)

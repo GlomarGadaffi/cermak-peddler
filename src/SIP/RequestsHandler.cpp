@@ -63,6 +63,7 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	OnHandledEvent onHandledEvent) :
 	_onHandled(onHandledEvent),
 	_serverIp(std::move(serverIp)),
+	_localIp(_serverIp == "0.0.0.0" ? getPrimaryLocalIP() : _serverIp),
 	_serverPort(serverPort)
 {
 	initHandlers();
@@ -259,7 +260,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 			{
 				auto infoOk = getMessageFromPool(request->toString(), request->getSource());
 				infoOk->setHeader(SipMessageTypes::OK);
-				std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+				std::string activeIp = _localIp;
 				infoOk->setVia(std::string(request->getVia()) + ";received=" + activeIp);
 				_outbox.emplace_back(request->getSource(), std::move(infoOk));
 			}
@@ -334,7 +335,7 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader("SIP/2.0 400 Bad Request");
 		response->clearBody();
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
@@ -414,7 +415,7 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 			auto response = getMessageFromPool(data->toString(), data->getSource());
 			response->setHeader("SIP/2.0 503 Service Unavailable");
 			response->clearBody();
-			std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+			std::string activeIp = _localIp;
 			response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 			_outbox.emplace_back(data->getSource(), std::move(response));
 			return;
@@ -423,7 +424,7 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 
 	auto response = getMessageFromPool(data->toString(), data->getSource());
 	response->setHeader(SipMessageTypes::OK);
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	// Echo the granted lease back in the Contact so the client knows when to refresh.
@@ -435,7 +436,7 @@ void RequestsHandler::onOptions(std::shared_ptr<SipMessage> data)
 {
 	auto response = getMessageFromPool(data->toString(), data->getSource());
 	response->setHeader(SipMessageTypes::OK);
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	response->setContact(buildContact(data->getFromNumber()));
@@ -484,7 +485,7 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 		auto session = getSession(data->getCallID());
 		if (session.has_value())
 		{
-			std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+			std::string activeIp = _localIp;
 			std::string serverIpPort = activeIp + ":" + std::to_string(_serverPort);
 			std::string originalCSeq(data->getCSeq());
 			size_t invitePos = originalCSeq.find("INVITE");
@@ -557,7 +558,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader("SIP/2.0 400 Bad Request");
 		response->clearBody();
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
@@ -570,7 +571,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader("SIP/2.0 403 Forbidden");
 		response->clearBody();
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
@@ -583,7 +584,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		auto ringing = getMessageFromPool(data->toString(), data->getSource());
 		ringing->setHeader("SIP/2.0 180 Ringing");
 		ringing->clearBody();
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		ringing->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		std::string toTag = IDGen::GenerateID(9);
 		ringing->setTo(std::string(data->getTo()) + ";tag=" + toTag);
@@ -751,7 +752,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		auto ringing = getMessageFromPool(data->toString(), data->getSource());
 		ringing->setHeader("SIP/2.0 180 Ringing");
 		ringing->clearBody();
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		ringing->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		ringing->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 		ringing->setContact(buildContact(destNumber));
@@ -785,7 +786,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader("SIP/2.0 480 Temporarily Unavailable");
 		response->clearBody();
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		response->setContact(buildContact(caller.value()->getNumber()));
 		endHandle(data->getFromNumber(), response);
@@ -923,7 +924,7 @@ bool RequestsHandler::parseCallerRtp(const std::shared_ptr<SipMessage>& invite,
 void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 	const std::shared_ptr<SipClient>& caller)
 {
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 
 	// Single-stream cap: a 2nd dial of 440 while a stream is live is rejected so the
 	// one media slot/socket/task is never double-booked (degrade gracefully).
@@ -1166,7 +1167,7 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 	{
 		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader(SipMessageTypes::OK);
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		endCall(data->getCallID(), data->getFromNumber(), destNumber);
@@ -1180,7 +1181,7 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		_rtpSender.stop(std::string(data->getCallID()));
 		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader(SipMessageTypes::OK);
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		endCall(data->getCallID(), data->getFromNumber(), destNumber);
@@ -1191,7 +1192,7 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 	{
 		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader(SipMessageTypes::OK);
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 
@@ -1314,7 +1315,13 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 
 			if (session.value()->isBroadcast())
 			{
-				if (session.value()->getState() != Session::State::Connected)
+				// Only the first answer from a pending fork (Invited state) should run
+				// the connect path. A re-INVITE 200 OK from an already-connected or held
+				// broadcast call (Held / Connected state) falls through to a silent drop
+				// below — the peer relay above was already skipped by !isBroadcast(), so
+				// the hold/resume path for broadcast calls is currently unsupported and
+				// the 200 OK is discarded (the hold stays in place). (#69)
+				if (session.value()->getState() == Session::State::Invited)
 				{
 					auto clientOpt = findClientByAddress(data->getSource());
 					if (!clientOpt.has_value())
@@ -1451,7 +1458,7 @@ void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 		if (answeringClient)
 		{
 			auto ackFork = getMessageFromPool(data->toString(), data->getSource());
-			std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+			std::string activeIp = _localIp;
 			std::string serverIpPort = activeIp + ":" + std::to_string(_serverPort);
 
 			char ipBuf[INET_ADDRSTRLEN]{};
@@ -1515,7 +1522,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader("SIP/2.0 403 Forbidden");
 		response->clearBody();
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
@@ -1558,7 +1565,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader(SipMessageTypes::BAD_REQUEST);
 		response->clearBody();
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
@@ -1569,7 +1576,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		auto accepted = getMessageFromPool(data->toString(), data->getSource());
 		accepted->setHeader(SipMessageTypes::ACCEPTED);
 		accepted->clearBody();
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		accepted->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		accepted->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 		_outbox.emplace_back(data->getSource(), std::move(accepted));
@@ -1615,7 +1622,7 @@ void RequestsHandler::onMessage(std::shared_ptr<SipMessage> data)
 	auto response = getMessageFromPool(data->toString(), data->getSource());
 	response->setHeader(SipMessageTypes::OK);
 	response->clearBody();
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	_outbox.emplace_back(data->getSource(), std::move(response));
@@ -1629,7 +1636,7 @@ void RequestsHandler::buildInviteFork(const std::shared_ptr<SipMessage>& invite,
 	auto inviteFork = getMessageFromPool(invite->toString(), invite->getSource());
 	inviteFork->setContact(buildContact(caller->getNumber()));
 
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	char ipBuf[INET_ADDRSTRLEN]{};
 	inet_ntop(AF_INET, &target->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
 	std::string targetIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(target->getAddress().sin_port));
@@ -1681,7 +1688,7 @@ void RequestsHandler::startBroadcastFork(std::shared_ptr<SipMessage> invite,
 	auto ringing = getMessageFromPool(invite->toString(), invite->getSource());
 	ringing->setHeader("SIP/2.0 180 Ringing");
 	ringing->clearBody();
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	ringing->setVia(std::string(invite->getVia()) + ";received=" + activeIp);
 	ringing->setTo(std::string(invite->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	ringing->setContact(buildContact(contactExt));
@@ -1775,7 +1782,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildReferNotify(const std::shared_
 {
 	// RFC 3515 §2.4.5 NOTIFY: Event: refer + message/sipfrag body reporting the
 	// transfer result. Sent within the REFER's dialog back to the transferor.
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	char ipBuf[INET_ADDRSTRLEN]{};
 	inet_ntop(AF_INET, &transferor->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
 	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(transferor->getAddress().sin_port));
@@ -1810,7 +1817,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildCancel(const std::shared_ptr<S
 	// Build a CANCEL for an outstanding forked INVITE leg toward `target`, derived
 	// from the original INVITE (same Call-ID / branch). Mirrors the inline CANCEL
 	// construction used by onCancel()/onOk() for the 999 path.
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	std::string serverIpPort = activeIp + ":" + std::to_string(_serverPort);
 
 	auto cancelMsg = getMessageFromPool(invite->toString(), invite->getSource());
@@ -1928,6 +1935,7 @@ void RequestsHandler::recordCdr(const std::shared_ptr<Session>& session,
 			// the later Bye transition does NOT touch it, so getStartTime() still marks
 			// the answer instant in both cases — talk time is now - startTime.
 			case Session::State::Connected:
+			case Session::State::Held:   // call torn down mid-hold → still Answered (#73)
 			case Session::State::Bye:
 				result = CdrResult::Answered;
 				{
@@ -2137,7 +2145,7 @@ void RequestsHandler::endHandle(std::string_view destNumber, std::shared_ptr<Sip
 
 std::string RequestsHandler::buildContact(std::string_view number) const
 {
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	return "Contact: <sip:" + std::string(number) + "@" + activeIp + ":" + std::to_string(_serverPort) + ";transport=UDP>";
 }
 
@@ -2652,7 +2660,7 @@ void RequestsHandler::sendChallenge(const std::shared_ptr<SipMessage>& data, boo
 	auto response = getMessageFromPool(data->toString(), data->getSource());
 	response->setHeader("SIP/2.0 401 Unauthorized");
 	response->clearBody();
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	// Fresh stateless nonce per challenge; realm MUST match SipSecretStore::kRealm.
@@ -2668,7 +2676,7 @@ void RequestsHandler::sendForbidden(const std::shared_ptr<SipMessage>& data, con
 	auto response = getMessageFromPool(data->toString(), data->getSource());
 	response->setHeader("SIP/2.0 403 " + reason);
 	response->clearBody();
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 	response->syncContentLength();
 	_outbox.emplace_back(data->getSource(), std::move(response));
@@ -2809,7 +2817,7 @@ bool RequestsHandler::sendMessageTo(const std::string& ext, const std::string& t
 		inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf));
 		std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(addr.sin_port));
 
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 
 		std::string callId  = IDGen::GenerateID(16) + "@" + activeIp;
@@ -3091,6 +3099,16 @@ void RequestsHandler::tick()
 			_snapshot = std::move(nextSnapshot);
 		}
 
+		// RFC 3261 §17: register any new outgoing INVITEs for retransmit (mirrors
+		// the same scan in handle()). tick()-originated INVITE forks (park ring-back,
+		// hunt-group next-ring, CFNA redirect) need Timer A/B coverage too. (#70)
+		for (const auto& [addr, msg] : _outbox)
+		{
+			auto txType = classifyTxType(msg);
+			if (txType != SipTransaction::Type::None)
+				registerTx(txType, addr, msg);
+		}
+
 		localOutbox = std::move(_outbox);
 		_outbox.clear();
 
@@ -3132,7 +3150,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_
 	inet_ntop(AF_INET, &client->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
 	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(client->getAddress().sin_port));
 
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 
 	std::string callId = IDGen::GenerateID(16) + "@" + activeIp;
@@ -3202,7 +3220,7 @@ void RequestsHandler::sendRegisterBeep(const std::shared_ptr<SipClient>& phone)
 	inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf));
 	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(addr.sin_port));
 
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 
 	std::string callId  = IDGen::GenerateID(16) + "@" + activeIp;
@@ -3274,7 +3292,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildBeepAck(const std::shared_ptr<
 	inet_ntop(AF_INET, &bd->addr.sin_addr, ipBuf, sizeof(ipBuf));
 	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(bd->addr.sin_port));
 
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 
 	std::ostringstream ss;
@@ -3304,7 +3322,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildBeepBye(const std::shared_ptr<
 	inet_ntop(AF_INET, &bd->addr.sin_addr, ipBuf, sizeof(ipBuf));
 	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(bd->addr.sin_port));
 
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 	std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
 
@@ -3336,7 +3354,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildBeepCancel(std::size_t slot)
 	inet_ntop(AF_INET, &bd.addr.sin_addr, ipBuf, sizeof(ipBuf));
 	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(bd.addr.sin_port));
 
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 
 	std::ostringstream ss;
@@ -4014,7 +4032,7 @@ void RequestsHandler::onDtmfInfo(std::shared_ptr<SipMessage> data)
 		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader("SIP/2.0 403 Forbidden");
 		response->clearBody();
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		accum.digits.clear();
@@ -4214,7 +4232,7 @@ void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
 		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader("SIP/2.0 488 Not Acceptable Here");
 		response->clearBody();
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
@@ -4279,7 +4297,7 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 		return;
 	}
 	auto session = sessionOpt.value();
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 
 	if (!data->hasSdp())
 	{
@@ -4479,7 +4497,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildDialogNotify(DialogSubscriptio
 	const std::string& state, const std::string& direction, const std::string& dialogId,
 	bool terminated, const char* termReason)
 {
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 	char ipBuf[INET_ADDRSTRLEN]{};
 	inet_ntop(AF_INET, &sub.addr.sin_addr, ipBuf, sizeof(ipBuf));
@@ -4531,7 +4549,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildDialogNotify(DialogSubscriptio
 
 void RequestsHandler::onSubscribe(std::shared_ptr<SipMessage> data)
 {
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 
 	// 1. Event-package gate: only the RFC 4235 "dialog" package is implemented.
 	std::string pkg = parseEventPackage(data->toString());
@@ -4857,12 +4875,16 @@ void RequestsHandler::sweepSessionTimers(std::chrono::steady_clock::time_point n
 		const std::string& dFrom = session->getDialogFrom();
 		const std::string& dTo   = session->getDialogTo();
 
-		if (src && !dFrom.empty())
+		// Guard on both dialog headers: a BYE with an empty From or To is malformed
+		// and phones will drop it, leaving the session alive and re-firing every sweep
+		// tick. dTo can be empty if armSessionTimer was invoked before the 200 OK set
+		// dialog headers (e.g. a partial onReinvite path). (#72)
+		if (src && !dFrom.empty() && !dTo.empty())
 		{
 			auto b = buildServerBye(src->getNumber(), src->getAddress(), callID, dTo, dFrom);
 			if (b) _outbox.emplace_back(src->getAddress(), std::move(b));
 		}
-		if (dest && !dFrom.empty())
+		if (dest && !dFrom.empty() && !dTo.empty())
 		{
 			auto b = buildServerBye(dest->getNumber(), dest->getAddress(), callID, dFrom, dTo);
 			if (b) _outbox.emplace_back(dest->getAddress(), std::move(b));
@@ -4970,7 +4992,7 @@ void RequestsHandler::onParkInvite(std::shared_ptr<SipMessage> data,
 		return;
 	}
 	ParkSlot& slot = _parkSlots[orbitIdx];
-	const std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	const std::string activeIp = _localIp;
 	const std::string orbit = "70" + std::to_string(orbitIdx);
 	const std::string toTag = IDGen::GenerateID(9);
 
@@ -5022,8 +5044,24 @@ void RequestsHandler::onParkInvite(std::shared_ptr<SipMessage> data,
 	}
 
 	// ── RETRIEVE ── the orbit is occupied: SDP-swap retrieve.
+	// Allocate the retriever session FIRST (#71): if the pool is exhausted we 503
+	// the retriever and leave the slot intact rather than sending a re-INVITE to
+	// the parked party and then having no session to track the bridge.
 	const std::string parkedSdp(slot.parkedSdp);
 	const std::string retrieverSdp(data->getBody());
+
+	auto virt = allocateVirtualPeer(slot.parkedExt, slot.parkedAddr);
+	auto rsession = allocateSession(std::string(data->getCallID()), caller);
+	if (!rsession)
+	{
+		auto resp = getMessageFromPool(data->toString(), data->getSource());
+		resp->setHeader("SIP/2.0 503 Service Unavailable");
+		resp->clearBody();
+		resp->syncContentLength();
+		_outbox.emplace_back(data->getSource(), std::move(resp));
+		queueLog("Park: retrieve rejected — session pool exhausted", true);
+		return;
+	}
 
 	auto ok = getMessageFromPool(data->toString(), data->getSource());
 	ok->setHeader(SipMessageTypes::OK);
@@ -5035,22 +5073,18 @@ void RequestsHandler::onParkInvite(std::shared_ptr<SipMessage> data,
 	ok->syncContentLength();
 	_outbox.emplace_back(data->getSource(), ok);
 
-	sendParkReinvite(slot, retrieverSdp);
+	rsession->setDest(virt);
+	rsession->setPeerCallID(slot.callID);
+	rsession->setLocalTag(toTag);
+	rsession->setInviteMessage(data);
+	_sessions.emplace(std::string(data->getCallID()), rsession);
+	rsession->setState(Session::State::Connected);
 
-	auto virt = allocateVirtualPeer(slot.parkedExt, slot.parkedAddr);
-	if (auto rsession = allocateSession(std::string(data->getCallID()), caller))
-	{
-		rsession->setDest(virt);
-		rsession->setPeerCallID(slot.callID);
-		rsession->setLocalTag(toTag);
-		rsession->setInviteMessage(data);
-		_sessions.emplace(std::string(data->getCallID()), rsession);
-		rsession->setState(Session::State::Connected);
-	}
 	if (auto parked = getSession(slot.callID); parked.has_value())
 	{
 		parked.value()->setPeerCallID(std::string(data->getCallID()));
 	}
+	sendParkReinvite(slot, retrieverSdp);
 	queueLog("Park: " + caller->getNumber() + " retrieved " + slot.parkedExt + " from " + orbit);
 
 	slot = ParkSlot{};
@@ -5060,7 +5094,7 @@ void RequestsHandler::onParkInvite(std::shared_ptr<SipMessage> data,
 void RequestsHandler::sendParkReinvite(ParkSlot& slot, const std::string& sdp)
 {
 	if (slot.callID.empty() || !slot.parked) return;
-	const std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	const std::string activeIp = _localIp;
 	const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 
 	char ipBuf[INET_ADDRSTRLEN]{};
@@ -5076,7 +5110,7 @@ void RequestsHandler::sendParkReinvite(ParkSlot& slot, const std::string& sdp)
 	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
 	   << "From: <sip:" << slot.orbit << "@" << srcIpPort << ">;tag=" << slot.localTag << "\r\n"
 	   << "To: <sip:" << slot.parkedExt << "@" << activeIp << ">;tag=" << theirTag << "\r\n"
-	   << slot.callID << "\r\n"
+	   << "Call-ID: " << slot.callID << "\r\n"
 	   << "CSeq: 2 INVITE\r\n"
 	   << "Max-Forwards: 70\r\n"
 	   << "Contact: <sip:" << slot.orbit << "@" << srcIpPort << ";transport=UDP>\r\n"
@@ -5096,7 +5130,7 @@ void RequestsHandler::sendParkReinvite(ParkSlot& slot, const std::string& sdp)
 void RequestsHandler::byeParkedParty(const ParkSlot& slot)
 {
 	if (slot.callID.empty()) return;
-	const std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	const std::string activeIp = _localIp;
 	const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 	const std::string fromHeader = "<sip:" + slot.orbit + "@" + srcIpPort + ">;tag=" + slot.localTag;
 	const std::string toHeader = "<sip:" + slot.parkedExt + "@" + activeIp + ">;tag=" + slot.parkedFromTag;
@@ -5109,7 +5143,7 @@ void RequestsHandler::startParkRingback(ParkSlot& slot, const std::shared_ptr<Si
 	std::chrono::steady_clock::time_point now)
 {
 	if (!parker) { byeParkedParty(slot); freeParkSlot(slot.callID); return; }
-	const std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	const std::string activeIp = _localIp;
 	const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 	const sockaddr_in& addr = parker->getAddress();
 
@@ -5157,7 +5191,7 @@ bool RequestsHandler::handleParkOk(const std::shared_ptr<SipMessage>& data)
 	if (auto it = std::find(_parkPendingAcks.begin(), _parkPendingAcks.end(), callID);
 		it != _parkPendingAcks.end())
 	{
-		const std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		const std::string activeIp = _localIp;
 		const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 		const sockaddr_in srcAddr = data->getSource();
 		char ipBuf[INET_ADDRSTRLEN]{};
@@ -5182,7 +5216,7 @@ bool RequestsHandler::handleParkOk(const std::shared_ptr<SipMessage>& data)
 	{
 		if (slot.state == ParkState::RingingBack && slot.rbCallID == callID)
 		{
-			const std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+			const std::string activeIp = _localIp;
 			const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 			char ipBuf[INET_ADDRSTRLEN]{};
 			inet_ntop(AF_INET, &slot.rbAddr.sin_addr, ipBuf, sizeof(ipBuf));
@@ -5237,7 +5271,7 @@ bool RequestsHandler::handleTransferOk(const std::shared_ptr<SipMessage>& data)
 	auto it = std::find(_transferPendingAcks.begin(), _transferPendingAcks.end(), callID);
 	if (it == _transferPendingAcks.end()) return false;
 
-	const std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	const std::string activeIp = _localIp;
 	const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 	const sockaddr_in src = data->getSource();
 	char ipBuf[INET_ADDRSTRLEN]{};
@@ -5364,7 +5398,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildServerBye(
 	const std::string& fromHeader,
 	const std::string& toHeader)
 {
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 	char ipBuf[INET_ADDRSTRLEN]{};
 	inet_ntop(AF_INET, &destAddr.sin_addr, ipBuf, sizeof(ipBuf));
