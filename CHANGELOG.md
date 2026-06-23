@@ -57,7 +57,32 @@ passing.
 - `tests/CMakeLists.txt`: added `PlayoutBuffer.cpp`, `LoopbackAnchorClient.cpp`, and
   the three new test files.
 
-### Fixed
+### Fixed (code-review pass — all confirmed during sip-backport review)
+
+- **Broadcast re-INVITE hold triggered first-answer connect path** (`onOk`): the guard
+  `state != Connected` was also true for `Held`, so a hold 200 OK re-overwrote the
+  established dest and cancelled already-gone pending targets. Changed guard to
+  `state == Invited`. (#69)
+- **tick()-originated INVITE forks had no Timer A/B coverage** (`tick()`): added the
+  same `classifyTxType`/`registerTx` outbox scan that exists in `handle()`, so park
+  ring-back, hunt-group next-ring, and CFNA redirect are all registered for RFC 3261
+  §17 retransmit. (#70)
+- **Park retrieve slot cleared on session-pool exhaustion** (`onParkInvite`): moved
+  `allocateSession` before queuing the 200 OK and sending the re-INVITE; returns 503
+  and leaves the slot intact if the pool is exhausted. (#71)
+- **`sweepSessionTimers` emitted malformed BYE when dialog-To was empty**: added
+  `!dTo.empty()` guard to both BYE paths. (#72)
+- **`Held` state CDR-logged as Failed with zero duration** (`recordCdr`): added
+  `Session::State::Held` to the `Connected`/`Bye` `CdrResult::Answered` case. (#73)
+- **`sendParkReinvite` emitted bare Call-ID token** (missing `"Call-ID: "` label):
+  single-character fix; RFC 3261 §20.8 violation — phones rejected or dropped the
+  retrieve re-INVITE. (part of #68 work)
+- **`getPrimaryLocalIP()` called under `_mutex`** in 7 new functions: resolved once at
+  construction into `_localIp`; all 20+ `(_serverIp == "0.0.0.0") ? getPrimaryLocalIP()
+  : _serverIp` sites replaced. Eliminates a socket/connect syscall from the packet hot
+  path. CLAUDE.md §"No blocking I/O under the registrar lock". (#67 follow-on)
+
+### Fixed (pre-existing)
 
 - `onBye` and `onCancel`: spoofed-teardown guard (`isDialogSourceAuthorized`).
 - `onCancel`: park-orbit CANCEL now tears down the orbit slot and refreshes the

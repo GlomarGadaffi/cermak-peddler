@@ -489,6 +489,7 @@ private:
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> _outbox;
 
 	std::string _serverIp;
+	std::string _localIp;   // resolved once at construction; avoids getPrimaryLocalIP() under _mutex
 	int         _serverPort;
 
 	std::atomic<uint64_t> _packetsProcessed{0};
