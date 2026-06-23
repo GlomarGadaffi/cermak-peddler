@@ -3,6 +3,7 @@
 #include <atomic>
 #include <sstream>
 #include <cctype>
+#include <cstring>
 #include <cstdlib>
 #include <algorithm>
 #include "SipMessageTypes.h"
