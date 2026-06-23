@@ -28,16 +28,34 @@ void Session::reset(std::string callID, std::shared_ptr<SipClient> src)
 	_huntMembers.clear();
 	_huntIndex = 0;
 	_groupExt.clear();
+	_peerCallID.clear();
+	_parkUac = false;
+	_localTag.clear();
+	_sessionExpiresSeconds = 0;
+	_isRefresher = false;
+	_nextRefresh  = {};
+	_sessionExpiry = {};
+	_dialogFrom.clear();
+	_dialogTo.clear();
+	_remoteSdp.clear();
+	_isTransferBridge = false;
 }
 
 void Session::setState(State state)
 {
 	if (state == _state)
 		return;
+	const State prev = _state;
 	_state = state;
 	if (state == State::Connected)
 	{
-		_startTime = std::chrono::steady_clock::now(); // Reset start time to when talk time begins
+		if (prev == State::Held)
+		{
+			// Hold resume inside the same dialog: keep the original connect
+			// instant so CDR talk time spans the hold.
+			return;
+		}
+		_startTime = std::chrono::steady_clock::now();
 		if (!_dest)
 		{
 			std::cerr << "Session::setState(Connected): destination not set for call " << _callID << '\n';
@@ -104,4 +122,15 @@ void Session::release()
 	_huntMembers.clear();
 	_huntIndex = 0;
 	_groupExt.clear();
+	_peerCallID.clear();
+	_parkUac = false;
+	_localTag.clear();
+	_sessionExpiresSeconds = 0;
+	_isRefresher = false;
+	_nextRefresh  = {};
+	_sessionExpiry = {};
+	_dialogFrom.clear();
+	_dialogTo.clear();
+	_remoteSdp.clear();
+	_isTransferBridge = false;
 }

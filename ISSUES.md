@@ -6,6 +6,34 @@ This document serves as the active issue tracker and architectural roadmap for *
 
 ## Active Issues & Backlog Roadmap
 
+### 🟡 Issue #68: Smoke-test call parking on real hardware
+* **Status**: ⏳ Open / Planned
+* **Labels**: `hardware-testing`, `parking`
+* **Severity**: Medium
+
+#### Description
+Park (700–709), retrieve, and ring-back paths were ported from production and pass the
+host unit suite, but need an end-to-end smoke test on real ESP32-S3 hardware with two
+registered SIP phones. Verify: (a) park INVITE gets `200 OK` with `a=inactive` hold SDP;
+(b) retrieve INVITE bridges both legs peer-to-peer; (c) ring-back fires after orbit
+timeout and re-bridges. Also verify NVS survives a reboot (pzones key).
+
+---
+
+### 🟡 Issue #67: Smoke-test BLF presence subscription on a Yealink / Polycom phone
+* **Status**: ⏳ Open / Planned
+* **Labels**: `hardware-testing`, `blf`
+* **Severity**: Medium
+
+#### Description
+SUBSCRIBE / NOTIFY (RFC 6665) and RFC 4235 dialog-info XML are implemented and compile
+cleanly. Need hardware validation: register a Yealink T4X or Polycom VVX with a BLF key
+pointed at another extension; verify the BLF LED goes idle → ringing → in-call → idle
+across a full call cycle. Also verify 489 Bad Event is returned for unsupported packages
+and that subscription expiry triggers a terminal NOTIFY.
+
+---
+
 ### 🟡 Issue #44: End-to-end SIP call test needed on JC3248W535EN hardware
 * **Status**: ⏳ Open / Planned
 * **Labels**: `hardware-testing`, `verification`
@@ -56,60 +84,32 @@ Stream live SIP UDP signaling packets directly to the CRT console landing page u
 
 ---
 
-## API Integration: 3CX Call Control Connector (Epic)
+## External Audio Connector (Epic)
 
-> **Goal**: let a pocket-dial / tincan handset place calls to **3CX extensions** over WAN by bridging pocket-dial's SIP/RTP world to 3CX's HTTP-based **Call Control API**.
->
-> **Why no SBC / NAT / STUN / TURN / ICE is needed**: the connector *terminates the handset's RTP locally* (one SIP hop, on-box) and re-originates the call into 3CX over **HTTPS, not SIP/RTP** — so there is no second SIP/RTP peer for ICE to traverse. Both legs are 8 kHz, so media is a pure companding swap (G.711 ⇄ PCM16) with **no resampling and no media server**. Over WAN this only requires a flat L3 (WireGuard/overlay or public IP) so the connector's advertised SDP address is directly reachable.
+The `AnchorClient` interface (`src/SIP/AnchorClient.hpp`) lets you bridge an active SIP
+call to any external audio system — a SIP trunk, a PSTN gateway, a recording server, or
+an AI voice pipeline. Implement `makeCall()`, `writeAudio()`, and `AudioRxCallback` in
+your subclass; the engine takes care of the SIP signaling on both legs.
 
-### Architecture Decision
-The connector is a **media-terminating SIP endpoint** that `REGISTER`s to pocketdial-desktop as an ordinary extension (e.g. `3000`, or a dialing prefix). pocket-dial's **existing** `onInvite` forward path (`RequestsHandler.cpp`) delivers the INVITE to it with **zero changes to the signaling-only server** — the registrar keeps sourcing no media. The connector mirrors the **`440` `RtpSender` beachhead**, except it:
-* answers `200 OK` with its **own** SDP carrying a real media address and `a=sendrecv` (the `440` path uses the server media port but is send-only/tone),
-* bridges audio to 3CX instead of synthesizing a tone,
-* maps SIP `BYE`/`CANCEL` ↔ 3CX participant `drop`.
+`LoopbackAnchorClient` (`src/SIP/LoopbackAnchorClient.cpp`) is the reference
+implementation: it echoes audio back to the caller and is useful as a smoke test and as a
+template for real connector implementations.
 
-**Open fork (must decide — gates the language of all sub-issues below):**
-* **(A) C++ connector binary in this repo** — new target reusing `SipMessage`/`SipSdpMessage`; needs a TLS HTTP/WS client (libcurl) for 3CX. One repo, one deploy.
-* **(B) Lean Node sidecar** — separate process on the Pi, registers as an extension; trivial 3CX HTTPS/WSS, no TLS-dep friction; pocket-dial untouched.
-
-### Reference: 3CX Call Control API (verified)
-* **License**: 3CX **Enterprise + CFD**; an API Client scoped to **Call Control Access**; a **Route Point DN** (`type Wroutepoint`) for origination.
-* **Auth**: OAuth2 `client_credentials` → `POST https://{fqdn}/connect/token` → Bearer. ⚠️ `expires_in` misreports ~60 s for a ~1 h grant — **trust the JWT `exp` claim**, and do **not** refresh early (a new token invalidates the one a live media stream is holding).
-* **Two planes** — don't confuse them: `/xapi/v1` (a.k.a. "Configuration REST API", OData, config/management only) vs **`/callcontrol`** (calls + media). This connector is entirely `/callcontrol`.
-* **Originate**: `POST /callcontrol/{dn}/makecall` (or `/callcontrol/{dn}/devices/{deviceId}/makecall` for a deterministic participant id under concurrency).
-* **Participant control**: `POST /callcontrol/{dn}/participants/{id}/{drop|answer|divert|routeto|transferto}`.
-* **Audio (bidirectional)**: `GET /callcontrol/{dn}/participants/{id}/stream` receives the party's audio; `POST` to the same path **injects** audio. Format both ways: **PCM 16-bit, 8 kHz, mono**, HTTP chunked octet-stream.
-* **Events**: `wss://{fqdn}/callcontrol/ws` (participant-updated, DTMF, etc.), each event carrying an `entity` path to `GET`. Polling `participants` at ~300 ms is a proven fallback.
-* **Codec alignment**: 3CX PCM16 @ 8 kHz ⇄ G.711 @ 8 kHz is a 256-entry lookup-table companding conversion — same rate, **no resampling**. 20 ms / 160-sample framing matches `RtpSender`.
-
-### Foundations (✅ Completed — the enabling base, branch `2.0`)
-* 🟢 **`RtpSender` media beachhead** (`119ca84`): first server-sourced RTP path — virtual ext **`440`** streams a one-way G.711 µ-law tone (PCMU PT0, 8 kHz, 20 ms) to the caller, answering with the server's **own** SDP (media port `5062`). Pure helpers `linearToUlaw` / `synthTone` / `buildRtpHeader` are platform-independent and host-unit-tested (`tests/Rtp_test.cpp`); the real socket + 20 ms FreeRTOS pacing task are ESP-only; single-stream cap (2nd dial → `486`).
-* 🟢 **Media crashloop fixes** (`b7e82d5`): `udp_receiver_task` 8→16 KB and `rtp_media_tx` 4→6 KB stacks (the new SDP/UAC chain overflowed them), plus an `HttpServer::acceptLoop` guard for `std::thread`-spawn `std::system_error` (uncaught throw was rebooting the device).
-
-### 🔵 Issue #60: 3CX Connector — Form-Factor Decision (C++ in-repo vs Node sidecar)
-* **Status**: ⏳ Open / **Blocking** (gates #61–#64)
-* **Labels**: `api-integration`, `architecture`, `decision`
-* **Description**: Choose option **(A)** or **(B)** above. Determines language, dependency surface (libcurl vs none), and whether the connector ships inside this repo or beside it on the Pi.
-
-### 🔵 Issue #61: RTP Receive Path + µ-law→PCM16 Decode (uplink)
+### 🔵 Issue #65: AnchorClient — real host UDP media transport
 * **Status**: ⏳ Open / Planned
-* **Labels**: `api-integration`, `media`, `rtp`
-* **Description**: Add the inverse of `RtpSender` — receive the handset's RTP on the media socket, strip the RTP header, decode G.711 µ-law→PCM16 (inverse of `linearToUlaw`), and feed it to the 3CX `POST /stream`. Needs a small jitter/ordering tolerance (the `440` sender path has none).
+* **Labels**: `media`, `desktop`, `rtp`
+* **Description**: `RtpSender` socket + 20 ms pacing are `#if ESP_PLATFORM`; the host
+  build stubs them out. For an AnchorClient to move real audio on a desktop/Pi host
+  deployment, implement the host (Linux/Windows) UDP socket and 20 ms pacing loop
+  alongside the ESP path. The `PlayoutBuffer` jitter buffer is already in place.
 
-### 🔵 Issue #62: Real Desktop (host) Media Transport
+### 🔵 Issue #66: AnchorClient — sample connector (SIP trunk / VoIP provider)
 * **Status**: ⏳ Open / Planned
-* **Labels**: `api-integration`, `media`, `desktop`
-* **Description**: `RtpSender`'s socket + pacing are `#if ESP_PLATFORM`; on the desktop build they are **no-op stubs** that only flip `_active`. For the connector to move audio on the Pi (`SipServer.exe`), implement the real host (Linux/Windows) UDP socket + 20 ms pacing loop alongside the ESP path.
-
-### 🔵 Issue #63: 3CX Call Control Client (token + makecall + /stream + events)
-* **Status**: ⏳ Open / Planned
-* **Labels**: `api-integration`, `3cx`, `http`
-* **Description**: Implement the 3CX leg per the Reference above — JWT-`exp` token lifecycle, `makecall` to the target extension, concurrent `GET`/`POST /stream` (chunked), and `wss /callcontrol/ws` (or 300 ms participant polling) to detect `Connected` and far-end hangup. (libcurl if option A.)
-
-### 🔵 Issue #64: Bridge Orchestration (virtual-ext intercept + leg mapping)
-* **Status**: ⏳ Open / Planned
-* **Labels**: `api-integration`, `sip`, `media`
-* **Description**: Wire it together — a virtual extension / prefix (`777`/`999`/`440`-style intercept in `onInvite`) hands the call to the connector, which answers with its own `a=sendrecv` SDP (real media addr), opens both 3CX streams, and replaces the `synthTone` frame source with audio pulled from 3CX. Map `INVITE`→`makecall`, `BYE`/`CANCEL`→participant `drop`, and 3CX far-end hangup→SIP `BYE`. Honor the no-ICE addressing rule (SDP `c=` must be a handset-reachable IP).
+* **Labels**: `api-integration`, `sip`, `documentation`
+* **Description**: Provide a sample concrete AnchorClient that connects pocket-dial to a
+  standard SIP trunk (REGISTER + INVITE/BYE using `libosip2` or raw UDP). This would let
+  pocket-dial place and receive PSTN calls without any cloud dependency. The interface is
+  already defined; this is just a worked example.
 
 ---
 

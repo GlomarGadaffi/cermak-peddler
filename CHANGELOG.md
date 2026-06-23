@@ -1,5 +1,76 @@
 # Changelog
 
+## Unreleased (sip-backport) - 2026-06-23
+
+Full SIP protocol feature backport into the engine. Build: zero errors (one
+pre-existing `inet_addr` deprecation warning on MSVC, pre-existing). Tests: all
+passing.
+
+### Added — SIP protocol
+
+- **RFC 3261 §17 transaction layer** (`RequestsHandler.cpp`): `SipTransaction` pool, Timer A
+  retransmit with exponential back-off, Timer B 32 s timeout; `sweepTransactions()` runs
+  each tick; `freeTxsForCallId()` cleans up on teardown. Outgoing INVITEs are
+  auto-registered on every `handle()` / `tick()` pass.
+- **RFC 4028 session timers** (`RequestsHandler.cpp`): `armSessionTimer()` called on call
+  connect; `sweepSessionTimers()` sends server-originated BYE to both legs on expiry.
+  Server is always refresher (UAS policy).
+- **RFC 3311 mid-dialog UPDATE** (`onUpdate()`): relay SDP-bearing UPDATE to the peer leg;
+  bodiless UPDATE responds `200 OK` and resets the session timer.
+- **RFC 3261 §12.2 mid-dialog re-INVITE** (`onReinvite()`): hold (`a=sendonly`/`inactive`)
+  sets `Session::State::Held`; resume restores `Connected`. CDR talk-time preserved across
+  hold/resume. 200 OK relay in `onOk()` via `sameAddress()` peer lookup.
+- **Call parking** (`onParkInvite`, `handleParkOk`, `parkSweep`, `startParkRingback`, …):
+  virtual orbit extensions 700–709; park with `a=inactive` hold SDP; SDP-swap retrieve;
+  ring-back on timeout with configurable orbit; bridged BYE relay on teardown.
+- **Paging zones** (`onInvite`, `findPageZone`, `setPageZone`, `getPageZones`, `persistPageZones`):
+  extensions 980–989; intercom auto-answer fork via `startBroadcastFork()`; NVS persistence
+  under key `"pzones"`; mirrored into `_snapshot.pageZones` for the dashboard.
+- **BLF / presence** (`onSubscribe`, `refreshSubscriptions`, `sweepSubscriptions`,
+  `buildDialogInfoXml`, `computeDialogState`, `buildDialogNotify`): RFC 6665 SUBSCRIBE /
+  NOTIFY with RFC 4235 dialog-info+xml body; 489 Bad Event for unsupported packages; change
+  detection on every `handle()` pass; terminal NOTIFY on subscription expiry.
+- **`isDialogSourceAuthorized()`**: rejects forged BYE / CANCEL from off-path addresses
+  (issue #46); wired into `onBye()` and `onCancel()`.
+- **`AnchorClient` interface** (`src/SIP/AnchorClient.hpp`): abstract class for external
+  audio systems; `makeCall`, `writeAudio`, `AudioRxCallback`, `dropCall`, lifecycle.
+- **`LoopbackAnchorClient`** (`src/SIP/LoopbackAnchorClient.cpp/hpp`): reference
+  implementation; echoes audio back to the caller; useful as a smoke test and as a
+  starting template for SIP trunk / recorder / AI pipeline integrations.
+- **`PlayoutBuffer`** (`src/SIP/PlayoutBuffer.cpp/hpp`): adaptive jitter buffer (200 ms
+  ceiling, comfort-noise underrun fill, overrun drop-oldest); used by AnchorClient paths.
+- **Virtual peer pool** (`_virtualPeerPool`): pre-allocated `POCKETDIAL_VIRTUAL_PEERS`
+  `SipClient` shared_ptrs; `allocateVirtualPeer()` recycles by use-count; park and BLF
+  use this pool instead of heap-allocating per-call.
+- **File-scope static helpers**: `sameAddress()`, `parkTagOf()`, `stripHeaderName()`;
+  forward-declared at top of `RequestsHandler.cpp`.
+- **`SipMessageTypes`**: `UPDATE`, `SUBSCRIBE`, `BAD_EVENT` constants.
+
+### Added — tests
+
+- `tests/PageZone_test.cpp`: `isPageZoneExt`, `splitZoneMembers`, `joinMembers`
+  round-trip and cap tests.
+- `tests/PlayoutBuffer_test.cpp`: write/read, underrun/overrun, clear, null-guard,
+  target-depth tests.
+- `tests/AnchorClient_test.cpp`: `LoopbackAnchorClient` lifecycle, `makeCall` event
+  delivery, audio loopback, `dropCall` Dropped event.
+- `tests/CMakeLists.txt`: added `PlayoutBuffer.cpp`, `LoopbackAnchorClient.cpp`, and
+  the three new test files.
+
+### Fixed
+
+- `onBye` and `onCancel`: spoofed-teardown guard (`isDialogSourceAuthorized`).
+- `onCancel`: park-orbit CANCEL now tears down the orbit slot and refreshes the
+  dashboard snapshot; paging zone CANCEL now forks correctly (was only handling `999`).
+- `onBye`: paging zone BYE now forks correctly (was only handling `999`).
+- `onOk`: `handleParkOk` / `handleTransferOk` intercepts added before the session
+  lookup; re-INVITE 200 OK relay (hold/resume) added; `setDialogHeaders` +
+  `setRemoteSdp` + `armSessionTimer` called on call connect.
+- `.gitignore`: `docs/` removed from exclusion list; `LINEAGE.md` and scratch artefacts
+  remain excluded.
+
+---
+
 ## Unreleased (fix/code-review-hardening) - 2026-06-10
 
 Code-review pass across the cross-platform SIP engine (`src/`) and all four ESP-IDF
