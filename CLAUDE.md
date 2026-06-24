@@ -96,4 +96,4 @@ Code branches on `defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)` v
 - **Hardware-verify loop:** flash `idf.py -D SIP_TRANSPORT=display -p COM4 flash`, then render the live screens through a real terminal emulator with `.smoke/ssh_tui.py <ip>` (uses `pyte` to reconstruct the 80×24 grid). A connection right after a flash can EOF once (board not ready) — just retry.
 
 ## Documentation discretion
-Keep **committed / public docs vendor-neutral**: describe the *capability* (SIP trunk, call-control API, "a commercial softswitch / CPaaS fabric"), not a specific commercial PBX/softswitch product name. The edge-gateway / upstream-trunk direction (`docs/FEATURE_ROADMAP.md` §7) follows this deliberately — vendor-specific test targets and credentials stay out of the repo.
+Keep **committed / public docs vendor-neutral and secret-free**: describe capabilities generically, and never commit credentials, vendor-specific test targets, or commercial product names. pocket-dial is a LAN-only, peer-to-peer-media PBX; upstream-trunk / PSTN / provider-connector work is out of scope here.
