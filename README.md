@@ -80,5 +80,4 @@ MIT — see [LICENSE](LICENSE).
 ## Companion projects
 
 - [pocket-dial-handset](https://github.com/GlomarGadaffi/pocket-dial-handset) — ESP32-S3 push-to-talk SIP handset that registers to pocket-dial
-- [pocket-dial-voicemail](https://github.com/GlomarGadaffi/pocket-dial-voicemail) — store-and-forward voicemail
 - [resiprocate](https://github.com/GlomarGadaffi/resiprocate) — the vendored SIP/ICE/TURN/STUN/RTP stack
