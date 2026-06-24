@@ -1,3 +1,3 @@
-# cermak-peddler
+# pocket-dial
 
 > read the code.
