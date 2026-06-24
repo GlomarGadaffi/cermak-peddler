@@ -113,6 +113,53 @@ The connector is a **media-terminating SIP endpoint** that `REGISTER`s to pocket
 
 ---
 
+## Feature-Parity Backlog (LAN PBX)
+
+Generic desk-PBX features to bring pocket-dial to parity with full-size PBXes. **All of these are
+designed to need _no_ server-side media path** — media stays peer-to-peer; the server only brokers
+signaling and tracks state. See **Non-Goals** below for the hard scope boundary.
+
+### 🔵 Issue #65: [Feature] Call Park / Park-Orbit
+* **Status**: ⏳ Open / Planned (Backlog)
+* **Labels**: `feature`, `sip`, `call-control`
+* **Description**: Park an active call to a virtual "orbit" slot (e.g. `700`–`709`): the parking phone dials a park code, its leg is held in an orbit slot, and **any** extension retrieves the call by dialing that orbit number. **Signaling-state only — no server media.** On retrieval the call re-establishes peer-to-peer RTP between the retriever and the held party, so this needs no media bridge. Reuses the existing `Session` pool and the `onInvite` virtual-extension intercept (à la `777`/`999`).
+* **Acceptance**: (1) mid-call park → caller held, orbit number announced/shown; (2) dialing the orbit from another extension connects to the held party via fresh P2P SDP O/A; (3) one `Session` slot per parked call (documented against `MAX_SESSIONS`); (4) park timeout rings back the parker; (5) double-retrieve of an orbit returns `486`.
+* **Notes**: Promotes the `FEATURE_ROADMAP.md` P1 "Call parking / park-orbit" item.
+
+### 🔵 Issue #66: [Feature] Paging Zones (multi-zone `999`)
+* **Status**: ⏳ Open / Planned (Backlog)
+* **Labels**: `feature`, `sip`, `paging`
+* **Description**: Generalize the single all-page (`999`) into named zones (e.g. `981` = floor-1) backed by a zone→members map, reusing the existing `startBroadcastFork` / `huntRingNext` forking path. Bounded zone table + per-zone member cap so message-pool use stays bounded (same discipline as the `999` page). Keeps the current fork-and-answer model — no media mixing.
+* **Acceptance**: a zone code pages only that zone's members; membership configurable via the existing ring-group API; per-zone cap enforced; heap returns to baseline after the page (Static Pool recycle, per `BENCHMARKS.md`).
+* **Notes**: Promotes `FEATURE_ROADMAP.md` P2 "Paging zones."
+
+### 🔵 Issue #67: [Feature] BLF / Presence (`SUBSCRIBE`/`NOTIFY`, dialog-info)
+* **Status**: ⏳ Open / Planned (Backlog)
+* **Labels**: `feature`, `sip`, `presence`
+* **Description**: Let desk-phone busy-lamp-field keys reflect extension/line state the server already tracks (registration + active `Session`). Implement `SUBSCRIBE`/`NOTIFY` for `dialog-info+xml` with a **bounded** subscription table and NOTIFY fan-out on state change.
+* **Acceptance**: a phone subscribed to ext X gets NOTIFY on X ringing/answered/idle; subscription table is capacity-capped; expiry refresh handled; no unbounded fan-out.
+* **Notes**: Promotes `FEATURE_ROADMAP.md` P2 "BLF / presence." Pairs with provisioning (BLF keys are provisionable).
+
+### 🔵 Issue #68: [Feature] Directed Call Pickup (pickup groups)
+* **Status**: ⏳ Open / Planned (Backlog)
+* **Labels**: `feature`, `sip`, `call-control`
+* **Description**: Answer a ringing peer's call from your own phone via a pickup code (`*8` group pickup or `**<ext>` directed). Reuses the fork/`Session` machinery and the registrar's view of in-progress INVITEs; the call lands P2P on the picker — no server media.
+* **Acceptance**: while ext A rings, ext B dials the pickup code and connects to the caller with P2P SDP; only same-pickup-group calls eligible; race with A answering resolves cleanly (one wins, other `486`/cancel).
+
+### 🔵 Issue #69: [Feature] Dial-Plan / Hunt-Group Generalization
+* **Status**: ⏳ Open / Planned (Backlog)
+* **Labels**: `feature`, `sip`, `routing`
+* **Description**: Extend the existing `ringall`/`hunt` ring groups (`setRingGroup`/`getRingGroups`) into a small **pattern → action** dial plan for LAN routing (match an extension/prefix → group ring / hunt / page zone / park orbit / pickup). Table-driven, bounded, LAN-only.
+* **Acceptance**: a configurable rule table maps dialed patterns to existing actions, evaluated in order; bounded table size.
+* **Notes**: Promotes `FEATURE_ROADMAP.md` "Dial plan / hunt groups."
+
+### ⚪ Non-Goals (hard scope boundary)
+pocket-dial stays a **LAN-only, peer-to-peer-media PBX**. The following are **out of scope** and intentionally not implemented here — every feature above is designed to need none of them:
+* **Server-side media bridging / mixing / relay** (any "media anchor" that terminates and relays or mixes RTP). All media stays phone↔phone.
+* **Upstream trunk / PSTN integration** and **third-party telephony-provider connectors**. pocket-dial does not originate or terminate external trunks.
+
+---
+
 ## Resolved Issues
 
 ### 🟢 Issue #48: `RequestsHandler` Mutex Lock Contention under Status Polling
