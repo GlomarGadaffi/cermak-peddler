@@ -1,5 +1,71 @@
 # Changelog
 
+## Unreleased (anchor-bridge-port) - 2026-06-30
+
+Lands the previously-prepared `sip-backport` branch (below) onto `main`, relicenses
+the project, and ports the vendor-agnostic media-anchor architecture and conference
+mixer from the project's commercial sibling. Build: zero errors. Tests: all passing
+(host; ESP-IDF firmware build pending verification).
+
+### License
+
+- **Relicensed MIT → Apache 2.0.** The original BarGabriel/SipServer MIT notice is
+  preserved verbatim in `LICENSE-MIT` (not erased); `NOTICE` documents the dual
+  heritage; `LICENSE` is now Apache 2.0 for everything contributed since the fork.
+  README's companion-projects link corrected to point at the actual upstream
+  (it pointed at the vendored resiprocate stack instead).
+
+### Added — vendor-agnostic anchored media (opt-in, not wired into call routing)
+
+- **`MediaBridge`** (`src/SIP/MediaBridge.cpp/hpp`): RTP↔`AnchorClient` glue. Already
+  vendor-neutral as authored (depends only on the abstract `AnchorClient` interface) —
+  ported with comment genericization only (no logic changes): stripped prose that named
+  a specific commercial transport (HTTP GET/POST stream framing, internal issue-number
+  references) in favor of generic anchor-interface language.
+- **`TelephonyProvider` / `TelephonyApiConfig`** (`src/SIP/`): provider registry/factory
+  + credential-slot table. `TelephonyProviderType` trimmed to ship only `Loopback` — no
+  unimplemented vendor enumerators. The registry pattern is the extension point for a
+  fork's own connector.
+- **`RtpSender::FrameProvider`**: additive optional pull-callback (default `nullptr`,
+  existing 440-tone callers unaffected) so `MediaBridge` can feed real audio into the
+  sender instead of the synthesized test tone. Also adds the encode-side
+  `ulawEncodeBuffer` mirror of the existing `RtpReceiver::mulawDecodeBuffer` (was
+  missing; `MediaBridge` needs it).
+- **`MixBus`** (`src/SIP/MixBus.cpp/hpp`, `mix_kernels*`, `pie/mix_sum4_s16.S`): N-way
+  conference audio mixer — int32 accumulate, saturate exactly once on output,
+  lock-free per-port attach/detach/tick lifecycle. Scalar reference is the default;
+  the ESP32-S3 PIE vector kernels are opt-in behind `POCKETDIAL_MIXBUS_PIE`. See
+  `docs/CONFERENCE_MIXER.md`. Ships standalone and tested, not yet wired into
+  `MediaBridge` (tracked: `ISSUES.md` #75) — explicitly NOT a call-routing change.
+
+### Added — tests
+
+- `tests/MediaBridge_test.cpp`: lifecycle/identity bookkeeping, `feedRx` →
+  `PlayoutBuffer`, and an end-to-end run through a real `LoopbackAnchorClient` wired
+  the way a future caller would wire any `AnchorClient`'s single rx callback.
+- `tests/MixBus_test.cpp`: minus-self mixing, no-over-saturation on loud legs,
+  attach/detach/reclaim lifecycle, `mix_sum4_s16` primitive (ported from the original
+  standalone self-test as GoogleTest cases).
+
+### Fixed
+
+- `ISSUES.md`: issues #65/#66/#67 (call park, paging zones, BLF) were still marked
+  "planned" despite being implemented by the sip-backport landing — flipped to shipped.
+- `ISSUES.md` Non-Goals: the prior blanket "no server-side media bridging" / "no
+  telephony-provider connectors" language predated this pass and would have
+  contradicted the shipped (but unwired) code above. Rewritten to the real boundary:
+  no vendor connector *implementations*, no PSTN/trunk origination *policy*, no
+  `RequestsHandler` call-routing wiring — all a fork's own decision, not built here.
+- `main/CMakeLists.txt`: the ESP-IDF firmware SRCS list was missing
+  `PlayoutBuffer.cpp` even after the sip-backport landing (it lists sources
+  explicitly, unlike the host build's glob) — firmware build was silently
+  incomplete. Added, along with the new files above.
+- `docs/FEATURE_ROADMAP.md`, `CLAUDE.md`: reconciled the signalling-only framing and
+  current-capabilities table with what's actually shipped (the backport features were
+  never added to either after landing).
+
+---
+
 ## Unreleased (sip-backport) - 2026-06-23
 
 Full SIP protocol feature backport into the engine. Build: zero errors (one
