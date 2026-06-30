@@ -40,10 +40,17 @@
 #include <string>
 #include <array>
 #include <mutex>
+#include <functional>
 
 class RtpSender
 {
 public:
+	// Optional per-frame audio source: called once per 20 ms tick to fill `outUlaw`
+	// with `count` µ-law samples. Returns false to mean "nothing this frame" (the
+	// sender falls back to silence, not the test tone, when a provider is attached).
+	// Leave unset (the default) for the plain 440 test-tone stream.
+	using FrameProvider = std::function<bool(uint8_t* outUlaw, size_t count)>;
+
 	// G.711 @ 8 kHz, 20 ms ptime → 160 samples / packet. Payload type 0 (PCMU).
 	static constexpr int    SAMPLE_RATE_HZ   = 8000;
 	static constexpr int    PTIME_MS         = 20;
@@ -61,6 +68,12 @@ public:
 	// ITU-T G.711 µ-law encode of one 16-bit linear PCM sample. Standard reference
 	// implementation: bias 0x84, segment search, 8-bit companded byte (inverted).
 	static uint8_t linearToUlaw(int16_t pcm);
+
+	// Encode `count` PCM16 samples from `in` into `out` (µ-law). `out` must hold
+	// `count` uint8_t. No allocation, fully bounds-driven by `count`. Safe no-op
+	// on null/empty. Returns the number of samples written. Mirror of
+	// RtpReceiver::mulawDecodeBuffer.
+	static size_t ulawEncodeBuffer(const int16_t* in, size_t count, uint8_t* out);
 
 	// Fill `out` with `count` µ-law samples of a sine tone at `freqHz`, advancing the
 	// caller's running phase `phase` (in radians) so successive frames are continuous
@@ -86,12 +99,14 @@ public:
 	// The UDP port the server sources RTP from (advertised in the 440 200-OK SDP).
 	int serverRtpPort() const { return _serverRtpPort; }
 
-	// Start streaming the synthesized tone to destIp:destPort, tagged with callID so
-	// stop() only stops the matching dialog (a stale BYE for an old call is ignored).
+	// Start streaming to destIp:destPort, tagged with callID so stop() only stops the
+	// matching dialog (a stale BYE for an old call is ignored). With no `provider`,
+	// streams the synthesized 440 test tone (existing behavior, unchanged); with a
+	// `provider`, pulls real audio from it each frame instead (silence on underrun).
 	// Returns false if a stream is already active (cap reached) or the socket/task
 	// could not be created. On host this is a guarded no-op that still flips _active
 	// so the SDP-answer / cap logic is exercisable in tests.
-	bool start(const std::string& destIp, uint16_t destPort, const std::string& callID);
+	bool start(const std::string& destIp, uint16_t destPort, const std::string& callID, FrameProvider provider = nullptr);
 
 	// Stop the stream IF it belongs to `callID` (or unconditionally if callID empty).
 	// Idempotent: safe to call on an already-idle sender. Frees the socket, signals
@@ -125,6 +140,7 @@ private:
 	// task never race the slot. Non-recursive (matches the codebase convention).
 	mutable std::mutex _slotMutex;
 	std::string        _callID;           // owner of the live stream
+	FrameProvider      _provider;
 };
 
 #endif
