@@ -34,6 +34,7 @@ add_executable(sip_parser_tests
     RtpReceiver_test.cpp
     PlayoutBuffer_test.cpp
     AnchorClient_test.cpp
+    MediaBridge_test.cpp
     Tui_test.cpp
     # The ANSI sysop-terminal renderer is transport-agnostic and host-compilable
     # (no wolfSSH, no ESP — only an esp_timer guard, behind ESP_PLATFORM). It links
@@ -70,6 +71,10 @@ add_executable(sip_parser_tests
     # AnchorClient reference implementation. Pure loopback (no network); exercises
     # the AnchorClient contract: init/start/makeCall/audio/drop/stop lifecycle.
     ../src/SIP/LoopbackAnchorClient.cpp
+    # RTP<->AnchorClient glue. Host-compilable: RtpReceiver/RtpSender::start()
+    # are no-op stubs under !ESP_PLATFORM, so the lifecycle/identity bookkeeping
+    # and the feedRx -> PlayoutBuffer path are exercisable on the desktop build.
+    ../src/SIP/MediaBridge.cpp
     ../src/SIP/RequestsHandler.cpp
     ../src/SIP/SipSdpMessage.cpp
     ../src/SIP/SipClient.cpp
