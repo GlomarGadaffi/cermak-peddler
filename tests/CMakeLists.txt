@@ -35,6 +35,7 @@ add_executable(sip_parser_tests
     PlayoutBuffer_test.cpp
     AnchorClient_test.cpp
     MediaBridge_test.cpp
+    MixBus_test.cpp
     Tui_test.cpp
     # The ANSI sysop-terminal renderer is transport-agnostic and host-compilable
     # (no wolfSSH, no ESP — only an esp_timer guard, behind ESP_PLATFORM). It links
@@ -75,6 +76,11 @@ add_executable(sip_parser_tests
     # are no-op stubs under !ESP_PLATFORM, so the lifecycle/identity bookkeeping
     # and the feedRx -> PlayoutBuffer path are exercisable on the desktop build.
     ../src/SIP/MediaBridge.cpp
+    # Conference mix bus (see docs/CONFERENCE_MIXER.md). Pure C++17, no ESP
+    # dependency. mix_kernels_scalar.cpp is the always-on scalar reference --
+    # the ESP32-S3 PIE vector kernels (src/SIP/pie/) are opt-in and not built here.
+    ../src/SIP/MixBus.cpp
+    ../src/SIP/mix_kernels_scalar.cpp
     ../src/SIP/RequestsHandler.cpp
     ../src/SIP/SipSdpMessage.cpp
     ../src/SIP/SipClient.cpp
