@@ -6,7 +6,7 @@ This document serves as the active issue tracker and architectural roadmap for *
 
 ## Active Issues & Backlog Roadmap
 
-### 🟡 Issue #70: Hold/resume on broadcast (ring-group) calls is not yet supported
+### 🟡 Issue #74: Hold/resume on broadcast (ring-group) calls is not yet supported
 * **Status**: ⏳ Open / Planned
 * **Labels**: `bug`, `hold-resume`, `broadcast`
 * **Severity**: Medium
