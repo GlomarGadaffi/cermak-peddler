@@ -59,7 +59,7 @@ Host job runs **cppcheck** (`--error-exitcode=1`, blocking), clang-tidy (non-blo
 - `SipServer` owns the `UdpServer` socket + `RequestsHandler` + `SipMessageFactory`; on host builds it also runs a `_tickThread`. On ESP, the platform entry point drives `tick()`.
 - `UdpServer` (`src/Helpers/`) is the threading/socket abstraction — one receive thread, platform-pinned to a core.
 - `SipMessageFactory` parses raw UDP into `SipMessage`/`SipSdpMessage` (O(n) non-mutating index-walking parser, no RTTI), then `RequestsHandler` dispatches by method through a handler table.
-- `RequestsHandler` is the heart: the registrar (`_clients`), call state machines (`_sessions`), star-codes/PBX features, the `777` echo and `999` broadcast virtual extensions, and the thread-safe **dashboard query API** (`getActiveClients`, `getActiveSessions`, CDR, DND, call-forwarding).
+- `RequestsHandler` is the heart: the registrar (`_clients`), call state machines (`_sessions`), star-codes/PBX features — **call hold/resume** (re-INVITE + RFC 3311 UPDATE), **call park** on orbits `700`+, **paging zones** `98x`, **BLF/presence** (`SUBSCRIBE`/`NOTIFY`), **session timers** (RFC 4028), ring/hunt groups — the `777` echo and `999` broadcast virtual extensions, and the thread-safe **dashboard query API** (`getActiveClients`, `getActiveSessions`, `getParkedCalls`, CDR, DND, call-forwarding). `AnchorClient`/`MediaBridge`/`TelephonyProvider`/`MixBus` (`src/SIP/`) are separate, compiled-and-tested building blocks for bridging a call to an external audio system or N-way mixing — **not** wired into `RequestsHandler`'s call routing (see `ISSUES.md` Non-Goals and #75).
 
 ### The two invariants that shape all engine code
 1. **Zero heap allocation in the packet hot path.** Every `SipClient`, `Session`, and `SipMessage` is pre-allocated in fixed pools at boot (`src/SIP/PoolConfig.hpp`). These pool sizes ARE the device's hard concurrency limits; exhaustion degrades gracefully to `503 Service Unavailable` (or a one-off heap fallback for the message pool) — it never crashes. Don't `new`/`make_shared` in `RequestsHandler` or any UDP loop; use the pool allocators.
@@ -84,7 +84,7 @@ Code branches on `defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)` v
 - `sketches/` — standalone Arduino IDE ports (the `SipServer_JC3248W535` sketch is **deprecated** in favor of the ESP-IDF display build).
 - `.smoke/` — hardware smoke scripts (serial capture, SIP probe, NVS provisioning generator).
 - `tests/http/test_api.sh` is the single HTTP smoke suite used by both CI and on-hardware runs.
-- `docs/` — deep-dives (ARCHITECTURE, SCALING, THREAT_MODEL, OTA, PROVISIONING, RTP). `ISSUES.md` is the live architectural roadmap/issue tracker.
+- `docs/` — deep-dives (ARCHITECTURE, SCALING, THREAT_MODEL, OTA, PROVISIONING, RTP, CONFERENCE_MIXER). `ISSUES.md` is the live architectural roadmap/issue tracker.
 - Build output dirs (`build*/`) and `*.log` files in the repo root are local scratch — don't commit them.
 
 ## SSH sysop terminal & TUI (the primary config surface)
@@ -96,4 +96,4 @@ Code branches on `defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)` v
 - **Hardware-verify loop:** flash `idf.py -D SIP_TRANSPORT=display -p COM4 flash`, then render the live screens through a real terminal emulator with `.smoke/ssh_tui.py <ip>` (uses `pyte` to reconstruct the 80×24 grid). A connection right after a flash can EOF once (board not ready) — just retry.
 
 ## Documentation discretion
-Keep **committed / public docs vendor-neutral and secret-free**: describe capabilities generically, and never commit credentials, vendor-specific test targets, or commercial product names. pocket-dial is a LAN-only, peer-to-peer-media PBX; upstream-trunk / PSTN / provider-connector work is out of scope here.
+Keep **committed / public docs vendor-neutral and secret-free**: describe capabilities generically, and never commit credentials, vendor-specific test targets, or commercial product names. pocket-dial's default call path is a LAN-only, peer-to-peer-media PBX. `src/SIP/AnchorClient.hpp` / `MediaBridge` / `TelephonyProvider` are a vendor-neutral, opt-in extension point for bridging a call to an external audio system (ships with only a `Loopback` reference — see `ISSUES.md` Non-Goals); implementing or naming a specific commercial connector stays out of this repo. PSTN/trunk call-origination policy and wiring the anchor into `RequestsHandler`'s call routing are likewise a fork's own decision, not built here.

@@ -84,25 +84,25 @@ Generic desk-PBX features to bring pocket-dial to parity with full-size PBXes. *
 designed to need _no_ server-side media path** — media stays peer-to-peer; the server only brokers
 signaling and tracks state. See **Non-Goals** below for the hard scope boundary.
 
-### 🔵 Issue #65: [Feature] Call Park / Park-Orbit
-* **Status**: ⏳ Open / Planned (Backlog)
+### 🟢 Issue #65: [Feature] Call Park / Park-Orbit
+* **Status**: ✅ Shipped (`onParkInvite` + retrieve + ring-back, orbits `700`–`709`)
 * **Labels**: `feature`, `sip`, `call-control`
 * **Description**: Park an active call to a virtual "orbit" slot (e.g. `700`–`709`): the parking phone dials a park code, its leg is held in an orbit slot, and **any** extension retrieves the call by dialing that orbit number. **Signaling-state only — no server media.** On retrieval the call re-establishes peer-to-peer RTP between the retriever and the held party, so this needs no media bridge. Reuses the existing `Session` pool and the `onInvite` virtual-extension intercept (à la `777`/`999`).
-* **Acceptance**: (1) mid-call park → caller held, orbit number announced/shown; (2) dialing the orbit from another extension connects to the held party via fresh P2P SDP O/A; (3) one `Session` slot per parked call (documented against `MAX_SESSIONS`); (4) park timeout rings back the parker; (5) double-retrieve of an orbit returns `486`.
+* **Acceptance**: (1) mid-call park → caller held, orbit number announced/shown; (2) dialing the orbit from another extension connects to the held party via fresh P2P SDP O/A; (3) one `Session` slot per parked call (documented against `MAX_SESSIONS`); (4) park timeout rings back the parker; (5) double-retrieve of an orbit returns `486`. Host-tested; a real-hardware smoke-test pass is tracked separately above (`hardware-testing` label).
 * **Notes**: Promotes the `FEATURE_ROADMAP.md` P1 "Call parking / park-orbit" item.
 
-### 🔵 Issue #66: [Feature] Paging Zones (multi-zone `999`)
-* **Status**: ⏳ Open / Planned (Backlog)
+### 🟢 Issue #66: [Feature] Paging Zones (multi-zone `999`)
+* **Status**: ✅ Shipped (`isPageZoneExt`/`findPageZone`, extensions `980`–`989`)
 * **Labels**: `feature`, `sip`, `paging`
 * **Description**: Generalize the single all-page (`999`) into named zones (e.g. `981` = floor-1) backed by a zone→members map, reusing the existing `startBroadcastFork` / `huntRingNext` forking path. Bounded zone table + per-zone member cap so message-pool use stays bounded (same discipline as the `999` page). Keeps the current fork-and-answer model — no media mixing.
-* **Acceptance**: a zone code pages only that zone's members; membership configurable via the existing ring-group API; per-zone cap enforced; heap returns to baseline after the page (Static Pool recycle, per `BENCHMARKS.md`).
+* **Acceptance**: a zone code pages only that zone's members; membership configurable via the existing ring-group API; per-zone cap enforced; heap returns to baseline after the page (Static Pool recycle, per `BENCHMARKS.md`). Host-tested (`PageZone_test.cpp`).
 * **Notes**: Promotes `FEATURE_ROADMAP.md` P2 "Paging zones."
 
-### 🔵 Issue #67: [Feature] BLF / Presence (`SUBSCRIBE`/`NOTIFY`, dialog-info)
-* **Status**: ⏳ Open / Planned (Backlog)
+### 🟢 Issue #67: [Feature] BLF / Presence (`SUBSCRIBE`/`NOTIFY`, dialog-info)
+* **Status**: ✅ Shipped (`onSubscribe`, RFC 4235 `dialog-info+xml`)
 * **Labels**: `feature`, `sip`, `presence`
 * **Description**: Let desk-phone busy-lamp-field keys reflect extension/line state the server already tracks (registration + active `Session`). Implement `SUBSCRIBE`/`NOTIFY` for `dialog-info+xml` with a **bounded** subscription table and NOTIFY fan-out on state change.
-* **Acceptance**: a phone subscribed to ext X gets NOTIFY on X ringing/answered/idle; subscription table is capacity-capped; expiry refresh handled; no unbounded fan-out.
+* **Acceptance**: a phone subscribed to ext X gets NOTIFY on X ringing/answered/idle; subscription table is capacity-capped; expiry refresh handled; no unbounded fan-out. A real-hardware smoke-test pass on a BLF-capable phone is tracked separately above (`hardware-testing` label).
 * **Notes**: Promotes `FEATURE_ROADMAP.md` P2 "BLF / presence." Pairs with provisioning (BLF keys are provisionable).
 
 ### 🔵 Issue #68: [Feature] Directed Call Pickup (pickup groups)
@@ -119,9 +119,47 @@ signaling and tracks state. See **Non-Goals** below for the hard scope boundary.
 * **Notes**: Promotes `FEATURE_ROADMAP.md` "Dial plan / hunt groups."
 
 ### ⚪ Non-Goals (hard scope boundary)
-pocket-dial stays a **LAN-only, peer-to-peer-media PBX**. The following are **out of scope** and intentionally not implemented here — every feature above is designed to need none of them:
-* **Server-side media bridging / mixing / relay** (any "media anchor" that terminates and relays or mixes RTP). All media stays phone↔phone.
-* **Upstream trunk / PSTN integration** and **third-party telephony-provider connectors**. pocket-dial does not originate or terminate external trunks.
+pocket-dial's default call path stays **LAN-only, peer-to-peer media** — every feature above is
+signaling-only and needs none of the below. **Out of scope, intentionally not implemented here:**
+* **Specific commercial telephony-provider connectors** (3CX, or any other named vendor's
+  call-control API). `TelephonyProviderRegistry` (`src/SIP/TelephonyProvider.hpp`) is the
+  extension point — implement your own `AnchorClient` and register it; pocket-dial ships only
+  the `Loopback` reference, and `TelephonyProviderType` names no commercial vendor.
+* **PSTN/trunk call-origination policy** — deciding *when* a dialed number routes to an anchor
+  instead of a local extension, registering to an upstream trunk, NAT/SBC concerns. That's the
+  policy a fork writes alongside its own `AnchorClient`; wiring it into `RequestsHandler`'s call
+  routing is out of scope here.
+
+**What DOES ship, opt-in:** `AnchorClient` / `MediaBridge` / `TelephonyProvider` /
+`TelephonyApiConfig` (`src/SIP/`) are the vendor-neutral "bones" for bridging a call to an
+external audio system — compiled, unit-tested, and ready to extend, but not wired into any call
+path by default. `MixBus` (`src/SIP/MixBus.*`, see
+[docs/CONFERENCE_MIXER.md](docs/CONFERENCE_MIXER.md)) is a standalone, tested N-way audio mixer,
+also not yet wired into `MediaBridge` (tracked: #75 below). **Dialing a number does nothing with
+any of this today** — these are building blocks, not a feature you can pick up a phone and use,
+until a fork (or a future pass here) adds the routing policy.
+
+---
+
+## Anchored Media (Opt-In, Vendor-Agnostic)
+
+### 🔵 Issue #75: [Feature] Wire MixBus into MediaBridge for local N-way conferencing
+* **Status**: ⏳ Open / Planned (Backlog)
+* **Labels**: `feature`, `media`, `conferencing`
+* **Description**: `MixBus` (the N-way audio summing junction, §1–6 of
+  [docs/CONFERENCE_MIXER.md](docs/CONFERENCE_MIXER.md)) is implemented, unit-tested, and
+  vendor-neutral, but `MediaBridge` still serves one 1:1 leg per instance — the bus isn't wired
+  into the call path. §7 of that doc sketches the diff: `MediaBridge`'s RX/TX callbacks swap to
+  `bus.inputFrame`/`outputFrame`, `startBridge`/`stopBridge` gain `bus.attach`/`detach`, and a
+  single periodic tick driver replaces nothing else. This is generic LAN-conferencing
+  functionality (no anchor/vendor required — handset legs alone are enough ports), distinct from
+  and not blocked on the anchor call-routing policy noted in Non-Goals above.
+* **Acceptance**: 3+ registered extensions can be bridged onto one `MixBus` instance (via
+  whatever dial mechanism lands with this issue — e.g. a conference extension/star-code, design
+  TBD); each hears the sum of the others, minus itself; a leg leaving doesn't disturb the rest.
+* **Notes**: Scalar kernel cost is ~64k adds/s at ≤8 narrowband ports — negligible on a 240 MHz
+  core (see CONFERENCE_MIXER.md §4). Vectorising (the PIE kernels, `src/SIP/pie/`) stays opt-in
+  behind `POCKETDIAL_MIXBUS_PIE` until profiling says it's needed.
 
 ---
 
