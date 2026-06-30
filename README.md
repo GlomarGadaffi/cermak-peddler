@@ -75,9 +75,11 @@ before sending firmware PRs.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache License 2.0 — see [LICENSE](LICENSE). The original engine this project was forked
+from (BarGabriel/SipServer) is MIT-licensed; that notice is preserved as-is in
+[LICENSE-MIT](LICENSE-MIT). See [NOTICE](NOTICE) for the full attribution.
 
 ## Companion projects
 
 - [pocket-dial-handset](https://github.com/GlomarGadaffi/pocket-dial-handset) — ESP32-S3 push-to-talk SIP handset that registers to pocket-dial
-- [BarGabriel/SipServer](https://github.com/BarGabriel/SipServer/) — the original MIT-licensed SIP server this engine was vendored and extended from (see [LICENSE](LICENSE))
+- [BarGabriel/SipServer](https://github.com/BarGabriel/SipServer/) — the original MIT-licensed SIP server this engine was vendored and extended from (see [LICENSE-MIT](LICENSE-MIT))
