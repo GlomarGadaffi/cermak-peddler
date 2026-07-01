@@ -94,6 +94,15 @@ public:
 	void setRingGroup(const std::string& groupExt, const std::string& members, const std::string& mode);
 	std::vector<std::tuple<std::string, std::string, std::string>> getRingGroups();
 
+	// Parked calls snapshot for the TUI: {orbit, parkedExt, parker, secondsParked}.
+	std::vector<std::tuple<std::string, std::string, std::string, int>> getParkedCalls();
+
+	// Paging zones (980–989). setPageZone replaces a zone's membership; an empty
+	// member list deletes the zone. Thread-safe and NVS-persisted. The getter
+	// returns {zoneExt, "m1,m2,..."} pairs for the dashboard.
+	void setPageZone(const std::string& zoneExt, const std::string& members);
+	std::vector<std::pair<std::string, std::string>> getPageZones();
+
 	// ── Admin extension (Task 2B) ─────────────────────────────────────────────────
 	// NVS-persisted extension identity for the administrative endpoint.
 	// Default "101". Loaded from NVS namespace "pbxcfg", key "admin_ext" at boot.
@@ -159,6 +168,51 @@ private:
 	void onAck(std::shared_ptr<SipMessage> data);
 	void onRefer(std::shared_ptr<SipMessage> data);   // blind transfer (RFC 3515)
 	void onMessage(std::shared_ptr<SipMessage> data); // inbound MESSAGE (RFC 3428): ack 200 OK
+	void onReinvite(std::shared_ptr<SipMessage> data);  // mid-dialog re-INVITE (hold/resume, RFC 3261 §14)
+	void onUpdate(std::shared_ptr<SipMessage> data);    // RFC 3311 mid-dialog UPDATE
+
+	// onSubscribe: Event-package gate (489 on anything but "dialog"), AOR validation
+	// (404 for unregistered targets), fixed-slot allocation (503 on exhaustion),
+	// 202 Accepted + an immediate full-state NOTIFY. Called from handle() — caller holds _mutex.
+	void onSubscribe(std::shared_ptr<SipMessage> data);
+
+	// One BLF watcher dialog. Fixed-size record in a std::array — no heap growth.
+	struct DialogSubscription
+	{
+		bool        used = false;
+		std::string callId;        // subscription dialog id (refresh/unsubscribe key)
+		std::string watcherFrom;   // subscriber's full From header (incl. its tag)
+		std::string subTo;         // our full To header (incl. the tag we minted)
+		std::string targetAor;     // the extension being watched (the To user-part)
+		std::string lastState;     // last NOTIFYed state token (change detection)
+		unsigned    version = 0;   // dialog-info version counter (monotonic)
+		unsigned    cseq = 1;      // NOTIFY CSeq within the subscription dialog
+		int         expiresSec = 0;
+		sockaddr_in addr{};        // where NOTIFYs go (the SUBSCRIBE source)
+		std::chrono::steady_clock::time_point deadline{};
+	};
+	std::array<DialogSubscription, POCKETDIAL_MAX_SUBSCRIPTIONS> _subscriptions;
+
+	// Compute the current RFC 4235 dialog state of `targetAor` from the registrar +
+	// session tables: ""=idle, else trying/early/confirmed plus direction and dialog id.
+	// Caller holds _mutex.
+	std::string computeDialogState(const std::string& targetAor,
+		std::string& outDirection, std::string& outDialogId) const;
+
+	// Build one NOTIFY for a subscription slot carrying a dialog-info+xml body.
+	// `terminated` selects Subscription-State: terminated;reason=<termReason>.
+	// Caller holds _mutex.
+	std::shared_ptr<SipMessage> buildDialogNotify(DialogSubscription& sub,
+		const std::string& state, const std::string& direction, const std::string& dialogId,
+		bool terminated, const char* termReason);
+
+	// Recompute every watched target's state and NOTIFY slots whose state changed.
+	// Called at the end of handle() and from tick() (inside _mutex). Caller holds _mutex.
+	void refreshSubscriptions();
+
+	// Expire overdue subscriptions: terminal NOTIFY (reason=timeout) + slot free.
+	// Called from tick(); caller holds _mutex.
+	void sweepSubscriptions();
 
 	// ── DTMF SIP INFO handler (Task 2C) ──────────────────────────────────────────
 	// Invoked from handle() when a SIP INFO arrives carrying
@@ -187,7 +241,9 @@ private:
 	std::shared_ptr<SipMessage> buildBeepBye(const std::shared_ptr<SipMessage>& ok);
 	std::shared_ptr<SipMessage> buildBeepCancel(std::size_t slot);
 
-	enum class BeepState { Free, AwaitingInviteOk, AwaitingByeOk };
+	// AwaitingCancelDone: CANCEL sent, lingering until the 487 final response is ACKed
+	// (or a bounded deadline frees the slot). Added for #90 — see beep teardown notes.
+	enum class BeepState { Free, AwaitingInviteOk, AwaitingByeOk, AwaitingCancelDone };
 	struct BeepDialog
 	{
 		BeepState state = BeepState::Free;
@@ -204,7 +260,97 @@ private:
 	// Find the beep slot owning a Call-ID, or nullptr. Caller holds _mutex.
 	BeepDialog* findBeepByCallID(std::string_view callID);
 
-	void setCallState(std::string_view callID, Session::State state);
+	// ── RFC 3261 §17 INVITE client transaction layer ──────────────────────────
+	// One slot per outgoing INVITE fork.  Retransmit interval (Timer A) doubles
+	// from T1=500 ms each tick until a provisional response advances the state to
+	// Proceeding (no more retransmits) or Timer B (32 s) fires.
+	// Pool exhaustion → message sent once with no retransmit (graceful degradation).
+	// All fields guarded by _mutex.
+	struct SipTransaction
+	{
+		enum class Type  : uint8_t { None, InviteClient };
+		enum class State : uint8_t { Calling, Proceeding, Completed, Accepted };
+
+		Type  type  = Type::None;
+		State state = State::Calling;
+
+		sockaddr_in peer{};
+		char msg[1500]{};       // serialized bytes ready for retransmit (Ethernet MTU safe)
+		size_t msgLen       = 0;
+		bool   msgTruncated = false;
+
+		char callId[128]{};    // Call-ID for freeTxsForCallId() lifecycle linkage
+		char viaBranch[72]{};  // z9hG4bK… branch param (primary matching key)
+		char cseqMethod[12]{}; // "INVITE" etc. — disambiguates CANCEL sharing the branch
+
+		std::chrono::steady_clock::time_point nextRetransmit{};     // next Timer A fire
+		std::chrono::steady_clock::time_point transactionTimeout{}; // Timer B (32 s)
+		std::chrono::steady_clock::time_point absorbDeadline{};     // Timer L (RFC 6026, 2xx)
+
+		uint32_t retransmitCount   = 0;
+		uint32_t currentIntervalMs = 500; // Timer A: starts at T1, doubles each retransmit
+	};
+	std::array<SipTransaction, POCKETDIAL_MAX_TRANSACTIONS> _txPool{};
+
+	// RFC 3261 §17 transaction helpers (all callers hold _mutex).
+	static SipTransaction::Type classifyTxType(const std::shared_ptr<SipMessage>& msg);
+	void registerTx(SipTransaction::Type type, const sockaddr_in& peer,
+		const std::shared_ptr<SipMessage>& msg);
+	bool matchAndAdvanceTx(const std::shared_ptr<SipMessage>& msg);
+	void sweepTransactions(std::chrono::steady_clock::time_point now);
+	void freeTxsForCallId(std::string_view callId);
+
+	// RFC 4028 session timer helpers. Caller holds _mutex.
+	void armSessionTimer(Session* session, const std::shared_ptr<SipMessage>& ok200);
+	void sweepSessionTimers(std::chrono::steady_clock::time_point now);
+
+	// ── Call parking / park-orbit ──────────────────────────────────────────────
+	// Virtual orbit extensions 700..70(N-1). An INVITE to a FREE orbit parks the
+	// caller's leg there; an INVITE to an OCCUPIED orbit retrieves it: the retriever
+	// is answered with the parked party's SDP and the parked party is re-INVITEd so
+	// media renegotiates peer-to-peer. tick() sweeps timed-out parks: ring back the
+	// parker (Referred-By) when registered, else tear down with BYE. All helpers
+	// assume the caller holds _mutex and only enqueue to _outbox.
+	enum class ParkState : uint8_t { Free, Parked, RingingBack, Retrieving };
+	struct ParkSlot
+	{
+		ParkState state = ParkState::Free;
+		std::string orbit;              // "700".."70N"
+		std::string callID;             // Call-ID of the parked dialog
+		std::string parkedExt;          // the parked party's extension
+		sockaddr_in parkedAddr{};       // the parked party's signaling address
+		bool        parked = false;     // slot has a captured parked dialog
+		std::string parkedSdp;          // parked party's SDP (for retrieve / ring-back offers)
+		std::string parkedFromTag;      // parked party's From-tag (re-INVITE / BYE To-tag)
+		std::string localTag;           // our UAS To-tag on the parked dialog
+		std::string parker;             // ring-back target on timeout
+		std::chrono::steady_clock::time_point parkedAt{};
+		// Ring-back UAC dialog toward the parker (server-minted, fresh Call-ID).
+		std::string rbCallID;
+		std::string rbFromTag;
+		std::string rbBranch;
+		sockaddr_in rbAddr{};
+		std::chrono::steady_clock::time_point deadline{};
+	};
+	std::array<ParkSlot, POCKETDIAL_PARK_SLOTS> _parkSlots;
+	std::chrono::seconds _parkTimeout{POCKETDIAL_PARK_TIMEOUT_SEC};
+	std::vector<std::string> _parkPendingAcks;    // park re-INVITE ACKs pending
+	std::vector<std::string> _transferPendingAcks; // attended-transfer re-INVITE ACKs pending
+
+	int parkOrbitIndex(std::string_view ext) const;
+	void onParkInvite(std::shared_ptr<SipMessage> data,
+		const std::shared_ptr<SipClient>& caller, int orbitIdx);
+	void sendParkReinvite(ParkSlot& slot, const std::string& sdp);
+	void byeParkedParty(const ParkSlot& slot);
+	void startParkRingback(ParkSlot& slot, const std::shared_ptr<SipClient>& parker,
+		std::chrono::steady_clock::time_point now);
+	bool handleParkOk(const std::shared_ptr<SipMessage>& data);
+	bool handleTransferOk(const std::shared_ptr<SipMessage>& data);
+	void parkSweep(std::chrono::steady_clock::time_point now);
+	void freeParkSlot(std::string_view callID);
+	void refreshParkSnapshot();
+
+	bool setCallState(std::string_view callID, Session::State state);
 	void endCall(std::string_view callID, std::string_view srcNumber, std::string_view destNumber, std::string_view reason = "");
 
 	// CDR: write one record into the ring as a call ends. Caller must hold _mutex.
@@ -219,11 +365,13 @@ private:
 	// (std::mutex is non-recursive); does a bounded map lookup, no locking.
 	bool isDndEnabled(const std::string& extension);
 
-	// Internal forward/group lookups used by onInvite()/onBusy()/tick(). Caller
+	// Internal forward/group/zone lookups used by onInvite()/onBusy()/tick(). Caller
 	// MUST already hold _mutex (non-recursive) — bounded map lookups, no locking.
 	// getForwardTarget returns "" when no forward of that trigger is configured.
 	std::string getForwardTarget(const std::string& extension, const std::string& trigger) const;
 	const pbx::RingGroup* findRingGroup(const std::string& extension) const;
+	const pbx::PageZone* findPageZone(const std::string& extension) const;
+	bool isPageZoneDialog(const std::string& extension) const;
 
 	// Fan an INVITE out to a set of targets (the reusable core extracted from the
 	// 999 all-page path). `targets` are pre-selected registered clients; `intercom`
@@ -309,6 +457,24 @@ private:
 
 	std::shared_ptr<SipClient> allocateClient(std::string number, sockaddr_in address, int expiresSeconds);
 	std::shared_ptr<Session> allocateSession(std::string callID, std::shared_ptr<SipClient> src);
+	// Draw a transient virtual-peer SipClient (777/440/park leg) from the fixed pool
+	// instead of make_shared'ing one in the packet handler. Falls back to heap on
+	// exhaustion (graceful, never a crash). Caller holds _mutex.
+	std::shared_ptr<SipClient> allocateVirtualPeer(std::string number, sockaddr_in address, int expiresSeconds = 3600);
+
+	// Build a 200 OK with an SDP body for an INVITE (used by 777, park, onReinvite).
+	std::shared_ptr<SipMessage> buildOkWithSdp(const std::shared_ptr<SipMessage>& inviteMsg,
+		const std::string& activeIp, const std::string& toTag, const std::string& sdpBody);
+	// Build a server-initiated in-dialog BYE. From/To must include tags because the
+	// dialog role differs per call path (beep = server UAC; park = server UAS).
+	std::shared_ptr<SipMessage> buildServerBye(const std::string& destExt,
+		const sockaddr_in& destAddr, const std::string& callId,
+		const std::string& fromHeader, const std::string& toHeader);
+
+	// Verify that the in-dialog request comes from a peer recorded at dialog setup
+	// (source IP match). Returns false → respond 403 Forbidden. Caller holds _mutex.
+	bool isDialogSourceAuthorized(const std::shared_ptr<Session>& session,
+		const sockaddr_in& source) const;
 
 	// Server-side RTP media source (the 440 tone stream). One concurrent stream; the
 	// ESP-only UDP socket + 20 ms pacing task live inside it, guarded for host builds.
@@ -323,6 +489,7 @@ private:
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> _outbox;
 
 	std::string _serverIp;
+	std::string _localIp;   // resolved once at construction; avoids getPrimaryLocalIP() under _mutex
 	int         _serverPort;
 
 	std::atomic<uint64_t> _packetsProcessed{0};
@@ -338,6 +505,10 @@ private:
 		std::vector<std::tuple<std::string, std::string, std::string, std::string>> forwards;
 		// Ring/hunt groups: {groupExt, "ringall"|"hunt", "m1,m2,..."}.
 		std::vector<std::tuple<std::string, std::string, std::string>> ringGroups;
+		// Parked calls: {orbit, parkedExt, parker, secondsParked}.
+		std::vector<std::tuple<std::string, std::string, std::string, int>> parkedCalls;
+		// Paging zones: {zoneExt, "m1,m2,..."}.
+		std::vector<std::pair<std::string, std::string>> pageZones;
 		// Adopted devices (STAGE 2): {mac, ext, state, online}. Mirrored from _devices
 		// under _mutex; copied out for the TUI under _snapshotMutex.
 		std::vector<AdoptedDevice> devices;
@@ -371,6 +542,15 @@ private:
 	// POCKETDIAL_MAX_CLIENTS groups; each member list is bounded by splitMembers().
 	// Guarded by _mutex; mirrored into the snapshot and persisted to NVS.
 	std::unordered_map<std::string, pbx::RingGroup> _ringGroups;
+
+	// Paging zones, keyed by the zone extension (980–989). Bounded by
+	// POCKETDIAL_MAX_PAGE_ZONES; member lists bounded by splitZoneMembers().
+	// Guarded by _mutex; mirrored into the snapshot and persisted to NVS.
+	std::unordered_map<std::string, pbx::PageZone> _pageZones;
+
+	// How long to wait between OPTIONS keepalive cycles, in minutes. Atomic so the
+	// TUI can read without taking _mutex. Persisted to NVS ("pbxcfg"/"rewarm_min").
+	std::atomic<uint16_t> _rewarmMinutes{60};
 
 	// ── Registrar mode (STAGE 2) ──────────────────────────────────────────────────
 	// Atomic so onRegister() can read the policy without taking _mutex (it already
@@ -420,12 +600,22 @@ private:
 	// Caller holds _mutex.
 	void markDeviceOnline(const std::string& mac, bool online);
 
-	// NVS persistence for _forwards / _ringGroups. No-ops on host (the maps are the
-	// store); on ESP they read/write the "pbxcfg" NVS namespace. Caller holds _mutex.
+	// NVS persistence for _forwards / _ringGroups / _pageZones. No-ops on host (the
+	// maps are the store); on ESP they read/write the "pbxcfg" NVS namespace.
+	// Caller holds _mutex.
 	void loadPbxConfig();                 // boot-time reload into the maps
 	void persistForwards();               // write-through after a setForward mutation
 	void persistRingGroups();             // write-through after a setRingGroup mutation
+	void persistPageZones();              // write-through after a setPageZone mutation
 	bool _pbxConfigLoaded = false;
+
+	// BLF event-package parsing helper (pure / static / host-testable).
+	// Returns the canonical package name (e.g. "dialog") or "unknown".
+	static std::string parseEventPackage(const std::string& raw);
+
+	// RFC 4235 dialog-info XML builder (pure). Called from buildDialogNotify().
+	static std::string buildDialogInfoXml(const std::string& entity, unsigned version,
+		const std::string& dialogId, const std::string& state, const std::string& direction);
 
 	// Persistent CDR (Class A sweep). The CDR ring is flushed to the "cdrlog" NVS
 	// namespace on teardown (write-through) and reloaded on boot, so records survive
@@ -437,6 +627,8 @@ private:
 	std::vector<std::shared_ptr<SipClient>> _clientPool;
 	std::vector<std::shared_ptr<Session>> _sessionPool;
 	static std::vector<std::shared_ptr<SipMessage>> _messagePool;
+	// Virtual-peer pool: transient SipClient slots for 777/440/park legs (Issue #70).
+	std::vector<std::shared_ptr<SipClient>> _virtualPeerPool;
 
 	// Issue #38: token bucket keyed by source IPv4 (network-order s_addr).
 	struct RateBucket

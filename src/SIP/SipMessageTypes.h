@@ -28,6 +28,12 @@ public:
 	static constexpr auto NOT_FOUND          = "SIP/2.0 404 Not Found";
 	static constexpr auto BAD_REQUEST        = "SIP/2.0 400 Bad Request";
 	static constexpr auto ACCEPTED           = "SIP/2.0 202 Accepted";
+	// RFC 3311 mid-dialog media renegotiation / session-timer keep-alive.
+	static constexpr auto UPDATE             = "UPDATE";
+	// RFC 6665 event-subscription requests (BLF / presence).
+	static constexpr auto SUBSCRIBE          = "SUBSCRIBE";
+	// 489 Bad Event — returned when the requested event package is not supported.
+	static constexpr auto BAD_EVENT          = "SIP/2.0 489 Bad Event";
 };
 
 #endif

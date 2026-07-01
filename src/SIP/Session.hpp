@@ -21,6 +21,9 @@ public:
 		Cancel,
 		Bye,
 		Connected,
+		// Mid-dialog hold (re-INVITE with a=sendonly/recvonly/inactive). Resuming
+		// (Held -> Connected) preserves _startTime so CDR talk time spans the hold.
+		Held,
 	};
 
 
@@ -37,6 +40,13 @@ public:
 	std::shared_ptr<SipClient> getDest() const;
 	State getState() const;
 	std::chrono::steady_clock::time_point getStartTime() const;
+
+	// The To-tag this UAS generated for the dialog. RFC 3261: the tag is created
+	// once (on the first dialog-establishing response, our 180 Ringing) and MUST be
+	// reused unchanged on the 200 OK. A fresh tag on the 200 makes it a different
+	// dialog, which Yealink-class phones never reconcile — they keep ringing.
+	const std::string& getLocalTag() const { return _localTag; }
+	void setLocalTag(const std::string& tag) { _localTag = tag; }
 
 	// Broadcast / Forking helpers
 	bool isBroadcast() const { return _isBroadcast; }
@@ -77,6 +87,47 @@ public:
 	const std::string& getGroupExt() const { return _groupExt; }
 	void setGroupExt(const std::string& g) { _groupExt = g; }
 
+	// ── Call parking (park-orbit bridge) ──────────────────────────────
+	// peerCallID links the two dialog legs of a retrieved (or rung-back) parked
+	// call so a BYE from either side relays a server BYE to the other leg.
+	// parkUac marks the leg the SERVER originated (the park-timeout ring-back
+	// INVITE toward the parker), which inverts the From/To roles of that relay.
+	const std::string& getPeerCallID() const { return _peerCallID; }
+	void setPeerCallID(const std::string& id) { _peerCallID = id; }
+	bool isParkUac() const { return _parkUac; }
+	void setParkUac(bool v) { _parkUac = v; }
+
+	// ── RFC 4028 session timers ────────────────────────────────────────
+	uint32_t getSessionExpiresSeconds() const { return _sessionExpiresSeconds; }
+	bool isRefresher() const { return _isRefresher; }
+	std::chrono::steady_clock::time_point getNextRefresh() const { return _nextRefresh; }
+	std::chrono::steady_clock::time_point getSessionExpiry() const { return _sessionExpiry; }
+	void armSessionTimer(uint32_t secs, bool weAreRefresher,
+	                     std::chrono::steady_clock::time_point now) {
+		_sessionExpiresSeconds = secs;
+		_isRefresher = weAreRefresher;
+		_sessionExpiry = now + std::chrono::seconds(secs);
+		_nextRefresh   = now + std::chrono::seconds(secs / 2);
+	}
+	void setNextRefresh(std::chrono::steady_clock::time_point t) { _nextRefresh = t; }
+	const std::string& getDialogFrom() const { return _dialogFrom; }
+	const std::string& getDialogTo()   const { return _dialogTo;   }
+	void setDialogHeaders(std::string from, std::string to) {
+		_dialogFrom = std::move(from);
+		_dialogTo   = std::move(to);
+	}
+
+	// The callee's most recent SDP (from its 200 OK to the initial INVITE or any
+	// re-INVITE). Used by attended transfer to cross-connect two live dialogs.
+	const std::string& getRemoteSdp() const { return _remoteSdp; }
+	void setRemoteSdp(std::string s) { _remoteSdp = std::move(s); }
+
+	// Marks a session as one half of an attended-transfer bridge. The BYE relay
+	// uses getPeerCallID() to reach the other half and getDialogFrom/To() for
+	// correct in-dialog headers (rather than the park-bridge logic).
+	bool isTransferBridge() const { return _isTransferBridge; }
+	void setTransferBridge(bool v) { _isTransferBridge = v; }
+
 	void release();
 
 private:
@@ -85,6 +136,8 @@ private:
 	std::shared_ptr<SipClient> _dest;
 	State _state;
 	std::chrono::steady_clock::time_point _startTime;
+
+	std::string _localTag; // UAS-generated To-tag, shared across 180 + 200 OK
 
 	bool _isBroadcast = false;
 	std::vector<std::shared_ptr<SipClient>> _pendingTargets;
@@ -100,6 +153,23 @@ private:
 	size_t _huntIndex = 0;
 
 	std::string _groupExt;
+
+	// Call parking (park-orbit bridge): linked peer leg + server-as-UAC marker.
+	std::string _peerCallID;
+	bool _parkUac = false;
+
+	// RFC 4028 session timers. 0 = not negotiated.
+	uint32_t _sessionExpiresSeconds = 0;
+	bool _isRefresher = false;
+	std::chrono::steady_clock::time_point _nextRefresh{};
+	std::chrono::steady_clock::time_point _sessionExpiry{};
+	// From/To dialog headers (with tags) captured from the 200 OK that established
+	// the call — used to build server-originated BYEs on session timer expiry.
+	std::string _dialogFrom;
+	std::string _dialogTo;
+
+	std::string _remoteSdp;        // callee's most recent SDP (for transfer SDP swap)
+	bool _isTransferBridge = false; // true for attended-transfer bridge halves
 };
 
 #endif

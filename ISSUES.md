@@ -6,6 +6,28 @@ This document serves as the active issue tracker and architectural roadmap for *
 
 ## Active Issues & Backlog Roadmap
 
+### 🟡 Issue #74: Hold/resume on broadcast (ring-group) calls is not yet supported
+* **Status**: ⏳ Open / Planned
+* **Labels**: `bug`, `hold-resume`, `broadcast`
+* **Severity**: Medium
+
+#### Description
+When a phone in a ring-group (or 999 broadcast) call sends a re-INVITE to hold, the
+200 OK answer from the peer is silently discarded. The hold relay block in `onOk` is
+correctly guarded by `!isBroadcast()` to avoid looping, but there is no equivalent
+broadcast-aware relay path. As a result the phone's hold request is never forwarded, the
+re-INVITE transaction times out after 32 s (Timer D), and the phone treats hold as
+failed. Unicast hold/resume is unaffected.
+
+**Root cause (found by code review):** `onOk`'s broadcast first-answer block was guarded
+by `state != Connected`, which is also true for `Held` — so a re-INVITE 200 OK re-ran
+the connect path, overwrote the established dest, and sent CANCEL to already-gone targets.
+Fixed in this release: the guard now requires `state == Invited` so only a genuine first
+answer triggers the connect path. The 200 OK is now discarded (better than the previous
+destructive behaviour). A full relay path for broadcast hold/resume is tracked here.
+
+---
+
 ### 🟡 Issue #44: End-to-end SIP call test needed on JC3248W535EN hardware
 * **Status**: ⏳ Open / Planned
 * **Labels**: `hardware-testing`, `verification`
@@ -62,25 +84,25 @@ Generic desk-PBX features to bring pocket-dial to parity with full-size PBXes. *
 designed to need _no_ server-side media path** — media stays peer-to-peer; the server only brokers
 signaling and tracks state. See **Non-Goals** below for the hard scope boundary.
 
-### 🔵 Issue #65: [Feature] Call Park / Park-Orbit
-* **Status**: ⏳ Open / Planned (Backlog)
+### 🟢 Issue #65: [Feature] Call Park / Park-Orbit
+* **Status**: ✅ Shipped (`onParkInvite` + retrieve + ring-back, orbits `700`–`709`)
 * **Labels**: `feature`, `sip`, `call-control`
 * **Description**: Park an active call to a virtual "orbit" slot (e.g. `700`–`709`): the parking phone dials a park code, its leg is held in an orbit slot, and **any** extension retrieves the call by dialing that orbit number. **Signaling-state only — no server media.** On retrieval the call re-establishes peer-to-peer RTP between the retriever and the held party, so this needs no media bridge. Reuses the existing `Session` pool and the `onInvite` virtual-extension intercept (à la `777`/`999`).
-* **Acceptance**: (1) mid-call park → caller held, orbit number announced/shown; (2) dialing the orbit from another extension connects to the held party via fresh P2P SDP O/A; (3) one `Session` slot per parked call (documented against `MAX_SESSIONS`); (4) park timeout rings back the parker; (5) double-retrieve of an orbit returns `486`.
+* **Acceptance**: (1) mid-call park → caller held, orbit number announced/shown; (2) dialing the orbit from another extension connects to the held party via fresh P2P SDP O/A; (3) one `Session` slot per parked call (documented against `MAX_SESSIONS`); (4) park timeout rings back the parker; (5) double-retrieve of an orbit returns `486`. Host-tested; a real-hardware smoke-test pass is tracked separately above (`hardware-testing` label).
 * **Notes**: Promotes the `FEATURE_ROADMAP.md` P1 "Call parking / park-orbit" item.
 
-### 🔵 Issue #66: [Feature] Paging Zones (multi-zone `999`)
-* **Status**: ⏳ Open / Planned (Backlog)
+### 🟢 Issue #66: [Feature] Paging Zones (multi-zone `999`)
+* **Status**: ✅ Shipped (`isPageZoneExt`/`findPageZone`, extensions `980`–`989`)
 * **Labels**: `feature`, `sip`, `paging`
 * **Description**: Generalize the single all-page (`999`) into named zones (e.g. `981` = floor-1) backed by a zone→members map, reusing the existing `startBroadcastFork` / `huntRingNext` forking path. Bounded zone table + per-zone member cap so message-pool use stays bounded (same discipline as the `999` page). Keeps the current fork-and-answer model — no media mixing.
-* **Acceptance**: a zone code pages only that zone's members; membership configurable via the existing ring-group API; per-zone cap enforced; heap returns to baseline after the page (Static Pool recycle, per `BENCHMARKS.md`).
+* **Acceptance**: a zone code pages only that zone's members; membership configurable via the existing ring-group API; per-zone cap enforced; heap returns to baseline after the page (Static Pool recycle, per `BENCHMARKS.md`). Host-tested (`PageZone_test.cpp`).
 * **Notes**: Promotes `FEATURE_ROADMAP.md` P2 "Paging zones."
 
-### 🔵 Issue #67: [Feature] BLF / Presence (`SUBSCRIBE`/`NOTIFY`, dialog-info)
-* **Status**: ⏳ Open / Planned (Backlog)
+### 🟢 Issue #67: [Feature] BLF / Presence (`SUBSCRIBE`/`NOTIFY`, dialog-info)
+* **Status**: ✅ Shipped (`onSubscribe`, RFC 4235 `dialog-info+xml`)
 * **Labels**: `feature`, `sip`, `presence`
 * **Description**: Let desk-phone busy-lamp-field keys reflect extension/line state the server already tracks (registration + active `Session`). Implement `SUBSCRIBE`/`NOTIFY` for `dialog-info+xml` with a **bounded** subscription table and NOTIFY fan-out on state change.
-* **Acceptance**: a phone subscribed to ext X gets NOTIFY on X ringing/answered/idle; subscription table is capacity-capped; expiry refresh handled; no unbounded fan-out.
+* **Acceptance**: a phone subscribed to ext X gets NOTIFY on X ringing/answered/idle; subscription table is capacity-capped; expiry refresh handled; no unbounded fan-out. A real-hardware smoke-test pass on a BLF-capable phone is tracked separately above (`hardware-testing` label).
 * **Notes**: Promotes `FEATURE_ROADMAP.md` P2 "BLF / presence." Pairs with provisioning (BLF keys are provisionable).
 
 ### 🔵 Issue #68: [Feature] Directed Call Pickup (pickup groups)
@@ -97,13 +119,158 @@ signaling and tracks state. See **Non-Goals** below for the hard scope boundary.
 * **Notes**: Promotes `FEATURE_ROADMAP.md` "Dial plan / hunt groups."
 
 ### ⚪ Non-Goals (hard scope boundary)
-pocket-dial stays a **LAN-only, peer-to-peer-media PBX**. The following are **out of scope** and intentionally not implemented here — every feature above is designed to need none of them:
-* **Server-side media bridging / mixing / relay** (any "media anchor" that terminates and relays or mixes RTP). All media stays phone↔phone.
-* **Upstream trunk / PSTN integration** and **third-party telephony-provider connectors**. pocket-dial does not originate or terminate external trunks.
+pocket-dial's default call path stays **LAN-only, peer-to-peer media** — every feature above is
+signaling-only and needs none of the below. **Out of scope, intentionally not implemented here:**
+* **Specific commercial telephony-provider connectors** (3CX, or any other named vendor's
+  call-control API). `TelephonyProviderRegistry` (`src/SIP/TelephonyProvider.hpp`) is the
+  extension point — implement your own `AnchorClient` and register it; pocket-dial ships only
+  the `Loopback` reference, and `TelephonyProviderType` names no commercial vendor.
+* **PSTN/trunk call-origination policy** — deciding *when* a dialed number routes to an anchor
+  instead of a local extension, registering to an upstream trunk, NAT/SBC concerns. That's the
+  policy a fork writes alongside its own `AnchorClient`; wiring it into `RequestsHandler`'s call
+  routing is out of scope here.
+
+**What DOES ship, opt-in:** `AnchorClient` / `MediaBridge` / `TelephonyProvider` /
+`TelephonyApiConfig` (`src/SIP/`) are the vendor-neutral "bones" for bridging a call to an
+external audio system — compiled, unit-tested, and ready to extend, but not wired into any call
+path by default. `MixBus` (`src/SIP/MixBus.*`, see
+[docs/CONFERENCE_MIXER.md](docs/CONFERENCE_MIXER.md)) is a standalone, tested N-way audio mixer,
+also not yet wired into `MediaBridge` (tracked: #75 below). **Dialing a number does nothing with
+any of this today** — these are building blocks, not a feature you can pick up a phone and use,
+until a fork (or a future pass here) adds the routing policy.
+
+---
+
+## Anchored Media (Opt-In, Vendor-Agnostic)
+
+### 🔵 Issue #75: [Feature] Wire MixBus into MediaBridge for local N-way conferencing
+* **Status**: ⏳ Open / Planned (Backlog)
+* **Labels**: `feature`, `media`, `conferencing`
+* **Description**: `MixBus` (the N-way audio summing junction, §1–6 of
+  [docs/CONFERENCE_MIXER.md](docs/CONFERENCE_MIXER.md)) is implemented, unit-tested, and
+  vendor-neutral, but `MediaBridge` still serves one 1:1 leg per instance — the bus isn't wired
+  into the call path. §7 of that doc sketches the diff: `MediaBridge`'s RX/TX callbacks swap to
+  `bus.inputFrame`/`outputFrame`, `startBridge`/`stopBridge` gain `bus.attach`/`detach`, and a
+  single periodic tick driver replaces nothing else. This is generic LAN-conferencing
+  functionality (no anchor/vendor required — handset legs alone are enough ports), distinct from
+  and not blocked on the anchor call-routing policy noted in Non-Goals above.
+* **Acceptance**: 3+ registered extensions can be bridged onto one `MixBus` instance (via
+  whatever dial mechanism lands with this issue — e.g. a conference extension/star-code, design
+  TBD); each hears the sum of the others, minus itself; a leg leaving doesn't disturb the rest.
+* **Notes**: Scalar kernel cost is ~64k adds/s at ≤8 narrowband ports — negligible on a 240 MHz
+  core (see CONFERENCE_MIXER.md §4). Vectorising (the PIE kernels, `src/SIP/pie/`) stays opt-in
+  behind `POCKETDIAL_MIXBUS_PIE` until profiling says it's needed.
 
 ---
 
 ## Resolved Issues
+
+### 🟢 Issue #73: `Held` state CDR-logged as Failed with zero duration
+* **Status**: ✅ Resolved (sip-backport)
+* **Labels**: `bug`, `cdr`, `hold-resume`
+
+#### Resolution
+`recordCdr()` switch did not handle `Session::State::Held`; it fell to `default: Failed`
+with `durationSec = 0`. Any call torn down while on hold (e.g. session-timer expiry,
+`sweepSessionTimers`) produced a zero-duration Failed CDR record even for calls that had
+been answered and talked for minutes. Fixed by adding `Held` to the `Connected`/`Bye`
+`CdrResult::Answered` case, which also computes talk time from `_startTime` (preserved
+across hold/resume by the `prev == Held` guard in `Session::setState`).
+
+---
+
+### 🟢 Issue #72: `sweepSessionTimers` sends malformed BYE when dialog-To header is empty
+* **Status**: ✅ Resolved (sip-backport)
+* **Labels**: `bug`, `session-timers`, `sip`
+
+#### Resolution
+Both BYE guards in `sweepSessionTimers` checked only `!dFrom.empty()`. If `dTo` was
+empty (possible when `armSessionTimer` was called from `onReinvite` before dialog headers
+were fully captured by `onOk`), `buildServerBye` received an empty `toHeader`, producing
+a `To: \r\n` line that phones drop as malformed. The session then re-fired malformed BYEs
+on every sweep tick without ever freeing the slot. Fixed by requiring `!dTo.empty()` on
+both guards before building either BYE.
+
+---
+
+### 🟢 Issue #71: `onParkInvite` retrieve path cleared the park slot before checking session-pool availability
+* **Status**: ✅ Resolved (sip-backport)
+* **Labels**: `bug`, `parking`, `reliability`
+
+#### Resolution
+The retrieve path sent the re-INVITE to the parked party and pushed the Call-ID to
+`_parkPendingAcks` before calling `allocateSession` for the retriever. If the session
+pool was exhausted, `allocateSession` returned nullptr and the `slot = ParkSlot{}` clear
+ran unconditionally, leaving a live untracked parked dialog: the parked phone answered the
+re-INVITE, an ACK was sent, but there was no retriever session, so all subsequent BYEs
+returned 481 and CDR was never recorded. Fixed by allocating the retriever session first;
+on failure a `503 Service Unavailable` is returned and the slot is left intact. The 200 OK
+and re-INVITE are sent only after a successful allocation.
+
+---
+
+### 🟢 Issue #70: tick()-originated INVITE forks had no RFC 3261 §17 retransmit coverage
+* **Status**: ✅ Resolved (sip-backport)
+* **Labels**: `bug`, `transaction-layer`, `reliability`
+
+#### Resolution
+The `registerTx` outbox scan (which registers outgoing INVITEs for Timer A/B retransmit)
+existed only in `handle()`. `tick()` populates `_outbox` with new INVITEs via
+`parkSweep()` → `startParkRingback()`, `huntRingNext()` → `buildInviteFork()`, and
+`redirectInvite()` → `buildInviteFork()`, but had no equivalent scan — all three paths
+sent INVITEs fire-and-forget with no retransmit. On a lossy link (Wi-Fi, cross-VLAN)
+these silently fail: park ring-back never reaches the parker, CFNA redirect never arrives,
+hunt-group next-ring never rings the next member. Fixed by adding the same `classifyTxType`
+/ `registerTx` scan loop in `tick()` before the outbox drain.
+
+---
+
+### 🟢 Issue #69b (fix): Broadcast re-INVITE hold re-triggered the first-answer connect path
+* **Status**: ✅ Resolved (sip-backport, part of #69 fix)
+* **Labels**: `bug`, `hold-resume`, `broadcast`
+
+#### Resolution
+`onOk`'s broadcast first-answer block was guarded by
+`session.value()->getState() != Session::State::Connected`. After `onReinvite()` set state
+to `Held`, the condition was true and the block executed: it overwrote the established
+dest with `setDest(answeringClient)`, forced state back to `Connected`, and sent CANCEL to
+already-gone pending targets. The hold 200 OK was forwarded as if it were a fresh call
+answer; no ACK was sent to the answering phone; Timer D fired 32 s later. Fixed by
+changing the guard to `state == Session::State::Invited` so the first-answer path only
+fires for a genuine new answer from a pending fork.
+
+---
+
+### 🟢 Issue #68b (fix): `sendParkReinvite` emitted Call-ID without mandatory header name
+* **Status**: ✅ Resolved (sip-backport, found during #68 code review)
+* **Labels**: `bug`, `parking`, `sip`
+
+#### Resolution
+The retrieve re-INVITE assembled by `sendParkReinvite` emitted `slot.callID` as a bare
+line with no `"Call-ID: "` label (e.g. `abc123@192.168.1.1\r\n`), violating RFC 3261
+§20.8 which requires Call-ID in every request. The parked phone received an invalid SIP
+request and rejected it with 400 or dropped it silently, stranding the parked dialog even
+though the retriever had already been answered with 200 OK. Fixed by prepending `"Call-ID: "`.
+
+---
+
+### 🟢 Issue #67b (fix): `getPrimaryLocalIP()` called inside `_mutex` across 7 new functions
+* **Status**: ✅ Resolved (sip-backport, found during #67 code review)
+* **Labels**: `bug`, `performance`, `concurrency`
+
+#### Resolution
+`onReinvite`, `onUpdate`, `buildDialogNotify`, `sendParkReinvite`, `startParkRingback`,
+`handleParkOk`, and `handleTransferOk` all called `getPrimaryLocalIP()` while holding
+`_mutex` inside `handle()` or `tick()`. `getPrimaryLocalIP()` performs a
+`socket`/`connect`/`getsockname`/`close` syscall chain (plus `WSAStartup`/`WSACleanup`
+on Windows), violating CLAUDE.md's "no blocking I/O under the registrar lock" rule. The
+same functions also constructed `std::ostringstream` objects (heap allocation) in the
+hot path, violating the "zero heap in the packet hot path" rule. Fixed by resolving the
+local IP once at construction time into `_localIp` and replacing all
+`(_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp` expressions with `_localIp`
+throughout `RequestsHandler.cpp`.
+
+---
 
 ### 🟢 Issue #48: `RequestsHandler` Mutex Lock Contention under Status Polling
 * **Status**: ✅ Resolved (v1.3.0 / `32166b5` & `f09a98c`)

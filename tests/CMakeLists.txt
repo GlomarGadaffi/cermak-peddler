@@ -29,8 +29,13 @@ add_executable(sip_parser_tests
     SipDigest_test.cpp
     ArpLookup_test.cpp
     Pbx_test.cpp
+    PageZone_test.cpp
     Rtp_test.cpp
     RtpReceiver_test.cpp
+    PlayoutBuffer_test.cpp
+    AnchorClient_test.cpp
+    MediaBridge_test.cpp
+    MixBus_test.cpp
     Tui_test.cpp
     # The ANSI sysop-terminal renderer is transport-agnostic and host-compilable
     # (no wolfSSH, no ESP — only an esp_timer guard, behind ESP_PLATFORM). It links
@@ -61,6 +66,21 @@ add_executable(sip_parser_tests
     # !ESP_PLATFORM so the µ-law decode + RTP-parse helpers and the single-stream
     # cap are unit-testable on the desktop build (see RtpReceiver_test.cpp).
     ../src/SIP/RtpReceiver.cpp
+    # Adaptive jitter buffer used by AnchorClient implementations. Pure C++17;
+    # no ESP/socket dependencies. Exercises write/read/overrun/underrun paths.
+    ../src/SIP/PlayoutBuffer.cpp
+    # AnchorClient reference implementation. Pure loopback (no network); exercises
+    # the AnchorClient contract: init/start/makeCall/audio/drop/stop lifecycle.
+    ../src/SIP/LoopbackAnchorClient.cpp
+    # RTP<->AnchorClient glue. Host-compilable: RtpReceiver/RtpSender::start()
+    # are no-op stubs under !ESP_PLATFORM, so the lifecycle/identity bookkeeping
+    # and the feedRx -> PlayoutBuffer path are exercisable on the desktop build.
+    ../src/SIP/MediaBridge.cpp
+    # Conference mix bus (see docs/CONFERENCE_MIXER.md). Pure C++17, no ESP
+    # dependency. mix_kernels_scalar.cpp is the always-on scalar reference --
+    # the ESP32-S3 PIE vector kernels (src/SIP/pie/) are opt-in and not built here.
+    ../src/SIP/MixBus.cpp
+    ../src/SIP/mix_kernels_scalar.cpp
     ../src/SIP/RequestsHandler.cpp
     ../src/SIP/SipSdpMessage.cpp
     ../src/SIP/SipClient.cpp

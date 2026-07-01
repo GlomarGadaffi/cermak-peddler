@@ -17,12 +17,17 @@ Cross-references:
 [../ISSUES.md](../ISSUES.md) ·
 [../README.md](../README.md)
 
-> **Framing.** pocket-dial is a *signalling-only* SIP registrar/proxy: it brokers call
-> setup and never touches RTP audio (media is peer-to-peer — see [SCALING.md](SCALING.md) §1).
-> That single architectural fact decides what is cheap (anything signalling-side,
-> bounded by the pre-allocated pools) and what is expensive (anything that would put the
-> MCU in the media path — mixing, transcoding, SRTP, recording). Every priority below is
-> assigned with that line drawn.
+> **Framing.** pocket-dial's default call path is a *signalling-only* SIP registrar/proxy: it
+> brokers call setup and never touches RTP audio (media is peer-to-peer — see
+> [SCALING.md](SCALING.md) §1). That single architectural fact decides what is cheap (anything
+> signalling-side, bounded by the pre-allocated pools) and what is expensive (anything that would
+> put the MCU in the media path). Every priority below is assigned with that line drawn. An
+> **opt-in** exception exists: `AnchorClient`/`MediaBridge`/`TelephonyProvider` (`src/SIP/`) are a
+> vendor-neutral extension point for bridging a call to an external audio system, and `MixBus`
+> (`src/SIP/MixBus.*`) is a tested N-way mixer — both ship compiled and unit-tested but unwired
+> from call routing by default (see [ISSUES.md](../ISSUES.md) Non-Goals). They don't change the
+> framing above for the default path; they're there for a fork that wants to cross the line
+> deliberately, on its own terms.
 
 ---
 
@@ -43,7 +48,8 @@ Cross-references:
 | Security (HTTP) | Same-origin/CSRF check, 16 KB body cap, `SO_RCVTIMEO`, no wildcard CORS | `ARCHITECTURE.md` §5 |
 | Dev / debug | Desktop (Linux/Windows) host build & CI smoke harness; SIP load tester + liveness/SSH/HTTP smoke scripts | `main.cpp`, `tests/load/sip_stress.py`, `.smoke/`, `tests/http/test_api.sh` |
 | **Config over SSH** | **SSH "sysop terminal"** — wolfSSH on ESP-IDF v6 + an ANSI/TUI hub (banner → System Monitor · Network · PBX Config · Security · Reports/CDR · About). Ring groups, call-forward, and DND are configurable over SSH. Hardware-verified end-to-end. | `src/Helpers/Tui.cpp`, `src/Helpers/SshServer.cpp`, `cmake/patch_wolfssl.py`, `docs/design/` |
-| **PBX call features** | CDR ring, per-extension **DND**, **call-forward** (CFU/CFB/CFNA), **ring groups** (ring-all / hunt), **blind transfer** (REFER), DTMF star-codes (`*60/*80/*72/*73/*69/*11`) | `src/SIP/RequestsHandler.cpp`, `CallDetailRecord.hpp`, `PbxConfig.hpp` |
+| **PBX call features** | CDR ring, per-extension **DND**, **call-forward** (CFU/CFB/CFNA), **ring groups** (ring-all / hunt), **blind transfer** (REFER), **hold/resume** (re-INVITE + RFC 3311 UPDATE), **session timers** (RFC 4028), **call parking** (orbits `700`-`709`), **paging zones** (`980`-`989`), **BLF/presence** (`SUBSCRIBE`/`NOTIFY`, RFC 4235), DTMF star-codes (`*60/*80/*72/*73/*69/*11`) | `src/SIP/RequestsHandler.cpp`, `CallDetailRecord.hpp`, `PbxConfig.hpp` |
+| **Anchored media (opt-in, unwired)** | `AnchorClient`/`MediaBridge`/`TelephonyProvider`/`TelephonyApiConfig` — vendor-neutral building blocks for bridging a call to an external audio system (ships with only a `Loopback` reference); `MixBus` — a tested N-way audio mixer. Neither is wired into call routing by default; see [ISSUES.md](../ISSUES.md) Non-Goals. | `src/SIP/MediaBridge.*`, `src/SIP/TelephonyProvider.*`, `src/SIP/MixBus.*` |
 
 ---
 
@@ -159,10 +165,12 @@ Iteration D  ── Observability & ops
   P2  Provisioning dashboard editor ........ UI on top of Iteration B
 
 Iteration E+ ── Bigger bets
-  P1  Dial plan / hunt groups (reuse 999 forking) · Call parking
-  P2  BLF/presence · paging zones · DHCP Opt-66 · multi-vendor provisioning
+  ✓   Call parking · BLF/presence · paging zones ........... shipped (ISSUES.md #65-67)
+  P1  Dial plan / hunt-group generalization (reuse 999 forking) · directed pickup .. ISSUES.md #68/#69
+  P2  DHCP Opt-66 · multi-vendor provisioning
   P2  Secure Boot v2 + flash encryption + signed OTA  (durable physical/supply-chain fix)
   P2  Multi-AP/mesh · optional HTTPS · SRTP
+  P2  Wire MixBus into MediaBridge for local N-way conferencing (opt-in) .......... ISSUES.md #75
 ```
 
 **Why this order:**
@@ -190,7 +198,7 @@ static-pool architecture, not for any other reason.
 
 | Non-goal | Why (technical) |
 |----------|-----------------|
-| **On-MCU media mixing / conferencing** | Requires an RTP mixer (CPU + media bandwidth + buffers) the MCU cannot afford while running SIP + LVGL. Breaks the "server never touches RTP" invariant ([SCALING.md](SCALING.md) §1). Only viable as a relay to an *external* mixer. |
+| **On-MCU media mixing / conferencing wired into live calls** | The scalar mixer (`MixBus`) is implemented and tested — ~64k adds/s at ≤8 narrowband ports, a rounding error on a 240 MHz core (see [CONFERENCE_MIXER.md](CONFERENCE_MIXER.md) §4) — but it is *not* wired into `MediaBridge`'s call path or any dial-plan entry point (tracked: [ISSUES.md](../ISSUES.md) #75). Still breaks the "server never touches RTP" invariant for the *default* path ([SCALING.md](SCALING.md) §1) whenever it IS wired in — that's a deliberate, bounded opt-in, not a removal of the invariant for ordinary LAN calls. |
 | **On-device voicemail (record/playback)** | Same reason: media must traverse and be stored/transcoded on the device. Scope only as routing to an external SIP voicemail UA. |
 | **On-MCU transcoding** | No DSP budget. The engine deliberately *rewrites SDP to G.711 (`0 8 101`)* and forces phones via provisioning rather than transcoding; that is the design, not a gap. |
 | **Wideband / Opus / G.722 media negotiation** | The interop strategy is to *lock* to G.711; supporting wideband would reintroduce the codec-mismatch failures `enforceG711()` exists to prevent. |

@@ -43,18 +43,25 @@ and `partitions_4mb.csv`.
 
 - **SIP registrar + PBX** — extensions register and call each other; digest auth and call setup handled on-device.
 - **Peer-to-peer RTP** — media goes phone↔phone, not through the MCU.
+- **Call control** — blind transfer (REFER), hold/resume (re-INVITE + RFC 3311 UPDATE), session
+  timers (RFC 4028), call parking (orbits `700`-`709`), paging zones (`980`-`989`), BLF/presence
+  (`SUBSCRIBE`/`NOTIFY`, RFC 4235), ring groups (ring-all / hunt), call-forward (CFU/CFB/CFNA), DND.
 - **Star codes** — echo test, do-not-disturb, and other classic PBX star codes (see [docs/API.md](docs/API.md)).
 - **Web UI + HTTP API** — manage extensions and DND from a browser or `POST /api/dnd`.
 - **NVS provisioning** — inject credentials/config without rebuilding ([docs/PROVISIONING.md](docs/PROVISIONING.md)).
 - **Dual-OTA firmware updates** ([docs/OTA.md](docs/OTA.md)).
 - **Optional SSH sysop terminal** — a TUI console served over SSH (`-D PD_HOST_SSH=ON`, built on wolfSSH).
 - **Runs on the desktop too** — same engine, GoogleTest-covered and CI-gated.
+- **Anchored media, opt-in** — `AnchorClient`/`MediaBridge`/`TelephonyProvider` are a vendor-neutral
+  extension point for bridging a call to an external audio system, and `MixBus` is a tested N-way
+  conference mixer. Both ship compiled and unit-tested but **not wired into call routing** — bring
+  your own connector and dial-plan policy (see [docs/CONFERENCE_MIXER.md](docs/CONFERENCE_MIXER.md), [ISSUES.md](ISSUES.md) Non-Goals).
 
 ## Docs
 
 - [SETUP_GUIDE.md](docs/SETUP_GUIDE.md) · [FLASHING.md](docs/FLASHING.md) · [HARDWARE.md](docs/HARDWARE.md) — getting running
 - [PHONE_COMPATIBILITY.md](docs/PHONE_COMPATIBILITY.md) — phones people have actually registered
-- [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [RTP.md](docs/RTP.md) — how it works inside
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [RTP.md](docs/RTP.md) · [CONFERENCE_MIXER.md](docs/CONFERENCE_MIXER.md) — how it works inside
 - [PROVISIONING.md](docs/PROVISIONING.md) · [OTA.md](docs/OTA.md) — config and updates
 - [SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md) · [THREAT_MODEL.md](docs/THREAT_MODEL.md) — security posture
 - [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — when it doesn't
@@ -75,9 +82,11 @@ before sending firmware PRs.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache License 2.0 — see [LICENSE](LICENSE). The original engine this project was forked
+from (BarGabriel/SipServer) is MIT-licensed; that notice is preserved as-is in
+[LICENSE-MIT](LICENSE-MIT). See [NOTICE](NOTICE) for the full attribution.
 
 ## Companion projects
 
 - [pocket-dial-handset](https://github.com/GlomarGadaffi/pocket-dial-handset) — ESP32-S3 push-to-talk SIP handset that registers to pocket-dial
-- [resiprocate](https://github.com/GlomarGadaffi/resiprocate) — the vendored SIP/ICE/TURN/STUN/RTP stack
+- [BarGabriel/SipServer](https://github.com/BarGabriel/SipServer/) — the original MIT-licensed SIP server this engine was vendored and extended from (see [LICENSE-MIT](LICENSE-MIT))

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <sstream>
 #include <cctype>
+#include <cstring>
 #include <cstdlib>
 #include <algorithm>
 #include "SipMessageTypes.h"
@@ -32,6 +33,11 @@
 
 std::vector<std::shared_ptr<SipMessage>> RequestsHandler::_messagePool;
 
+// File-scope static helpers defined later in this translation unit.
+static bool sameAddress(const sockaddr_in&, const sockaddr_in&);
+static std::string parkTagOf(std::string_view header);
+static std::string stripHeaderName(std::string_view fullLine);
+
 namespace
 {
 	// Default lease granted when a REGISTER does not request one (seconds).
@@ -58,6 +64,7 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	OnHandledEvent onHandledEvent) :
 	_onHandled(onHandledEvent),
 	_serverIp(std::move(serverIp)),
+	_localIp(_serverIp == "0.0.0.0" ? getPrimaryLocalIP() : _serverIp),
 	_serverPort(serverPort)
 {
 	initHandlers();
@@ -80,6 +87,11 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 		{
 			_messagePool.push_back(std::make_shared<SipSdpMessage>("", sockaddr_in{}));
 		}
+	}
+	_virtualPeerPool.reserve(POCKETDIAL_VIRTUAL_PEERS);
+	for (int i = 0; i < POCKETDIAL_VIRTUAL_PEERS; ++i)
+	{
+		_virtualPeerPool.push_back(std::make_shared<SipClient>());
 	}
 
 	// Reload persisted PBX config (call-forward / ring groups) and the CDR ring from
@@ -130,7 +142,9 @@ void RequestsHandler::initHandlers()
 	_handlers.emplace(SipMessageTypes::BYE,               std::bind(&RequestsHandler::onBye,            this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::REQUEST_TERMINATED,std::bind(&RequestsHandler::onReqTerminated,  this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::REFER,             std::bind(&RequestsHandler::onRefer,          this, std::placeholders::_1));
+	_handlers.emplace(SipMessageTypes::UPDATE,            std::bind(&RequestsHandler::onUpdate,         this, std::placeholders::_1));
 	_handlers.emplace(SipMessageTypes::MESSAGE,           std::bind(&RequestsHandler::onMessage,        this, std::placeholders::_1));
+	_handlers.emplace(SipMessageTypes::SUBSCRIBE,         std::bind(&RequestsHandler::onSubscribe,      this, std::placeholders::_1));
 }
 
 void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
@@ -170,6 +184,11 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 		}
 
 		maybeSweep();
+
+		// RFC 3261 §17 transaction layer: advance the state machine for any tracked
+		// InviteClient transaction before the TU handler runs. A 1xx moves Calling →
+		// Proceeding (stops retransmitting); a 2xx/3xx-6xx → Accepted/Completed.
+		matchAndAdvanceTx(request);
 
 		// Route responses by parsed numeric status code so dispatch is immune to
 		// reason-phrase variation (e.g. "486 Busy" vs "486 Busy Here"). Requests and
@@ -242,7 +261,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 			{
 				auto infoOk = getMessageFromPool(request->toString(), request->getSource());
 				infoOk->setHeader(SipMessageTypes::OK);
-				std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+				std::string activeIp = _localIp;
 				infoOk->setVia(std::string(request->getVia()) + ";received=" + activeIp);
 				_outbox.emplace_back(request->getSource(), std::move(infoOk));
 			}
@@ -258,6 +277,21 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 			{
 				it->second(std::move(request));
 			}
+		}
+
+		// BLF change detection: one pass after every handled packet covers
+		// registration appear/disappear, session create/transition/teardown.
+		// NOTIFYs land in _outbox and ride out with this pass (after unlock).
+		refreshSubscriptions();
+
+		// RFC 3261 §17: register any new outgoing INVITE in _outbox for retransmit.
+		// Scan after BLF NOTIFYs are added so the full outbox is covered; classifyTxType
+		// filters to INVITE requests only so NOTIFYs and responses are ignored.
+		for (const auto& [addr, msg] : _outbox)
+		{
+			auto txType = classifyTxType(msg);
+			if (txType != SipTransaction::Type::None)
+				registerTx(txType, addr, msg);
 		}
 
 		localOutbox = std::move(_outbox);
@@ -302,7 +336,7 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader("SIP/2.0 400 Bad Request");
 		response->clearBody();
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
@@ -382,7 +416,7 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 			auto response = getMessageFromPool(data->toString(), data->getSource());
 			response->setHeader("SIP/2.0 503 Service Unavailable");
 			response->clearBody();
-			std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+			std::string activeIp = _localIp;
 			response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 			_outbox.emplace_back(data->getSource(), std::move(response));
 			return;
@@ -391,7 +425,7 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 
 	auto response = getMessageFromPool(data->toString(), data->getSource());
 	response->setHeader(SipMessageTypes::OK);
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	// Echo the granted lease back in the Contact so the client knows when to refresh.
@@ -403,7 +437,7 @@ void RequestsHandler::onOptions(std::shared_ptr<SipMessage> data)
 {
 	auto response = getMessageFromPool(data->toString(), data->getSource());
 	response->setHeader(SipMessageTypes::OK);
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	response->setContact(buildContact(data->getFromNumber()));
@@ -413,6 +447,19 @@ void RequestsHandler::onOptions(std::shared_ptr<SipMessage> data)
 void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 {
 	std::string destNumber(data->getToNumber());
+
+	// Issue #46: same off-path teardown guard as onBye(). A CANCEL whose Call-ID
+	// names an established two-leg dialog must come from a leg IP.
+	if (auto cancelSess = getSession(data->getCallID());
+		cancelSess.has_value() &&
+		!isDialogSourceAuthorized(cancelSess.value(), data->getSource()))
+	{
+		queueLog("CANCEL for Call-ID " + std::string(data->getCallID()) +
+			" rejected: source not a dialog leg (spoofed teardown)", true);
+		sendForbidden(data, "Forbidden");
+		return;
+	}
+
 	if (destNumber == "777")
 	{
 		endCall(data->getCallID(), data->getFromNumber(), "777");
@@ -427,12 +474,19 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	if (destNumber == "999")
+	if (parkOrbitIndex(destNumber) >= 0)
+	{
+		endCall(data->getCallID(), data->getFromNumber(), destNumber);
+		refreshParkSnapshot();
+		return;
+	}
+
+	if (destNumber == "999" || isPageZoneDialog(destNumber))
 	{
 		auto session = getSession(data->getCallID());
 		if (session.has_value())
 		{
-			std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+			std::string activeIp = _localIp;
 			std::string serverIpPort = activeIp + ":" + std::to_string(_serverPort);
 			std::string originalCSeq(data->getCSeq());
 			size_t invitePos = originalCSeq.find("INVITE");
@@ -456,7 +510,7 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 				_outbox.emplace_back(target->getAddress(), std::move(cancelMsg));
 			}
 		}
-		endCall(data->getCallID(), data->getFromNumber(), "999");
+		endCall(data->getCallID(), data->getFromNumber(), destNumber);
 		return;
 	}
 
@@ -482,12 +536,22 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// should retransmit that response; for 2xx, the ACK re-drive handles it. The
 	// simplest safe policy here is a silent drop so we never create a second session
 	// slot for the same dialog, which could exhaust the pool and trigger spurious 503.
-	if (auto existing = getSession(data->getCallID());
-		existing.has_value() &&
-		(existing.value()->getState() == Session::State::Invited ||
-		 existing.value()->getState() == Session::State::Connected))
+	if (auto existing = getSession(data->getCallID()); existing.has_value())
 	{
-		return; // silent drop per RFC 3261 §17.2.3
+		const auto st = existing.value()->getState();
+		// Mid-dialog re-INVITE (RFC 3261 §12.2): To-tag present = established dialog.
+		// This is the hold/resume path — route to onReinvite().
+		if ((st == Session::State::Connected || st == Session::State::Held) &&
+			std::string_view(data->getTo()).find("tag=") != std::string_view::npos)
+		{
+			onReinvite(data);
+			return;
+		}
+		if (st == Session::State::Invited || st == Session::State::Connected ||
+			st == Session::State::Held)
+		{
+			return; // silent drop per RFC 3261 §17.2.3
+		}
 	}
 
 	if (!isValidAor(data->getFromNumber()) || !isValidAor(data->getToNumber()))
@@ -495,7 +559,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader("SIP/2.0 400 Bad Request");
 		response->clearBody();
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
@@ -508,7 +572,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader("SIP/2.0 403 Forbidden");
 		response->clearBody();
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
@@ -521,7 +585,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		auto ringing = getMessageFromPool(data->toString(), data->getSource());
 		ringing->setHeader("SIP/2.0 180 Ringing");
 		ringing->clearBody();
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		ringing->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		std::string toTag = IDGen::GenerateID(9);
 		ringing->setTo(std::string(data->getTo()) + ";tag=" + toTag);
@@ -580,11 +644,53 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// Paging zones (980–989): a configured zone is a scoped 999 — fork an intercom
+	// INVITE to every registered zone member. An unconfigured 98x falls through to
+	// normal routing (and 404s, since 98x is not a real extension/group target).
+	if (pbx::isPageZoneExt(destNumber))
+	{
+		if (const pbx::PageZone* zone = findPageZone(destNumber))
+		{
+			std::vector<std::shared_ptr<SipClient>> targets;
+			for (const auto& m : zone->members)
+			{
+				if (m == caller.value()->getNumber()) continue;
+				auto mc = findClient(m);
+				if (mc.has_value())
+					targets.push_back(mc.value());
+			}
+
+			if (targets.empty())
+			{
+				std::shared_ptr<SipMessage> responseObj = getMessageFromPool(data->toString(), data->getSource());
+				responseObj->setHeader(SipMessageTypes::UNAVAILABLE);
+				responseObj->clearBody();
+				responseObj->setContact(buildContact(caller.value()->getNumber()));
+				_outbox.emplace_back(data->getSource(), std::move(responseObj));
+				return;
+			}
+
+			startBroadcastFork(data, caller.value(), std::move(targets), /*intercom=*/true);
+			return;
+		}
+	}
+
 	if (destNumber == "440")
 	{
 		// Media beachhead: the server answers and sources a one-way RTP tone stream.
 		onMediaInvite(data, caller.value());
 		return;
+	}
+
+	// Call parking (park-orbit, 700..70N): an INVITE to a FREE orbit parks the
+	// caller's leg there; an INVITE to an OCCUPIED orbit retrieves the parked call.
+	{
+		int orbitIdx = parkOrbitIndex(destNumber);
+		if (orbitIdx >= 0)
+		{
+			onParkInvite(data, caller.value(), orbitIdx);
+			return;
+		}
 	}
 
 	// Ring / hunt groups (Class A sweep): a configured group extension (e.g. 6xx)
@@ -647,7 +753,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		auto ringing = getMessageFromPool(data->toString(), data->getSource());
 		ringing->setHeader("SIP/2.0 180 Ringing");
 		ringing->clearBody();
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		ringing->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		ringing->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 		ringing->setContact(buildContact(destNumber));
@@ -681,7 +787,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader("SIP/2.0 480 Temporarily Unavailable");
 		response->clearBody();
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		response->setContact(buildContact(caller.value()->getNumber()));
 		endHandle(data->getFromNumber(), response);
@@ -819,7 +925,7 @@ bool RequestsHandler::parseCallerRtp(const std::shared_ptr<SipMessage>& invite,
 void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 	const std::shared_ptr<SipClient>& caller)
 {
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 
 	// Single-stream cap: a 2nd dial of 440 while a stream is live is rejected so the
 	// one media slot/socket/task is never double-booked (degrade gracefully).
@@ -1046,11 +1152,23 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 {
 	auto session = getSession(data->getCallID());
 	std::string destNumber(data->getToNumber());
+
+	// Issue #46: reject an off-path forged teardown. A BYE for an established
+	// two-phone dialog must originate from one of the call's leg IPs.
+	if (session.has_value() &&
+		!isDialogSourceAuthorized(session.value(), data->getSource()))
+	{
+		queueLog("BYE for Call-ID " + std::string(data->getCallID()) +
+			" rejected: source not a dialog leg (spoofed teardown)", true);
+		sendForbidden(data, "Forbidden");
+		return;
+	}
+
 	if (destNumber == "777")
 	{
 		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader(SipMessageTypes::OK);
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		endCall(data->getCallID(), data->getFromNumber(), destNumber);
@@ -1064,18 +1182,18 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		_rtpSender.stop(std::string(data->getCallID()));
 		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader(SipMessageTypes::OK);
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		endCall(data->getCallID(), data->getFromNumber(), destNumber);
 		return;
 	}
 
-	if (destNumber == "999")
+	if (destNumber == "999" || isPageZoneDialog(destNumber))
 	{
 		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader(SipMessageTypes::OK);
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 
@@ -1147,6 +1265,13 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// Park dialogs (server-originated re-INVITE ACKs + ring-back answers).
+	if (handleParkOk(data))
+		return;
+	// Attended-transfer re-INVITE ACKs.
+	if (handleTransferOk(data))
+		return;
+
 	auto session = getSession(data->getCallID());
 	if (session.has_value())
 	{
@@ -1156,11 +1281,48 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 			return;
 		}
 
-		if (data->getCSeq().find(SipMessageTypes::INVITE) != std::string::npos) 
+		if (data->getCSeq().find(SipMessageTypes::INVITE) != std::string::npos)
 		{
+			// Re-INVITE answer (hold/resume): relay 200 OK to the opposite leg and
+			// preserve the session state set by onReinvite() — do NOT re-run connect.
+			{
+				const auto st = session.value()->getState();
+				if ((st == Session::State::Connected || st == Session::State::Held) &&
+					!session.value()->isBroadcast())
+				{
+					auto legSrc  = session.value()->getSrc();
+					auto legDest = session.value()->getDest();
+					if (legSrc && legDest)
+					{
+						std::shared_ptr<SipClient> peer;
+						if (sameAddress(data->getSource(), legSrc->getAddress()))
+						{
+							peer = legDest;
+						}
+						else if (sameAddress(data->getSource(), legDest->getAddress()))
+						{
+							if (!data->getBody().empty())
+								session.value()->setRemoteSdp(std::string(data->getBody()));
+							peer = legSrc;
+						}
+						if (peer)
+						{
+							_outbox.emplace_back(peer->getAddress(), data);
+							return;
+						}
+					}
+				}
+			}
+
 			if (session.value()->isBroadcast())
 			{
-				if (session.value()->getState() != Session::State::Connected)
+				// Only the first answer from a pending fork (Invited state) should run
+				// the connect path. A re-INVITE 200 OK from an already-connected or held
+				// broadcast call (Held / Connected state) falls through to a silent drop
+				// below — the peer relay above was already skipped by !isBroadcast(), so
+				// the hold/resume path for broadcast calls is currently unsupported and
+				// the 200 OK is discarded (the hold stays in place). (#69)
+				if (session.value()->getState() == Session::State::Invited)
 				{
 					auto clientOpt = findClientByAddress(data->getSource());
 					if (!clientOpt.has_value())
@@ -1257,6 +1419,12 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 			session->get()->setDest(client.value());
 			session->get()->setState(Session::State::Connected);
 			session->get()->clearRingTimer();   // answered: disarm any CFNA timeout
+			// Capture dialog From/To and callee SDP so attended transfer can
+			// cross-connect two live sessions without querying stored invite messages.
+			session->get()->setDialogHeaders(std::string(data->getFrom()),
+			                                std::string(data->getTo()));
+			session->get()->setRemoteSdp(std::string(data->getBody()));
+			armSessionTimer(session->get(), data);
 			auto response = getMessageFromPool(data->toString(), data->getSource());
 			response->setContact(buildContact(data->getToNumber()));
 			endHandle(data->getFromNumber(), std::move(response));
@@ -1291,7 +1459,7 @@ void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 		if (answeringClient)
 		{
 			auto ackFork = getMessageFromPool(data->toString(), data->getSource());
-			std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+			std::string activeIp = _localIp;
 			std::string serverIpPort = activeIp + ":" + std::to_string(_serverPort);
 
 			char ipBuf[INET_ADDRSTRLEN]{};
@@ -1355,7 +1523,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader("SIP/2.0 403 Forbidden");
 		response->clearBody();
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
@@ -1398,7 +1566,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader(SipMessageTypes::BAD_REQUEST);
 		response->clearBody();
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		return;
@@ -1409,7 +1577,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		auto accepted = getMessageFromPool(data->toString(), data->getSource());
 		accepted->setHeader(SipMessageTypes::ACCEPTED);
 		accepted->clearBody();
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		accepted->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		accepted->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 		_outbox.emplace_back(data->getSource(), std::move(accepted));
@@ -1455,7 +1623,7 @@ void RequestsHandler::onMessage(std::shared_ptr<SipMessage> data)
 	auto response = getMessageFromPool(data->toString(), data->getSource());
 	response->setHeader(SipMessageTypes::OK);
 	response->clearBody();
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	_outbox.emplace_back(data->getSource(), std::move(response));
@@ -1469,7 +1637,7 @@ void RequestsHandler::buildInviteFork(const std::shared_ptr<SipMessage>& invite,
 	auto inviteFork = getMessageFromPool(invite->toString(), invite->getSource());
 	inviteFork->setContact(buildContact(caller->getNumber()));
 
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	char ipBuf[INET_ADDRSTRLEN]{};
 	inet_ntop(AF_INET, &target->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
 	std::string targetIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(target->getAddress().sin_port));
@@ -1521,7 +1689,7 @@ void RequestsHandler::startBroadcastFork(std::shared_ptr<SipMessage> invite,
 	auto ringing = getMessageFromPool(invite->toString(), invite->getSource());
 	ringing->setHeader("SIP/2.0 180 Ringing");
 	ringing->clearBody();
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	ringing->setVia(std::string(invite->getVia()) + ";received=" + activeIp);
 	ringing->setTo(std::string(invite->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	ringing->setContact(buildContact(contactExt));
@@ -1615,7 +1783,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildReferNotify(const std::shared_
 {
 	// RFC 3515 §2.4.5 NOTIFY: Event: refer + message/sipfrag body reporting the
 	// transfer result. Sent within the REFER's dialog back to the transferor.
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	char ipBuf[INET_ADDRSTRLEN]{};
 	inet_ntop(AF_INET, &transferor->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
 	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(transferor->getAddress().sin_port));
@@ -1650,7 +1818,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildCancel(const std::shared_ptr<S
 	// Build a CANCEL for an outstanding forked INVITE leg toward `target`, derived
 	// from the original INVITE (same Call-ID / branch). Mirrors the inline CANCEL
 	// construction used by onCancel()/onOk() for the 999 path.
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	std::string serverIpPort = activeIp + ":" + std::to_string(_serverPort);
 
 	auto cancelMsg = getMessageFromPool(invite->toString(), invite->getSource());
@@ -1673,13 +1841,15 @@ std::shared_ptr<SipMessage> RequestsHandler::buildCancel(const std::shared_ptr<S
 	return cancelMsg;
 }
 
-void RequestsHandler::setCallState(std::string_view callID, Session::State state)
+bool RequestsHandler::setCallState(std::string_view callID, Session::State state)
 {
 	auto session = getSession(callID);
 	if (session)
 	{
 		session->get()->setState(state);
+		return true;
 	}
+	return false;
 }
 
 void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumber, std::string_view destNumber, std::string_view reason)
@@ -1687,6 +1857,11 @@ void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumbe
 	// DTMF accumulators are keyed by Call-ID and share the dialog lifecycle; drop
 	// this dialog's entry so _dtmfState can't grow unbounded across calls (Fix #4).
 	_dtmfState.erase(std::string(callID));
+
+	// RFC 3261 §17: free any transaction slots tracking retransmits for this call.
+	freeTxsForCallId(callID);
+	// Free any park orbit slot holding this call's parked leg.
+	freeParkSlot(callID);
 
 	// Capture the session (for CDR start time / final state) BEFORE we erase it.
 	std::shared_ptr<Session> ending;
@@ -1761,6 +1936,7 @@ void RequestsHandler::recordCdr(const std::shared_ptr<Session>& session,
 			// the later Bye transition does NOT touch it, so getStartTime() still marks
 			// the answer instant in both cases — talk time is now - startTime.
 			case Session::State::Connected:
+			case Session::State::Held:   // call torn down mid-hold → still Answered (#73)
 			case Session::State::Bye:
 				result = CdrResult::Answered;
 				{
@@ -1970,7 +2146,7 @@ void RequestsHandler::endHandle(std::string_view destNumber, std::shared_ptr<Sip
 
 std::string RequestsHandler::buildContact(std::string_view number) const
 {
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	return "Contact: <sip:" + std::string(number) + "@" + activeIp + ":" + std::to_string(_serverPort) + ";transport=UDP>";
 }
 
@@ -2485,7 +2661,7 @@ void RequestsHandler::sendChallenge(const std::shared_ptr<SipMessage>& data, boo
 	auto response = getMessageFromPool(data->toString(), data->getSource());
 	response->setHeader("SIP/2.0 401 Unauthorized");
 	response->clearBody();
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	// Fresh stateless nonce per challenge; realm MUST match SipSecretStore::kRealm.
@@ -2501,7 +2677,7 @@ void RequestsHandler::sendForbidden(const std::shared_ptr<SipMessage>& data, con
 	auto response = getMessageFromPool(data->toString(), data->getSource());
 	response->setHeader("SIP/2.0 403 " + reason);
 	response->clearBody();
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 	response->syncContentLength();
 	_outbox.emplace_back(data->getSource(), std::move(response));
@@ -2642,7 +2818,7 @@ bool RequestsHandler::sendMessageTo(const std::string& ext, const std::string& t
 		inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf));
 		std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(addr.sin_port));
 
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 
 		std::string callId  = IDGen::GenerateID(16) + "@" + activeIp;
@@ -2711,6 +2887,15 @@ void RequestsHandler::tick()
 		_outbox.clear();
 
 		sweepExpired();
+
+		// RFC 3261 §17: retransmit timed-out INVITE forks and free completed slots.
+		sweepTransactions(now);
+		// RFC 4028: BYE sessions that have exceeded their session-expires timer.
+		sweepSessionTimers(now);
+		// BLF subscription expiry.
+		sweepSubscriptions();
+		// Call-park timeout: ring back the parker or BYE the parked party.
+		parkSweep(now);
 
 		// Belt-and-suspenders (Fix #4): drop DTMF accumulators whose dialog is gone,
 		// in case a teardown path bypassed endCall(). Bounded by the small session pool.
@@ -2898,9 +3083,31 @@ void RequestsHandler::tick()
 				pbx::joinMembers(g.members));
 		}
 
+		// Parked calls view: {orbit, parkedExt, parker, secondsParked}.
+		nextSnapshot.parkedCalls.clear();
+		for (const auto& slot : _parkSlots)
+		{
+			if (slot.state == ParkState::Parked)
+			{
+				int sec = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
+					now - slot.parkedAt).count());
+				nextSnapshot.parkedCalls.emplace_back(slot.orbit, slot.parkedExt, slot.parker, sec);
+			}
+		}
+
 		{
 			std::lock_guard<std::mutex> snapLock(_snapshotMutex);
 			_snapshot = std::move(nextSnapshot);
+		}
+
+		// RFC 3261 §17: register any new outgoing INVITEs for retransmit (mirrors
+		// the same scan in handle()). tick()-originated INVITE forks (park ring-back,
+		// hunt-group next-ring, CFNA redirect) need Timer A/B coverage too. (#70)
+		for (const auto& [addr, msg] : _outbox)
+		{
+			auto txType = classifyTxType(msg);
+			if (txType != SipTransaction::Type::None)
+				registerTx(txType, addr, msg);
 		}
 
 		localOutbox = std::move(_outbox);
@@ -2944,7 +3151,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_
 	inet_ntop(AF_INET, &client->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
 	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(client->getAddress().sin_port));
 
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 
 	std::string callId = IDGen::GenerateID(16) + "@" + activeIp;
@@ -3014,7 +3221,7 @@ void RequestsHandler::sendRegisterBeep(const std::shared_ptr<SipClient>& phone)
 	inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf));
 	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(addr.sin_port));
 
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 
 	std::string callId  = IDGen::GenerateID(16) + "@" + activeIp;
@@ -3086,7 +3293,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildBeepAck(const std::shared_ptr<
 	inet_ntop(AF_INET, &bd->addr.sin_addr, ipBuf, sizeof(ipBuf));
 	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(bd->addr.sin_port));
 
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 
 	std::ostringstream ss;
@@ -3116,7 +3323,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildBeepBye(const std::shared_ptr<
 	inet_ntop(AF_INET, &bd->addr.sin_addr, ipBuf, sizeof(ipBuf));
 	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(bd->addr.sin_port));
 
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 	std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
 
@@ -3148,7 +3355,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildBeepCancel(std::size_t slot)
 	inet_ntop(AF_INET, &bd.addr.sin_addr, ipBuf, sizeof(ipBuf));
 	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(bd.addr.sin_port));
 
-	std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+	std::string activeIp = _localIp;
 	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 
 	std::ostringstream ss;
@@ -3375,6 +3582,16 @@ void RequestsHandler::loadPbxConfig()
 		if (!g.members.empty()) _ringGroups[rec[0]] = std::move(g);
 	}
 
+	// Page zones: ext \t m1,m2,...
+	for (const auto& rec : deserializeBlob(readBlob("pzones")))
+	{
+		if (rec.size() < 2 || rec[0].empty()) continue;
+		if (_pageZones.size() >= static_cast<size_t>(POCKETDIAL_MAX_PAGE_ZONES)) break;
+		pbx::PageZone z;
+		z.members = pbx::splitZoneMembers(rec[1]);
+		if (!z.members.empty()) _pageZones[rec[0]] = std::move(z);
+	}
+
 	nvs_close(h);
 #endif
 }
@@ -3414,6 +3631,25 @@ void RequestsHandler::persistRingGroups()
 	if (nvs_open(NVS_PBX_NS, NVS_READWRITE, &h) == ESP_OK)
 	{
 		nvs_set_str(h, "groups", blob.c_str());
+		nvs_commit(h);
+		nvs_close(h);
+	}
+#endif
+}
+
+void RequestsHandler::persistPageZones()
+{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	std::string blob;
+	for (const auto& [ext, z] : _pageZones)
+	{
+		blob += ext; blob += '\t';
+		blob += pbx::joinMembers(z.members); blob += '\n';
+	}
+	nvs_handle_t h;
+	if (nvs_open(NVS_PBX_NS, NVS_READWRITE, &h) == ESP_OK)
+	{
+		nvs_set_str(h, "pzones", blob.c_str());
 		nvs_commit(h);
 		nvs_close(h);
 	}
@@ -3797,7 +4033,7 @@ void RequestsHandler::onDtmfInfo(std::shared_ptr<SipMessage> data)
 		auto response = getMessageFromPool(data->toString(), data->getSource());
 		response->setHeader("SIP/2.0 403 Forbidden");
 		response->clearBody();
-		std::string activeIp = (_serverIp == "0.0.0.0") ? getPrimaryLocalIP() : _serverIp;
+		std::string activeIp = _localIp;
 		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		_outbox.emplace_back(data->getSource(), std::move(response));
 		accum.digits.clear();
@@ -3930,4 +4166,1272 @@ void RequestsHandler::onDtmfInfo(std::shared_ptr<SipMessage> data)
 		}
 		// else: keep accumulating (target not yet 4 digits)
 	}
+}
+
+// ── File-scope static helpers ─────────────────────────────────────────────────
+
+static bool sameAddress(const sockaddr_in& a, const sockaddr_in& b)
+{
+	return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
+}
+
+// Extract the ;tag= value from a From/To header line.
+static std::string parkTagOf(std::string_view header)
+{
+	size_t p = header.find(";tag=");
+	if (p == std::string_view::npos) return {};
+	p += 5;
+	size_t e = p;
+	while (e < header.size() && header[e] != ';' && header[e] != '>' &&
+		header[e] != ' ' && header[e] != '\r' && header[e] != '\n')
+	{
+		++e;
+	}
+	return std::string(header.substr(p, e - p));
+}
+
+// Strip a leading "HeaderName:" prefix (e.g. "From:", "To:", "Call-ID:") so
+// server-minted requests emit a clean value and never ship a doubled prefix.
+// Safe on bare values (the check is that the text before ':' contains only
+// letter/hyphen chars — so "<sip:...>" is left untouched). Idempotent.
+static std::string stripHeaderName(std::string_view h)
+{
+	size_t colon = h.find(':');
+	if (colon == std::string_view::npos || colon == 0 || colon > 15)
+		return std::string(h);
+	for (size_t i = 0; i < colon; ++i)
+	{
+		char c = h[i];
+		if (!(std::isalpha(static_cast<unsigned char>(c)) || c == '-'))
+			return std::string(h);
+	}
+	size_t v = colon + 1;
+	while (v < h.size() && (h[v] == ' ' || h[v] == '\t')) ++v;
+	size_t e = h.size();
+	while (e > v && (h[e - 1] == '\r' || h[e - 1] == '\n')) --e;
+	return std::string(h.substr(v, e - v));
+}
+
+// ── Mid-dialog re-INVITE (RFC 3261 §12.2 hold/resume) ────────────────────────
+
+void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
+{
+	auto sessionOpt = getSession(data->getCallID());
+	if (!sessionOpt.has_value())
+	{
+		return;
+	}
+	auto session = sessionOpt.value();
+	auto src = session->getSrc();
+	auto dest = session->getDest();
+
+	// Virtual-extension legs (777 echo) have no real peer to relay the offer to —
+	// decline the re-INVITE so the holding phone keeps the call on the original SDP.
+	const std::string destNum = dest ? dest->getNumber() : "";
+	if (destNum == "777" || !src || !dest)
+	{
+		auto response = getMessageFromPool(data->toString(), data->getSource());
+		response->setHeader("SIP/2.0 488 Not Acceptable Here");
+		response->clearBody();
+		std::string activeIp = _localIp;
+		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		_outbox.emplace_back(data->getSource(), std::move(response));
+		return;
+	}
+
+	// Identify the sending leg by source address; the relay target is the peer.
+	std::shared_ptr<SipClient> peer;
+	if (sameAddress(data->getSource(), src->getAddress()))
+	{
+		peer = dest;
+	}
+	else if (sameAddress(data->getSource(), dest->getAddress()))
+	{
+		peer = src;
+	}
+	if (!peer)
+	{
+		return; // not from either leg of this dialog: ignore
+	}
+
+	// Relay UNTOUCHED — no clearBody()/enforceG711() — so the hold SDP
+	// (a=sendonly/inactive) and its Content-Length reach the peer intact.
+	_outbox.emplace_back(peer->getAddress(), data);
+
+	// A re-INVITE from either leg is evidence the endpoint is alive — it counts
+	// as a session-timer refresh.
+	if (session->getSessionExpiresSeconds() > 0)
+	{
+		session->armSessionTimer(session->getSessionExpiresSeconds(),
+		                         session->isRefresher(),
+		                         std::chrono::steady_clock::now());
+	}
+
+	// Track hold state from the offered SDP direction. RFC 3264: an absent
+	// direction attribute implies sendrecv (an active call).
+	const auto dir = data->getSdpDirection();
+	if (dir == SipMessage::SdpDirection::SendOnly ||
+		dir == SipMessage::SdpDirection::RecvOnly ||
+		dir == SipMessage::SdpDirection::Inactive)
+	{
+		session->setState(Session::State::Held);
+		queueLog("Hold: " + std::string(data->getFromNumber()) + " held call " + std::string(data->getCallID()));
+	}
+	else
+	{
+		session->setState(Session::State::Connected);
+		queueLog("Hold: call " + std::string(data->getCallID()) + " resumed");
+	}
+}
+
+// ── Mid-dialog UPDATE (RFC 3311 hold/resume / session-timer keep-alive) ──────
+
+void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
+{
+	auto sessionOpt = getSession(data->getCallID());
+	if (!sessionOpt.has_value())
+	{
+		auto resp = getMessageFromPool(data->toString(), data->getSource());
+		resp->setHeader("SIP/2.0 481 Call/Transaction Does Not Exist");
+		resp->clearBody();
+		_outbox.emplace_back(data->getSource(), std::move(resp));
+		return;
+	}
+	auto session = sessionOpt.value();
+	std::string activeIp = _localIp;
+
+	if (!data->hasSdp())
+	{
+		// Bodiless UPDATE: session-timer refresh — 200 OK and reset expiry.
+		auto resp = getMessageFromPool(data->toString(), data->getSource());
+		resp->setHeader(SipMessageTypes::OK);
+		resp->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		resp->clearBody();
+		resp->syncContentLength();
+		_outbox.emplace_back(data->getSource(), std::move(resp));
+
+		if (session->getSessionExpiresSeconds() > 0)
+		{
+			session->armSessionTimer(session->getSessionExpiresSeconds(),
+			                         session->isRefresher(),
+			                         std::chrono::steady_clock::now());
+		}
+		return;
+	}
+
+	// SDP-bearing UPDATE: relay to the peer leg (same logic as onReinvite).
+	auto src  = session->getSrc();
+	auto dest = session->getDest();
+	const std::string destNum = dest ? dest->getNumber() : "";
+
+	if (destNum == "777" || !src || !dest)
+	{
+		auto resp = getMessageFromPool(data->toString(), data->getSource());
+		resp->setHeader("SIP/2.0 488 Not Acceptable Here");
+		resp->clearBody();
+		_outbox.emplace_back(data->getSource(), std::move(resp));
+		return;
+	}
+
+	std::shared_ptr<SipClient> peer;
+	if (sameAddress(data->getSource(), src->getAddress()))
+		peer = dest;
+	else if (sameAddress(data->getSource(), dest->getAddress()))
+		peer = src;
+
+	if (!peer) return;
+
+	_outbox.emplace_back(peer->getAddress(), data);
+
+	if (session->getSessionExpiresSeconds() > 0)
+	{
+		session->armSessionTimer(session->getSessionExpiresSeconds(),
+		                         session->isRefresher(),
+		                         std::chrono::steady_clock::now());
+	}
+
+	const auto dir = data->getSdpDirection();
+	if (dir == SipMessage::SdpDirection::SendOnly ||
+	    dir == SipMessage::SdpDirection::RecvOnly ||
+	    dir == SipMessage::SdpDirection::Inactive)
+	{
+		session->setState(Session::State::Held);
+		queueLog("Update/Hold: " + std::string(data->getFromNumber()) +
+		         " held call " + std::string(data->getCallID()));
+	}
+	else
+	{
+		session->setState(Session::State::Connected);
+		queueLog("Update/Resume: call " + std::string(data->getCallID()) + " resumed");
+	}
+}
+
+// ── BYE source authorization ──────────────────────────────────────────────────
+
+bool RequestsHandler::isDialogSourceAuthorized(const std::shared_ptr<Session>& session,
+	const sockaddr_in& source) const
+{
+	if (!session)
+	{
+		// Out-of-dialog BYE on a non-existent Call-ID: harmless — nothing to tear down.
+		return true;
+	}
+
+	auto src  = session->getSrc();
+	auto dest = session->getDest();
+
+	// Fail-open for any dialog with a missing leg (half-set-up session).
+	if (!src || !dest)
+	{
+		return true;
+	}
+
+	// Compare source IP only (port-agnostic): a phone may send the BYE from the same
+	// contact IP but a different ephemeral UDP port than the original INVITE.
+	const uint32_t fromIp = source.sin_addr.s_addr;
+	return fromIp == src->getAddress().sin_addr.s_addr ||
+	       fromIp == dest->getAddress().sin_addr.s_addr;
+}
+
+// ── BLF presence (RFC 6665 SUBSCRIBE / RFC 4235 dialog-event NOTIFY) ─────────
+
+std::string RequestsHandler::parseEventPackage(const std::string& raw)
+{
+	size_t pos = 0;
+	while (pos < raw.size())
+	{
+		size_t nl = raw.find('\n', pos);
+		size_t lineEnd = (nl == std::string::npos) ? raw.size() : nl;
+		size_t next = (nl == std::string::npos) ? raw.size() : nl + 1;
+		if (raw[pos] == '\r' || raw[pos] == '\n') break;
+
+		size_t colon = raw.find(':', pos);
+		if (colon != std::string::npos && colon < lineEnd)
+		{
+			std::string name = raw.substr(pos, colon - pos);
+			std::transform(name.begin(), name.end(), name.begin(),
+				[](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+			if (name == "event" || name == "o")
+			{
+				size_t vBegin = colon + 1;
+				size_t vEnd = lineEnd;
+				std::string val = raw.substr(vBegin, vEnd - vBegin);
+				size_t semi = val.find(';');
+				if (semi != std::string::npos) val.erase(semi);
+				size_t b = val.find_first_not_of(" \t\r");
+				size_t e = val.find_last_not_of(" \t\r");
+				if (b == std::string::npos) return "";
+				return val.substr(b, e - b + 1);
+			}
+		}
+		pos = next;
+	}
+	return "";
+}
+
+std::string RequestsHandler::buildDialogInfoXml(const std::string& entity, unsigned version,
+	const std::string& dialogId, const std::string& state, const std::string& direction)
+{
+	// Minimal RFC 4235 document, always state="full": each NOTIFY carries the
+	// complete (zero-or-one element) dialog set, so watchers never need to merge
+	// partials. An empty `state` omits the <dialog> element — the canonical
+	// "idle lamp" body that Yealink/Grandstream BLF keys expect.
+	std::ostringstream xml;
+	xml << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n"
+	    << "<dialog-info xmlns=\"urn:ietf:params:xml:ns:dialog-info\" version=\""
+	    << version << "\" state=\"full\" entity=\"" << entity << "\">\r\n";
+	if (!state.empty())
+	{
+		xml << "<dialog id=\"" << dialogId << "\"";
+		if (!direction.empty()) xml << " direction=\"" << direction << "\"";
+		xml << "><state>" << state << "</state></dialog>\r\n";
+	}
+	xml << "</dialog-info>\r\n";
+	return xml.str();
+}
+
+std::string RequestsHandler::computeDialogState(const std::string& targetAor,
+	std::string& outDirection, std::string& outDialogId) const
+{
+	std::string best;
+	auto rank = [](const std::string& s) -> int {
+		if (s == "confirmed") return 3;
+		if (s == "early")     return 2;
+		if (s == "trying")    return 1;
+		return 0;
+	};
+	for (const auto& [callID, session] : _sessions)
+	{
+		bool isSrc  = session->getSrc()  && session->getSrc()->getNumber()  == targetAor;
+		bool isDest = session->getDest() && session->getDest()->getNumber() == targetAor;
+		if (!isSrc && !isDest) continue;
+
+		std::string state, dir;
+		switch (session->getState())
+		{
+			case Session::State::Invited:
+				state = isDest ? "early" : "trying";
+				dir   = isDest ? "recipient" : "initiator";
+				break;
+			case Session::State::Connected:
+			case Session::State::Held:
+				// RFC 4235 §4: a held call is an established dialog; state stays
+				// "confirmed" so the watcher's BLF lamp remains lit (#53).
+				state = "confirmed";
+				dir   = isSrc ? "initiator" : "recipient";
+				break;
+			default:
+				continue;
+		}
+		if (rank(state) > rank(best))
+		{
+			best = state;
+			outDirection = dir;
+			outDialogId  = callID;
+		}
+	}
+	if (best.empty()) { outDirection.clear(); outDialogId.clear(); }
+	return best;
+}
+
+std::shared_ptr<SipMessage> RequestsHandler::buildDialogNotify(DialogSubscription& sub,
+	const std::string& state, const std::string& direction, const std::string& dialogId,
+	bool terminated, const char* termReason)
+{
+	std::string activeIp = _localIp;
+	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
+	char ipBuf[INET_ADDRSTRLEN]{};
+	inet_ntop(AF_INET, &sub.addr.sin_addr, ipBuf, sizeof(ipBuf));
+	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(sub.addr.sin_port));
+	std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
+
+	std::string entity = "sip:" + sub.targetAor + "@" + srcIpPort;
+	std::string body = buildDialogInfoXml(entity, sub.version, dialogId, state, direction);
+
+	int remaining = 0;
+	if (!terminated)
+	{
+		auto now = std::chrono::steady_clock::now();
+		remaining = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
+			sub.deadline - now).count());
+		if (remaining < 0) remaining = 0;
+	}
+	std::string subState = terminated
+		? ("terminated;reason=" + std::string(termReason))
+		: ("active;expires=" + std::to_string(remaining));
+
+	// NOTIFY runs inside the subscription dialog: our To-tag becomes the From,
+	// the watcher's From becomes the To (RFC 6665 §4.4.1 — roles swap).
+	std::string fromHdr = sub.subTo;
+	std::string toHdr   = sub.watcherFrom;
+	auto stripName = [](const std::string& h) {
+		size_t c = h.find(':');
+		return (c == std::string::npos) ? h : h.substr(c + 1);
+	};
+
+	std::ostringstream ss;
+	ss << "NOTIFY sip:" << destIpPort << " SIP/2.0\r\n"
+	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
+	   << "From:" << stripName(fromHdr) << "\r\n"
+	   << "To:" << stripName(toHdr) << "\r\n"
+	   << "Call-ID: " << sub.callId << "\r\n"
+	   << "CSeq: " << sub.cseq++ << " NOTIFY\r\n"
+	   << "Max-Forwards: 70\r\n"
+	   << "Event: dialog\r\n"
+	   << "Subscription-State: " << subState << "\r\n"
+	   << "Contact: <sip:" << sub.targetAor << "@" << srcIpPort << ">\r\n"
+	   << "User-Agent: pocket-dial\r\n"
+	   << "Content-Type: application/dialog-info+xml\r\n"
+	   << "Content-Length: " << body.size() << "\r\n\r\n"
+	   << body;
+
+	return getMessageFromPool(ss.str(), sub.addr);
+}
+
+void RequestsHandler::onSubscribe(std::shared_ptr<SipMessage> data)
+{
+	std::string activeIp = _localIp;
+
+	// 1. Event-package gate: only the RFC 4235 "dialog" package is implemented.
+	std::string pkg = parseEventPackage(data->toString());
+	if (pkg != "dialog")
+	{
+		auto resp = getMessageFromPool(data->toString(), data->getSource());
+		resp->setHeader(SipMessageTypes::BAD_EVENT);
+		resp->clearBody();
+		resp->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		resp->addHeader("Allow-Events", "dialog");
+		_outbox.emplace_back(data->getSource(), std::move(resp));
+		return;
+	}
+
+	// 2. Watched-target validation.
+	std::string target(data->getToNumber());
+	if (!isValidAor(target))
+	{
+		auto resp = getMessageFromPool(data->toString(), data->getSource());
+		resp->setHeader(SipMessageTypes::BAD_REQUEST);
+		resp->clearBody();
+		resp->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		_outbox.emplace_back(data->getSource(), std::move(resp));
+		return;
+	}
+
+	const int expires = parseRequestedExpires(data);
+	std::string callId(data->getCallID());
+	{
+		size_t c = callId.find(':');
+		if (c != std::string::npos) callId.erase(0, c + 1);
+		size_t b = callId.find_first_not_of(" \t");
+		size_t e = callId.find_last_not_of(" \t\r");
+		callId = (b == std::string::npos) ? "" : callId.substr(b, e - b + 1);
+	}
+
+	// 3. Refresh / unsubscribe: match existing subscription by Call-ID.
+	DialogSubscription* sub = nullptr;
+	for (auto& s : _subscriptions)
+	{
+		if (s.used && s.callId == callId) { sub = &s; break; }
+	}
+
+	if (sub == nullptr && expires > 0)
+	{
+		for (auto& s : _subscriptions)
+		{
+			if (!s.used) { sub = &s; break; }
+		}
+		if (sub == nullptr)
+		{
+			auto resp = getMessageFromPool(data->toString(), data->getSource());
+			resp->setHeader("SIP/2.0 503 Service Unavailable");
+			resp->clearBody();
+			resp->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+			_outbox.emplace_back(data->getSource(), std::move(resp));
+			queueLog("BLF: subscription pool exhausted, 503 to watcher of " + target, true);
+			return;
+		}
+		*sub = DialogSubscription{};
+		sub->used        = true;
+		sub->callId      = callId;
+		sub->watcherFrom = std::string(data->getFrom());
+		sub->subTo       = std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9);
+		sub->targetAor   = target;
+		queueLog("BLF: new subscription, watcher " + std::string(data->getFromNumber())
+			+ " -> target " + target);
+	}
+
+	// 4. 202 Accepted (RFC 6665 §4.2.1).
+	{
+		auto resp = getMessageFromPool(data->toString(), data->getSource());
+		resp->setHeader(SipMessageTypes::ACCEPTED);
+		resp->clearBody();
+		resp->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		if (sub) resp->setTo(sub->subTo);
+		else     resp->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
+		resp->setContact(buildContact(target));
+		resp->addHeader("Expires", std::to_string(expires));
+		_outbox.emplace_back(data->getSource(), std::move(resp));
+	}
+
+	if (sub == nullptr) return;
+
+	sub->addr       = data->getSource();
+	sub->expiresSec = expires;
+	sub->deadline   = std::chrono::steady_clock::now() + std::chrono::seconds(expires);
+
+	// 5. Immediate NOTIFY (RFC 6665 §4.2.1.4).
+	std::string dir, dialogId;
+	std::string state = computeDialogState(target, dir, dialogId);
+	const bool terminating = (expires == 0);
+	auto notify = buildDialogNotify(*sub, state, dir, dialogId, terminating, "noresource");
+	_outbox.emplace_back(sub->addr, std::move(notify));
+	sub->lastState = state + "|" + dir + "|" + dialogId;
+	sub->version++;
+
+	if (terminating)
+	{
+		queueLog("BLF: unsubscribe, watcher of " + target + " released");
+		*sub = DialogSubscription{};
+	}
+}
+
+void RequestsHandler::refreshSubscriptions()
+{
+	for (auto& sub : _subscriptions)
+	{
+		if (!sub.used) continue;
+		std::string dir, dialogId;
+		std::string state = computeDialogState(sub.targetAor, dir, dialogId);
+		std::string token = state + "|" + dir + "|" + dialogId;
+		if (token == sub.lastState) continue;
+		auto notify = buildDialogNotify(sub, state, dir, dialogId, false, "");
+		_outbox.emplace_back(sub.addr, std::move(notify));
+		sub.lastState = token;
+		sub.version++;
+	}
+}
+
+void RequestsHandler::sweepSubscriptions()
+{
+	auto now = std::chrono::steady_clock::now();
+	for (auto& sub : _subscriptions)
+	{
+		if (!sub.used || now < sub.deadline) continue;
+		std::string dir, dialogId;
+		std::string state = computeDialogState(sub.targetAor, dir, dialogId);
+		auto notify = buildDialogNotify(sub, state, dir, dialogId, true, "timeout");
+		_outbox.emplace_back(sub.addr, std::move(notify));
+		queueLog("BLF: subscription to " + sub.targetAor + " expired");
+		sub = DialogSubscription{};
+	}
+}
+
+// ── RFC 3261 §17 INVITE-client transaction (Timer A retransmit / Timer B timeout)
+
+RequestsHandler::SipTransaction::Type
+RequestsHandler::classifyTxType(const std::shared_ptr<SipMessage>& msg)
+{
+	if (!msg || msg->getStatusInfo().has_value()) return SipTransaction::Type::None;
+	if (msg->getType() == "INVITE") return SipTransaction::Type::InviteClient;
+	return SipTransaction::Type::None;
+}
+
+void RequestsHandler::registerTx(SipTransaction::Type type,
+                                  const sockaddr_in& peer,
+                                  const std::shared_ptr<SipMessage>& msg)
+{
+	SipTransaction* slot = nullptr;
+	for (auto& tx : _txPool)
+	{
+		if (tx.type == SipTransaction::Type::None) { slot = &tx; break; }
+	}
+	if (!slot)
+	{
+		queueLog("[tx] pool exhausted — INVITE sent without retransmit tracking", true);
+		return;
+	}
+
+	auto raw = msg->toString();
+	auto now = std::chrono::steady_clock::now();
+	constexpr uint32_t kT1ms     = 500;
+	constexpr uint32_t kTimerBms = 64 * kT1ms; // 32 s
+
+	slot->type          = type;
+	slot->state         = SipTransaction::State::Calling;
+	slot->peer          = peer;
+	slot->msgTruncated  = (raw.size() >= sizeof(slot->msg));
+	slot->msgLen        = raw.size() < sizeof(slot->msg) ? raw.size() : sizeof(slot->msg) - 1;
+	std::memcpy(slot->msg, raw.data(), slot->msgLen);
+	slot->msg[slot->msgLen] = '\0';
+
+	auto branch = msg->getViaBranch();
+	auto bLen   = branch.size() < sizeof(slot->viaBranch) ? branch.size() : sizeof(slot->viaBranch) - 1;
+	std::memcpy(slot->viaBranch, branch.data(), bLen);
+	slot->viaBranch[bLen] = '\0';
+
+	auto method = msg->getCSeqMethod();
+	auto mLen   = method.size() < sizeof(slot->cseqMethod) ? method.size() : sizeof(slot->cseqMethod) - 1;
+	std::memcpy(slot->cseqMethod, method.data(), mLen);
+	slot->cseqMethod[mLen] = '\0';
+
+	auto callId = msg->getCallID();
+	auto cLen   = callId.size() < sizeof(slot->callId) ? callId.size() : sizeof(slot->callId) - 1;
+	std::memcpy(slot->callId, callId.data(), cLen);
+	slot->callId[cLen] = '\0';
+
+	slot->nextRetransmit     = now + std::chrono::milliseconds(kT1ms);
+	slot->transactionTimeout = now + std::chrono::milliseconds(kTimerBms);
+	slot->absorbDeadline     = {};
+	slot->retransmitCount    = 0;
+	slot->currentIntervalMs  = kT1ms;
+}
+
+bool RequestsHandler::matchAndAdvanceTx(const std::shared_ptr<SipMessage>& msg)
+{
+	if (!msg) return false;
+	auto viaBranch = msg->getViaBranch();
+	if (viaBranch.empty()) return false;
+	auto cseqMethod = msg->getCSeqMethod();
+
+	bool matched = false;
+	auto now = std::chrono::steady_clock::now();
+	constexpr uint32_t kTimerLms = 64 * 500; // RFC 6026: 32 s absorb after 2xx
+
+	for (auto& tx : _txPool)
+	{
+		if (tx.type == SipTransaction::Type::None) continue;
+		if (viaBranch != std::string_view(tx.viaBranch)) continue;
+		if (!cseqMethod.empty() && cseqMethod != std::string_view(tx.cseqMethod)) continue;
+
+		matched = true;
+		auto si = msg->getStatusInfo();
+		if (!si.has_value()) continue;
+
+		using Cls = PocketDial::SipStatusClass;
+		switch (si->klass)
+		{
+			case Cls::Provisional:
+				if (tx.state == SipTransaction::State::Calling)
+					tx.state = SipTransaction::State::Proceeding;
+				break;
+			case Cls::Success:
+				tx.state = SipTransaction::State::Accepted;
+				tx.absorbDeadline = now + std::chrono::milliseconds(kTimerLms);
+				break;
+			default:
+				tx.state = SipTransaction::State::Completed;
+				tx.absorbDeadline = now + std::chrono::milliseconds(kTimerLms);
+				break;
+		}
+	}
+	return matched;
+}
+
+void RequestsHandler::sweepTransactions(std::chrono::steady_clock::time_point now)
+{
+	for (auto& tx : _txPool)
+	{
+		if (tx.type == SipTransaction::Type::None) continue;
+
+		if (tx.state == SipTransaction::State::Completed ||
+		    tx.state == SipTransaction::State::Accepted)
+		{
+			if (now >= tx.absorbDeadline)
+				tx.type = SipTransaction::Type::None;
+			continue;
+		}
+
+		if (tx.state == SipTransaction::State::Calling &&
+		    now >= tx.transactionTimeout)
+		{
+			queueLog(std::string("[tx] Timer B expired — INVITE for ") + tx.callId
+				+ " timed out (no provisional response)", true);
+			tx.type = SipTransaction::Type::None;
+			continue;
+		}
+
+		if (tx.state == SipTransaction::State::Calling &&
+		    now >= tx.nextRetransmit)
+		{
+			if (tx.msgLen > 0 && !tx.msgTruncated)
+			{
+				std::string retxStr(tx.msg, tx.msgLen);
+				auto retx = getMessageFromPool(retxStr, tx.peer);
+				if (retx) _outbox.emplace_back(tx.peer, std::move(retx));
+			}
+			tx.currentIntervalMs *= 2;
+			tx.nextRetransmit     = now + std::chrono::milliseconds(tx.currentIntervalMs);
+			tx.retransmitCount++;
+		}
+	}
+}
+
+void RequestsHandler::freeTxsForCallId(std::string_view callId)
+{
+	for (auto& tx : _txPool)
+	{
+		if (tx.type != SipTransaction::Type::None &&
+		    std::string_view(tx.callId) == callId)
+		{
+			tx.type = SipTransaction::Type::None;
+		}
+	}
+}
+
+// ── RFC 4028 session timers ───────────────────────────────────────────────────
+
+void RequestsHandler::armSessionTimer(Session* session,
+                                       const std::shared_ptr<SipMessage>& ok200)
+{
+	uint32_t secs = ok200->getSessionExpiresSecs();
+	if (secs == 0) return;
+	auto ref = ok200->getSessionExpiresRefresher();
+	bool weRefresh = (ref == "uas");
+	session->armSessionTimer(secs, weRefresh, std::chrono::steady_clock::now());
+	session->setDialogHeaders(std::string(ok200->getFrom()), std::string(ok200->getTo()));
+}
+
+void RequestsHandler::sweepSessionTimers(std::chrono::steady_clock::time_point now)
+{
+	std::vector<std::string> toExpire;
+	for (const auto& [callID, session] : _sessions)
+	{
+		if (session->getSessionExpiresSeconds() == 0) continue;
+		const auto st = session->getState();
+		if (st != Session::State::Connected && st != Session::State::Held) continue;
+
+		if (now >= session->getSessionExpiry())
+		{
+			toExpire.push_back(callID);
+		}
+	}
+
+	for (const auto& callID : toExpire)
+	{
+		auto it = _sessions.find(callID);
+		if (it == _sessions.end()) continue;
+		auto session = it->second;
+		auto src  = session->getSrc();
+		auto dest = session->getDest();
+		const std::string& dFrom = session->getDialogFrom();
+		const std::string& dTo   = session->getDialogTo();
+
+		// Guard on both dialog headers: a BYE with an empty From or To is malformed
+		// and phones will drop it, leaving the session alive and re-firing every sweep
+		// tick. dTo can be empty if armSessionTimer was invoked before the 200 OK set
+		// dialog headers (e.g. a partial onReinvite path). (#72)
+		if (src && !dFrom.empty() && !dTo.empty())
+		{
+			auto b = buildServerBye(src->getNumber(), src->getAddress(), callID, dTo, dFrom);
+			if (b) _outbox.emplace_back(src->getAddress(), std::move(b));
+		}
+		if (dest && !dFrom.empty() && !dTo.empty())
+		{
+			auto b = buildServerBye(dest->getNumber(), dest->getAddress(), callID, dFrom, dTo);
+			if (b) _outbox.emplace_back(dest->getAddress(), std::move(b));
+		}
+		queueLog("[session timer] expired — BYE sent for " + callID, true);
+		endCall(callID,
+		        src  ? src->getNumber()  : "",
+		        dest ? dest->getNumber() : "",
+		        "session timer expired");
+	}
+}
+
+// ── Paging zones (980–989) ────────────────────────────────────────────────────
+
+const pbx::PageZone* RequestsHandler::findPageZone(const std::string& extension) const
+{
+	auto it = _pageZones.find(extension);
+	return (it == _pageZones.end()) ? nullptr : &it->second;
+}
+
+bool RequestsHandler::isPageZoneDialog(const std::string& extension) const
+{
+	return pbx::isPageZoneExt(extension) && _pageZones.find(extension) != _pageZones.end();
+}
+
+void RequestsHandler::setPageZone(const std::string& zoneExt, const std::string& members)
+{
+	std::vector<std::pair<bool, std::string>> localLogs;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+
+		if (!pbx::isPageZoneExt(zoneExt))
+		{
+			queueLog("Page zone ignored for non-zone extension " + zoneExt +
+				" (zones are 980-989)", true);
+		}
+		else
+		{
+			std::vector<std::string> list = pbx::splitZoneMembers(members);
+			if (list.empty())
+			{
+				_pageZones.erase(zoneExt);
+				queueLog("Page zone " + zoneExt + " deleted");
+				persistPageZones();
+			}
+			else
+			{
+				bool isNew = (_pageZones.find(zoneExt) == _pageZones.end());
+				if (isNew && _pageZones.size() >= static_cast<size_t>(POCKETDIAL_MAX_PAGE_ZONES))
+				{
+					queueLog("Page zone ignored (table full) for " + zoneExt, true);
+				}
+				else
+				{
+					pbx::PageZone& z = _pageZones[zoneExt];
+					z.members = std::move(list);
+					queueLog("Page zone " + zoneExt + " = " + pbx::joinMembers(z.members));
+					persistPageZones();
+				}
+			}
+		}
+
+		{
+			std::lock_guard<std::mutex> snapLock(_snapshotMutex);
+			_snapshot.pageZones.clear();
+			_snapshot.pageZones.reserve(_pageZones.size());
+			for (const auto& [ext, z] : _pageZones)
+			{
+				_snapshot.pageZones.emplace_back(ext, pbx::joinMembers(z.members));
+			}
+		}
+
+		localLogs = std::move(_logQueue);
+		_logQueue.clear();
+	}
+
+	for (const auto& log : localLogs)
+	{
+		if (log.first) std::cerr << log.second << std::endl;
+		else std::cout << log.second << std::endl;
+	}
+}
+
+std::vector<std::pair<std::string, std::string>> RequestsHandler::getPageZones()
+{
+	std::lock_guard<std::mutex> lock(_snapshotMutex);
+	return _snapshot.pageZones;
+}
+
+// ── Call parking (orbits 700–709) ─────────────────────────────────────────────
+
+int RequestsHandler::parkOrbitIndex(std::string_view ext) const
+{
+	if (ext.size() != 3 || ext[0] != '7' || ext[1] != '0') return -1;
+	if (ext[2] < '0' || ext[2] > '9') return -1;
+	int idx = ext[2] - '0';
+	return (idx < static_cast<int>(_parkSlots.size())) ? idx : -1;
+}
+
+void RequestsHandler::onParkInvite(std::shared_ptr<SipMessage> data,
+	const std::shared_ptr<SipClient>& caller, int orbitIdx)
+{
+	if (orbitIdx < 0 || orbitIdx >= static_cast<int>(_parkSlots.size()) || !caller)
+	{
+		return;
+	}
+	ParkSlot& slot = _parkSlots[orbitIdx];
+	const std::string activeIp = _localIp;
+	const std::string orbit = "70" + std::to_string(orbitIdx);
+	const std::string toTag = IDGen::GenerateID(9);
+
+	if (slot.state == ParkState::Free)
+	{
+		// ── PARK ── answer with an a=inactive hold SDP so the parked party is held.
+		const std::string holdSdp =
+			"v=0\r\n"
+			"o=- 0 0 IN IP4 " + activeIp + "\r\n"
+			"s=pocket-dial\r\n"
+			"c=IN IP4 " + activeIp + "\r\n"
+			"t=0 0\r\n"
+			"m=audio 9 RTP/AVP 0\r\n"
+			"a=inactive\r\n";
+		auto ok = getMessageFromPool(data->toString(), data->getSource());
+		ok->setHeader(SipMessageTypes::OK);
+		ok->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		ok->setTo(std::string(data->getTo()) + ";tag=" + toTag);
+		ok->setContact(buildContact(orbit));
+		ok->setBody(holdSdp);
+		ok->syncContentLength();
+		_outbox.emplace_back(data->getSource(), ok);
+
+		slot = ParkSlot{};
+		slot.state      = ParkState::Parked;
+		slot.orbit      = orbit;
+		slot.callID     = std::string(data->getCallID());
+		slot.parkedExt  = caller->getNumber();
+		slot.parkedAddr = data->getSource();
+		slot.parked        = true;
+		slot.parkedSdp     = std::string(data->getBody());
+		slot.parkedFromTag = parkTagOf(data->getFrom());
+		slot.localTag   = toTag;
+		slot.parker     = caller->getNumber();
+		slot.parkedAt   = std::chrono::steady_clock::now();
+
+		auto virt = allocateVirtualPeer(orbit, data->getSource());
+		if (auto session = allocateSession(std::string(data->getCallID()), caller))
+		{
+			session->setDest(virt);
+			session->setLocalTag(toTag);
+			session->setInviteMessage(data);
+			_sessions.emplace(std::string(data->getCallID()), session);
+			session->setState(Session::State::Connected);
+		}
+		queueLog("Park: " + caller->getNumber() + " parked on " + orbit);
+		refreshParkSnapshot();
+		return;
+	}
+
+	// ── RETRIEVE ── the orbit is occupied: SDP-swap retrieve.
+	// Allocate the retriever session FIRST (#71): if the pool is exhausted we 503
+	// the retriever and leave the slot intact rather than sending a re-INVITE to
+	// the parked party and then having no session to track the bridge.
+	const std::string parkedSdp(slot.parkedSdp);
+	const std::string retrieverSdp(data->getBody());
+
+	auto virt = allocateVirtualPeer(slot.parkedExt, slot.parkedAddr);
+	auto rsession = allocateSession(std::string(data->getCallID()), caller);
+	if (!rsession)
+	{
+		auto resp = getMessageFromPool(data->toString(), data->getSource());
+		resp->setHeader("SIP/2.0 503 Service Unavailable");
+		resp->clearBody();
+		resp->syncContentLength();
+		_outbox.emplace_back(data->getSource(), std::move(resp));
+		queueLog("Park: retrieve rejected — session pool exhausted", true);
+		return;
+	}
+
+	auto ok = getMessageFromPool(data->toString(), data->getSource());
+	ok->setHeader(SipMessageTypes::OK);
+	ok->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+	ok->setTo(std::string(data->getTo()) + ";tag=" + toTag);
+	ok->setContact(buildContact(orbit));
+	if (!parkedSdp.empty()) ok->setBody(parkedSdp);
+	ok->enforceG711();
+	ok->syncContentLength();
+	_outbox.emplace_back(data->getSource(), ok);
+
+	rsession->setDest(virt);
+	rsession->setPeerCallID(slot.callID);
+	rsession->setLocalTag(toTag);
+	rsession->setInviteMessage(data);
+	_sessions.emplace(std::string(data->getCallID()), rsession);
+	rsession->setState(Session::State::Connected);
+
+	if (auto parked = getSession(slot.callID); parked.has_value())
+	{
+		parked.value()->setPeerCallID(std::string(data->getCallID()));
+	}
+	sendParkReinvite(slot, retrieverSdp);
+	queueLog("Park: " + caller->getNumber() + " retrieved " + slot.parkedExt + " from " + orbit);
+
+	slot = ParkSlot{};
+	refreshParkSnapshot();
+}
+
+void RequestsHandler::sendParkReinvite(ParkSlot& slot, const std::string& sdp)
+{
+	if (slot.callID.empty() || !slot.parked) return;
+	const std::string activeIp = _localIp;
+	const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
+
+	char ipBuf[INET_ADDRSTRLEN]{};
+	inet_ntop(AF_INET, &slot.parkedAddr.sin_addr, ipBuf, sizeof(ipBuf));
+	const std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(slot.parkedAddr.sin_port));
+
+	const std::string theirTag = slot.parkedFromTag;
+	const std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
+	const std::string body = sdp;
+
+	std::ostringstream ss;
+	ss << "INVITE sip:" << slot.parkedExt << "@" << destIpPort << " SIP/2.0\r\n"
+	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
+	   << "From: <sip:" << slot.orbit << "@" << srcIpPort << ">;tag=" << slot.localTag << "\r\n"
+	   << "To: <sip:" << slot.parkedExt << "@" << activeIp << ">;tag=" << theirTag << "\r\n"
+	   << "Call-ID: " << slot.callID << "\r\n"
+	   << "CSeq: 2 INVITE\r\n"
+	   << "Max-Forwards: 70\r\n"
+	   << "Contact: <sip:" << slot.orbit << "@" << srcIpPort << ";transport=UDP>\r\n"
+	   << "User-Agent: pocket-dial\r\n"
+	   << "Content-Type: application/sdp\r\n"
+	   << "Content-Length: " << body.size() << "\r\n\r\n"
+	   << body;
+
+	auto inv = getMessageFromPool(ss.str(), slot.parkedAddr);
+	inv->enforceG711();
+	inv->syncContentLength();
+	_outbox.emplace_back(slot.parkedAddr, std::move(inv));
+	_parkPendingAcks.push_back(slot.callID);
+	queueLog("Park: re-INVITE -> parked party " + slot.parkedExt);
+}
+
+void RequestsHandler::byeParkedParty(const ParkSlot& slot)
+{
+	if (slot.callID.empty()) return;
+	const std::string activeIp = _localIp;
+	const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
+	const std::string fromHeader = "<sip:" + slot.orbit + "@" + srcIpPort + ">;tag=" + slot.localTag;
+	const std::string toHeader = "<sip:" + slot.parkedExt + "@" + activeIp + ">;tag=" + slot.parkedFromTag;
+	auto bye = buildServerBye(slot.parkedExt, slot.parkedAddr,
+		stripHeaderName(slot.callID), fromHeader, toHeader);
+	if (bye) _outbox.emplace_back(slot.parkedAddr, std::move(bye));
+}
+
+void RequestsHandler::startParkRingback(ParkSlot& slot, const std::shared_ptr<SipClient>& parker,
+	std::chrono::steady_clock::time_point now)
+{
+	if (!parker) { byeParkedParty(slot); freeParkSlot(slot.callID); return; }
+	const std::string activeIp = _localIp;
+	const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
+	const sockaddr_in& addr = parker->getAddress();
+
+	char ipBuf[INET_ADDRSTRLEN]{};
+	inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf));
+	const std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(addr.sin_port));
+
+	slot.rbCallID  = "Call-ID: " + IDGen::GenerateID(16) + "@" + activeIp;
+	slot.rbFromTag = IDGen::GenerateID(9);
+	slot.rbBranch  = "z9hG4bK" + IDGen::GenerateID(12);
+	slot.rbAddr    = addr;
+	slot.state     = ParkState::RingingBack;
+	slot.deadline  = now + std::chrono::seconds(30);
+
+	const std::string body = slot.parkedSdp;
+	std::ostringstream ss;
+	ss << "INVITE sip:" << parker->getNumber() << "@" << destIpPort << " SIP/2.0\r\n"
+	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << slot.rbBranch << "\r\n"
+	   << "From: \"PocketDial Park\" <sip:" << slot.orbit << "@" << srcIpPort << ">;tag=" << slot.rbFromTag << "\r\n"
+	   << "To: <sip:" << parker->getNumber() << "@" << activeIp << ">\r\n"
+	   << slot.rbCallID << "\r\n"
+	   << "CSeq: 1 INVITE\r\n"
+	   << "Max-Forwards: 70\r\n"
+	   << "Contact: <sip:" << slot.orbit << "@" << srcIpPort << ";transport=UDP>\r\n"
+	   << "User-Agent: pocket-dial\r\n"
+	   << "Content-Type: application/sdp\r\n"
+	   << "Content-Length: " << body.size() << "\r\n\r\n"
+	   << body;
+
+	auto inv = getMessageFromPool(ss.str(), addr);
+	inv->enforceG711();
+	inv->syncContentLength();
+	_outbox.emplace_back(addr, std::move(inv));
+	queueLog("Park: timeout on " + slot.orbit + " — ringing back parker " + parker->getNumber());
+}
+
+bool RequestsHandler::handleParkOk(const std::shared_ptr<SipMessage>& data)
+{
+	const std::string cseq(data->getCSeq());
+	const std::string callID(data->getCallID());
+	const bool isInviteOk = cseq.find(SipMessageTypes::INVITE) != std::string::npos;
+	if (!isInviteOk) return false;
+
+	// (a) 200 OK to a park re-INVITE sent to the parked party: ACK and free tracking entry.
+	if (auto it = std::find(_parkPendingAcks.begin(), _parkPendingAcks.end(), callID);
+		it != _parkPendingAcks.end())
+	{
+		const std::string activeIp = _localIp;
+		const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
+		const sockaddr_in srcAddr = data->getSource();
+		char ipBuf[INET_ADDRSTRLEN]{};
+		inet_ntop(AF_INET, &srcAddr.sin_addr, ipBuf, sizeof(ipBuf));
+		const std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(srcAddr.sin_port));
+		std::ostringstream ss;
+		ss << "ACK sip:" << data->getToNumber() << "@" << destIpPort << " SIP/2.0\r\n"
+		   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=z9hG4bK" << IDGen::GenerateID(12) << "\r\n"
+		   << "From: " << stripHeaderName(data->getFrom()) << "\r\n"
+		   << "To: " << stripHeaderName(data->getTo()) << "\r\n"
+		   << callID << "\r\n"
+		   << "CSeq: 2 ACK\r\n"
+		   << "Max-Forwards: 70\r\n"
+		   << "Content-Length: 0\r\n\r\n";
+		_outbox.emplace_back(data->getSource(), getMessageFromPool(ss.str(), data->getSource()));
+		_parkPendingAcks.erase(it);
+		return true;
+	}
+
+	// (b) 200 OK to a ring-back INVITE sent to the parker: ACK parker, bridge both legs.
+	for (auto& slot : _parkSlots)
+	{
+		if (slot.state == ParkState::RingingBack && slot.rbCallID == callID)
+		{
+			const std::string activeIp = _localIp;
+			const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
+			char ipBuf[INET_ADDRSTRLEN]{};
+			inet_ntop(AF_INET, &slot.rbAddr.sin_addr, ipBuf, sizeof(ipBuf));
+			const std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(slot.rbAddr.sin_port));
+			std::ostringstream ss;
+			ss << "ACK sip:" << data->getToNumber() << "@" << destIpPort << " SIP/2.0\r\n"
+			   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << slot.rbBranch << "\r\n"
+			   << "From: \"PocketDial Park\" <sip:" << slot.orbit << "@" << srcIpPort << ">;tag=" << slot.rbFromTag << "\r\n"
+			   << "To: " << stripHeaderName(data->getTo()) << "\r\n"
+			   << slot.rbCallID << "\r\n"
+			   << "CSeq: 1 ACK\r\n"
+			   << "Max-Forwards: 70\r\n"
+			   << "Content-Length: 0\r\n\r\n";
+			_outbox.emplace_back(slot.rbAddr, getMessageFromPool(ss.str(), slot.rbAddr));
+
+			sendParkReinvite(slot, std::string(data->getBody()));
+
+			if (auto parker = findClient(slot.parker); parker.has_value())
+			{
+				auto virt = allocateVirtualPeer(slot.parkedExt, slot.parkedAddr);
+				if (auto rb = allocateSession(slot.rbCallID, parker.value()))
+				{
+					rb->setDest(virt);
+					rb->setPeerCallID(slot.callID);
+					rb->setLocalTag(slot.rbFromTag);
+					rb->setParkUac(true);
+					rb->setInviteMessage(data);
+					_sessions.emplace(slot.rbCallID, rb);
+					rb->setState(Session::State::Connected);
+				}
+				if (auto parked = getSession(slot.callID); parked.has_value())
+				{
+					parked.value()->setPeerCallID(slot.rbCallID);
+				}
+			}
+
+			queueLog("Park: parker answered ring-back on " + slot.orbit + " — bridging");
+			slot = ParkSlot{};
+			refreshParkSnapshot();
+			return true;
+		}
+	}
+	return false;
+}
+
+bool RequestsHandler::handleTransferOk(const std::shared_ptr<SipMessage>& data)
+{
+	const std::string cseq(data->getCSeq());
+	const std::string callID(data->getCallID());
+	if (cseq.find(SipMessageTypes::INVITE) == std::string::npos) return false;
+
+	auto it = std::find(_transferPendingAcks.begin(), _transferPendingAcks.end(), callID);
+	if (it == _transferPendingAcks.end()) return false;
+
+	const std::string activeIp = _localIp;
+	const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
+	const sockaddr_in src = data->getSource();
+	char ipBuf[INET_ADDRSTRLEN]{};
+	inet_ntop(AF_INET, &src.sin_addr, ipBuf, sizeof(ipBuf));
+	const std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(src.sin_port));
+
+	std::ostringstream ss;
+	ss << "ACK sip:" << data->getToNumber() << "@" << destIpPort << " SIP/2.0\r\n"
+	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=z9hG4bK" << IDGen::GenerateID(12) << "\r\n"
+	   << "From: " << stripHeaderName(data->getFrom()) << "\r\n"
+	   << "To: " << stripHeaderName(data->getTo()) << "\r\n"
+	   << callID << "\r\n"
+	   << "CSeq: 100 ACK\r\n"
+	   << "Max-Forwards: 70\r\n"
+	   << "Content-Length: 0\r\n\r\n";
+	_outbox.emplace_back(data->getSource(), getMessageFromPool(ss.str(), data->getSource()));
+	_transferPendingAcks.erase(it);
+	return true;
+}
+
+void RequestsHandler::parkSweep(std::chrono::steady_clock::time_point now)
+{
+	for (auto& slot : _parkSlots)
+	{
+		if (slot.state == ParkState::Parked &&
+			(now - slot.parkedAt) >= _parkTimeout)
+		{
+			auto parker = findClient(slot.parker);
+			if (parker.has_value())
+			{
+				startParkRingback(slot, parker.value(), now);
+			}
+			else
+			{
+				queueLog("Park: timeout on " + slot.orbit + " — parker " + slot.parker +
+					" gone, tearing down");
+				byeParkedParty(slot);
+				freeParkSlot(slot.callID);
+			}
+		}
+		else if (slot.state == ParkState::RingingBack && now >= slot.deadline)
+		{
+			queueLog("Park: ring-back on " + slot.orbit + " not answered — tearing down");
+			byeParkedParty(slot);
+			freeParkSlot(slot.callID);
+		}
+	}
+	refreshParkSnapshot();
+}
+
+void RequestsHandler::freeParkSlot(std::string_view callID)
+{
+	for (auto& slot : _parkSlots)
+	{
+		if (slot.state != ParkState::Free && slot.callID == callID)
+		{
+			slot = ParkSlot{};
+		}
+	}
+	_parkPendingAcks.erase(
+		std::remove(_parkPendingAcks.begin(), _parkPendingAcks.end(), std::string(callID)),
+		_parkPendingAcks.end());
+}
+
+void RequestsHandler::refreshParkSnapshot()
+{
+	const auto now = std::chrono::steady_clock::now();
+	std::lock_guard<std::mutex> snapLock(_snapshotMutex);
+	_snapshot.parkedCalls.clear();
+	for (const auto& slot : _parkSlots)
+	{
+		if (slot.state == ParkState::Free) continue;
+		int secs = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
+			now - slot.parkedAt).count());
+		_snapshot.parkedCalls.emplace_back(slot.orbit, slot.parkedExt, slot.parker, secs);
+	}
+}
+
+std::vector<std::tuple<std::string, std::string, std::string, int>> RequestsHandler::getParkedCalls()
+{
+	std::lock_guard<std::mutex> lock(_snapshotMutex);
+	return _snapshot.parkedCalls;
+}
+
+// ── Build helpers ─────────────────────────────────────────────────────────────
+
+std::shared_ptr<SipMessage> RequestsHandler::buildOkWithSdp(
+	const std::shared_ptr<SipMessage>& inviteMsg,
+	const std::string& activeIp,
+	const std::string& toTag,
+	const std::string& sdpBody)
+{
+	auto ok = getMessageFromPool(inviteMsg->toString(), inviteMsg->getSource());
+	ok->setHeader(SipMessageTypes::OK);
+	ok->setVia(std::string(inviteMsg->getVia()) + ";received=" + activeIp);
+	ok->setTo(std::string(inviteMsg->getTo()) + ";tag=" + toTag);
+	ok->setContact(buildContact(inviteMsg->getToNumber()));
+	ok->clearBody();
+	{
+		std::string raw = ok->toString();
+		size_t sep = raw.find("\r\n\r\n");
+		if (sep != std::string::npos)
+		{
+			std::string_view headerView(raw.data(), sep);
+			if (headerView.find("application/sdp") == std::string_view::npos)
+			{
+				raw.insert(sep, "\r\nContent-Type: application/sdp");
+				sep = raw.find("\r\n\r\n");
+			}
+			raw.erase(sep + 4);
+			raw += sdpBody;
+		}
+		ok->reset(std::move(raw), inviteMsg->getSource());
+	}
+	ok->enforceG711();
+	ok->syncContentLength();
+	return ok;
+}
+
+std::shared_ptr<SipMessage> RequestsHandler::buildServerBye(
+	const std::string& destExt,
+	const sockaddr_in& destAddr,
+	const std::string& callId,
+	const std::string& fromHeader,
+	const std::string& toHeader)
+{
+	std::string activeIp = _localIp;
+	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
+	char ipBuf[INET_ADDRSTRLEN]{};
+	inet_ntop(AF_INET, &destAddr.sin_addr, ipBuf, sizeof(ipBuf));
+	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(destAddr.sin_port));
+	std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
+
+	std::ostringstream ss;
+	ss << "BYE sip:" << destExt << "@" << destIpPort << " SIP/2.0\r\n"
+	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
+	   << "From: " << stripHeaderName(fromHeader) << "\r\n"
+	   << "To: " << stripHeaderName(toHeader) << "\r\n"
+	   << "Call-ID: " << stripHeaderName(callId) << "\r\n"
+	   << "CSeq: 2 BYE\r\n"
+	   << "Max-Forwards: 70\r\n"
+	   << "Content-Length: 0\r\n\r\n";
+
+	return getMessageFromPool(ss.str(), destAddr);
+}
+
+std::shared_ptr<SipClient> RequestsHandler::allocateVirtualPeer(std::string number, sockaddr_in address, int expiresSeconds)
+{
+	// A virtual peer is owned solely by the Session._dest it backs, so a pool slot is
+	// free precisely when only the pool itself still references it (use_count()==1).
+	for (auto& peer : _virtualPeerPool)
+	{
+		if (peer.use_count() == 1)
+		{
+			peer->reset(std::move(number), address, expiresSeconds);
+			return peer;
+		}
+	}
+	// Pool drained: fall back to a one-off heap SipClient rather than failing the call.
+	std::cerr << "[WARNING] Virtual-peer pool exhausted! Fallback to heap allocation.\n";
+	return std::make_shared<SipClient>(std::move(number), address, expiresSeconds);
 }

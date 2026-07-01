@@ -13,14 +13,19 @@ RAM, and what breaks if you push it too far.
 
 ## 1. Why RAM is the binding constraint (not CPU or bandwidth)
 
-pocket-dial is a **signalling-only** SIP server. It registers endpoints, routes
-INVITE/BYE/CANCEL, and brokers call setup. It does **not** touch the audio:
+pocket-dial's default call path is a **signalling-only** SIP server. It registers
+endpoints, routes INVITE/BYE/CANCEL, and brokers call setup. It does **not** touch
+the audio for an ordinary call:
 
 * **RTP media is peer-to-peer.** Once two phones complete the SDP offer/answer,
   they stream G.711 audio *directly to each other's IP:port*. The ESP32 never
   sees an RTP packet, never transcodes, never mixes. A connected call costs the
   server **zero** ongoing CPU and **zero** media bandwidth — only the few hundred
-  bytes of `Session` bookkeeping that remember who is talking to whom.
+  bytes of `Session` bookkeeping that remember who is talking to whom. (The
+  capacity model below is about THIS path. `AnchorClient`/`MediaBridge`/`MixBus`
+  are an opt-in exception that puts the board in the media path when a fork wires
+  them in — see [ISSUES.md](../ISSUES.md) Non-Goals; they carry their own,
+  separate CPU/RAM budget, not accounted for here.)
 * **Signalling is bursty and tiny.** A REGISTER or INVITE is a sub-1 KB UDP
   datagram handled in microseconds. Even with aggressive OPTIONS keepalives the
   packet rate per client is a handful per *minute*.

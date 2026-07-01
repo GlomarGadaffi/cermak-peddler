@@ -1,0 +1,9 @@
+pocket-dial
+Copyright (c) 2024-2026 GlomarGadaffi
+
+This product includes software originally developed by BarGabriel
+(https://github.com/BarGabriel/SipServer), used under the MIT License.
+The original MIT license text is preserved in LICENSE-MIT.
+
+All modifications and additions made since the fork are licensed under the
+Apache License, Version 2.0 (see LICENSE).
