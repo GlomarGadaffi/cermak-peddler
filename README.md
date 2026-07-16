@@ -50,7 +50,7 @@ and `partitions_4mb.csv`.
 - **Web UI + HTTP API** — manage extensions and DND from a browser or `POST /api/dnd`.
 - **NVS provisioning** — inject credentials/config without rebuilding ([docs/PROVISIONING.md](docs/PROVISIONING.md)).
 - **Dual-OTA firmware updates** ([docs/OTA.md](docs/OTA.md)).
-- **Optional SSH sysop terminal** — a TUI console served over SSH (`-D PD_HOST_SSH=ON`, built on wolfSSH).
+- **Admin plane, dark by default** — the HTTP dashboard is unreachable on a provisioned device except for a bounded window after a DTMF trigger or a fresh provisioning grace period; see [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md#55-http-admin-plane-dark-by-default-transport-gate--dtmf-trigger-ssh-removed). No SSH surface.
 - **Runs on the desktop too** — same engine, GoogleTest-covered and CI-gated.
 - **Anchored media, opt-in** — `AnchorClient`/`MediaBridge`/`TelephonyProvider` are a vendor-neutral
   extension point for bridging a call to an external audio system, and `MixBus` is a tested N-way

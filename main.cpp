@@ -5,9 +5,6 @@
 #include "HttpServer.hpp"
 #include "IPHelper.hpp"
 #include "cxxopts.hpp"
-#ifdef POCKETDIAL_HAS_WOLFSSH
-#include "SshServer.hpp"
-#endif
 
 int main(int argc, char** argv)
 {
@@ -50,17 +47,6 @@ int main(int argc, char** argv)
 		{
 			std::cout << "Remote LAN Access:  http://" << lanIp << ":" << webPort << "/\n";
 		}
-
-#ifdef POCKETDIAL_HAS_WOLFSSH
-		// SSH sysop terminal (PD_HOST_SSH builds): the same ANSI TUI the device
-		// serves on port 22, here on POCKETDIAL_SSH_PORT (CMake default 2222).
-		// Open (any password) until an admin PIN is provisioned, then PIN-gated.
-		SshServer::instance().attachHandler(&server.getHandler());
-		SshServer::instance().setNetInfo(lanIp.c_str(), 0, "");
-		SshServer::instance().start();
-		std::cout << "SSH sysop terminal: ssh -p " << POCKETDIAL_SSH_PORT
-		          << " sysop@" << (bindIp == "0.0.0.0" ? "localhost" : bindIp) << "\n";
-#endif
 
 		std::cout << "Press ENTER to stop...\n";
 		std::cin.get();

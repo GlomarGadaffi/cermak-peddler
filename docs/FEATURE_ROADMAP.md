@@ -46,8 +46,8 @@ Cross-references:
 | Capacity model | Compile-time pools `POCKETDIAL_MAX_CLIENTS/MAX_SESSIONS/MSG_POOL`; graceful `503` on exhaustion; Pocket/Office/Rack tiers | `src/SIP/PoolConfig.hpp`, [SCALING.md](SCALING.md) |
 | Security (signalling) | Per-source-IP token-bucket rate limit, optional CIDR allowlist, AOR input whitelist, bounded parser (header/body boundary) | `allowPacket`, `ipAllowed`, `isValidAor`, `findHeader` |
 | Security (HTTP) | Same-origin/CSRF check, 16 KB body cap, `SO_RCVTIMEO`, no wildcard CORS | `ARCHITECTURE.md` §5 |
-| Dev / debug | Desktop (Linux/Windows) host build & CI smoke harness; SIP load tester + liveness/SSH/HTTP smoke scripts | `main.cpp`, `tests/load/sip_stress.py`, `.smoke/`, `tests/http/test_api.sh` |
-| **Config over SSH** | **SSH "sysop terminal"** — wolfSSH on ESP-IDF v6 + an ANSI/TUI hub (banner → System Monitor · Network · PBX Config · Security · Reports/CDR · About). Ring groups, call-forward, and DND are configurable over SSH. Hardware-verified end-to-end. | `src/Helpers/Tui.cpp`, `src/Helpers/SshServer.cpp`, `cmake/patch_wolfssl.py`, `docs/design/` |
+| Dev / debug | Desktop (Linux/Windows) host build & CI smoke harness; SIP load tester + liveness/HTTP smoke scripts | `main.cpp`, `tests/load/sip_stress.py`, `.smoke/`, `tests/http/test_api.sh` |
+| **Admin plane, dark by default** | HTTP is the only admin surface (SSH "sysop terminal" — wolfSSH + the ANSI/TUI hub — **removed**, not hardened). Unreachable on a provisioned device except for a bounded TTL after a source-IP-verified DTMF trigger or a fresh provisioning grace window. Ring groups, call-forward, and DND remain configurable — now over the web dashboard only. | `src/Helpers/HttpServer.*`, `src/SIP/RequestsHandler::onDtmfInfo`, [THREAT_MODEL.md](THREAT_MODEL.md) §5.5. `docs/design/` (TUI design docs) is now historical — describes the removed SSH surface, not current behavior. |
 | **PBX call features** | CDR ring, per-extension **DND**, **call-forward** (CFU/CFB/CFNA), **ring groups** (ring-all / hunt), **blind transfer** (REFER), **hold/resume** (re-INVITE + RFC 3311 UPDATE), **session timers** (RFC 4028), **call parking** (orbits `700`-`709`), **paging zones** (`980`-`989`), **BLF/presence** (`SUBSCRIBE`/`NOTIFY`, RFC 4235), DTMF star-codes (`*60/*80/*72/*73/*69/*11`) | `src/SIP/RequestsHandler.cpp`, `CallDetailRecord.hpp`, `PbxConfig.hpp` |
 | **Anchored media (opt-in, unwired)** | `AnchorClient`/`MediaBridge`/`TelephonyProvider`/`TelephonyApiConfig` — vendor-neutral building blocks for bridging a call to an external audio system (ships with only a `Loopback` reference); `MixBus` — a tested N-way audio mixer. Neither is wired into call routing by default; see [ISSUES.md](../ISSUES.md) Non-Goals. | `src/SIP/MediaBridge.*`, `src/SIP/TelephonyProvider.*`, `src/SIP/MixBus.*` |
 
@@ -67,7 +67,9 @@ Cross-references:
 
 > **Update (2026-06-09):** several items previously listed as *proposed* below have since
 > shipped and now appear in §1 — CDR ring, per-extension DND, call-forward (CFU/CFB/CFNA),
-> ring/hunt groups, and blind transfer (REFER) — all surfaced in the new SSH "sysop terminal."
+> ring/hunt groups, and blind transfer (REFER) — originally surfaced in the SSH "sysop
+> terminal" (since removed, 2026-07-15 — see §1's "Admin plane, dark by default" row; these
+> features are unaffected and remain reachable via the web dashboard).
 > Treat their backlog rows in §3.1 as **done** unless a sub-point says otherwise.
 
 > **Known cross-cutting hazard (flagged in [PROVISIONING.md](PROVISIONING.md) §3.3):** SIP

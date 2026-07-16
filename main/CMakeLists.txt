@@ -52,10 +52,8 @@ elseif(SIP_TRANSPORT STREQUAL "lan8720")
     message(STATUS "SipServer transport: LAN8720 Ethernet (internal EMAC / RMII, classic ESP32)")
 elseif(SIP_TRANSPORT STREQUAL "display")
     set(MAIN_SRC "esp_main_display.cpp")
-    # wolfssl__wolfssl + wolfssl__wolfssh provide the SSH console (POCKETDIAL_HAS_WOLFSSH,
-    # set below). They are display-only so they live in EXTRA_REQUIRES, not the base REQUIRES.
     set(EXTRA_REQUIRES esp_lcd espressif__esp_lcd_touch lvgl__lvgl esp_driver_ledc
-        wolfssl__wolfssl wolfssl__wolfssh ${IDF_V6_DRIVERS})
+        ${IDF_V6_DRIVERS})
     set(ADDITIONAL_SRCS "drivers/esp_lcd_axs15231b.c" "ui/ui.cpp" "ui/qrcode.c" "wifi/DnsServer.cpp")
     message(STATUS "SipServer transport: Guition AXS15231B Touch Display (LVGL)")
 else()
@@ -76,8 +74,6 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/Helpers/SipDigest.cpp"
                             "../src/Helpers/SipSecretStore.cpp"
                             "../src/Helpers/ArpLookup.cpp"
-                            "../src/Helpers/SshServer.cpp"
-                            "../src/Helpers/Tui.cpp"
                             "../src/Helpers/OtaUpdater.cpp"
                             "../src/SIP/RequestsHandler.cpp"
                             "../src/SIP/Session.cpp"
@@ -100,13 +96,6 @@ idf_component_register(SRCS ${MAIN_SRC}
                     REQUIRES nvs_flash lwip esp_netif esp_event freertos mdns app_update esp_driver_ledc console esp_timer ${EXTRA_REQUIRES}
                     PRIV_REQUIRES esp_wifi)
 
-# SshServer.cpp initializes esp_console_cmd_t arrays with only the fields it uses (the
-# ESP-IDF console convention; trailing members default to 0). Under -Wextra that trips
-# -Werror=missing-field-initializers. Demote it for this file only — same approach the
-# display build already uses for esp_main_display.cpp and qrcode.c.
-set_source_files_properties("../src/Helpers/SshServer.cpp"
-    PROPERTIES COMPILE_FLAGS "-Wno-error=missing-field-initializers")
-
 # Issue #49: the display transport reserves Core 1 for the LVGL graphics task and
 # runs the SIP engine on Core 0, so the UDP receiver (which carries SIP signaling)
 # must stay on Core 0. The SoftAP/Ethernet transports run SIP on Core 1 and use the
@@ -123,39 +112,8 @@ if(SIP_TRANSPORT STREQUAL "eth")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE ${ETH_BOARD_DEF})
 endif()
 
-# Re-apply the wolfSSL ESP-IDF-v6.0.1 compatibility patches to the freshly fetched
-# (git-ignored) managed component. The wolfssl/wolfssh deps in idf_component.yml are
-# fetched for EVERY transport (the component manager's rules: can't gate on the custom
-# SIP_TRANSPORT var), so the patch must run unconditionally — otherwise eth/wifi/lan8720
-# builds would compile an unpatched wolfSSL and fail. The script is idempotent and a
-# no-op when wolfSSL isn't present. It runs at configure time so the patched sources
-# exist before the wolfssl/wolfssh components compile. See cmake/patch_wolfssl.py for the
-# three fixes (NO_ESP32_CRYPT software crypto, ESP_ENABLE_WOLFSSH, C23 'thread_local'
-# enum rename) and why each is needed on IDF v6.
-find_package(Python3 COMPONENTS Interpreter QUIET)
-if(NOT Python3_EXECUTABLE)
-    set(Python3_EXECUTABLE "python")
-endif()
-execute_process(
-    COMMAND "${Python3_EXECUTABLE}"
-            "${CMAKE_HOME_DIRECTORY}/cmake/patch_wolfssl.py"
-            "${CMAKE_HOME_DIRECTORY}/managed_components"
-    RESULT_VARIABLE _wolfssl_patch_rc)
-if(NOT _wolfssl_patch_rc EQUAL 0)
-    message(FATAL_ERROR "patch_wolfssl.py failed (rc=${_wolfssl_patch_rc}); "
-                        "wolfSSL will not build on ESP-IDF v6 without it.")
-endif()
-
 if(SIP_TRANSPORT STREQUAL "display")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE POCKETDIAL_UDP_RX_CORE=0)
-    # B1 spike: link the wolfSSH SSH console into the display firmware. SshServer.cpp
-    # compiles its full wolfSSH path (instead of the idle stub) when this is defined.
-    # The wolfssl/wolfssh managed components are enabled in main/idf_component.yml and
-    # forced to SOFTWARE crypto (NO_ESP32_CRYPT) so they build on ESP-IDF v6.0.1.
-    # WOLFSSL_USER_SETTINGS makes wolfssh/ssh.h pull wolfssl/wolfcrypt/settings.h ->
-    # user_settings.h (the component config) instead of the autotools-only
-    # wolfssl/options.h, which does not exist in a user_settings build.
-    target_compile_definitions(${COMPONENT_LIB} PRIVATE POCKETDIAL_HAS_WOLFSSH WOLFSSL_USER_SETTINGS)
     # qrcode.c (ricmoo QRCode, vendored): uses #pragma mark (an Xcode-ism) GCC flags as an
     # unknown pragma, plus an `x < 0` guard on an unsigned arg that -Wtype-limits reports
     # as always-false. Both are harmless in this third-party file; demote to warnings.

@@ -50,18 +50,39 @@ HttpServer::HttpServer(const std::string& ip, int port, RequestsHandler* handler
 	WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
 
-	_listenSock = static_cast<int>(socket(AF_INET, SOCK_STREAM, 0));
-	if (_listenSock < 0)
+	// PLAN_ADMIN_HTTP_ONLY.md: dark by default once provisioned. An unprovisioned
+	// device must keep today's behavior exactly (listen immediately — onboarding
+	// needs the web UI reachable before any admin credential exists). A
+	// provisioned device stays dark; acceptLoop()'s per-tick check is what opens
+	// it once a live admin-open deadline exists (invariant I1: fail closed).
+	if (!AdminAuth::isProvisioned())
 	{
-		throw std::runtime_error("HttpServer: TCP socket creation failed");
+		if (!openListenSocket())
+		{
+			throw std::runtime_error("HttpServer: failed to open listen socket on port " + std::to_string(_port));
+		}
+	}
+}
+
+bool HttpServer::openListenSocket()
+{
+	if (_listenSock >= 0)
+	{
+		return true; // already open
+	}
+
+	int sock = static_cast<int>(socket(AF_INET, SOCK_STREAM, 0));
+	if (sock < 0)
+	{
+		return false;
 	}
 
 	// Allow address reuse
 	int opt = 1;
 #if defined _WIN32 || defined _WIN64
-	setsockopt(_listenSock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
+	setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
 #else
-	setsockopt(_listenSock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+	setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 #endif
 
 	sockaddr_in addr{};
@@ -77,28 +98,38 @@ HttpServer::HttpServer(const std::string& ip, int port, RequestsHandler* handler
 	addr.sin_addr.s_addr = htonl(INADDR_ANY);
 	addr.sin_port = htons(static_cast<uint16_t>(_port));
 
-	if (bind(_listenSock, reinterpret_cast<const struct sockaddr*>(&addr), sizeof(addr)) < 0)
+	if (bind(sock, reinterpret_cast<const struct sockaddr*>(&addr), sizeof(addr)) < 0)
 	{
-		closeSocket(_listenSock);
-		throw std::runtime_error("HttpServer: bind failed on port " + std::to_string(_port));
+		closeSocket(sock);
+		return false;
 	}
 
-	if (listen(_listenSock, 8) < 0)
+	if (listen(sock, 8) < 0)
 	{
-		closeSocket(_listenSock);
-		throw std::runtime_error("HttpServer: listen failed");
+		closeSocket(sock);
+		return false;
 	}
+
+	_listenSock = sock;
+	return true;
+}
+
+void HttpServer::closeListenSocket()
+{
+	if (_listenSock < 0)
+	{
+		return; // already closed
+	}
+	shutdown(_listenSock, 2);
+	closeSocket(_listenSock);
+	_listenSock = -1;
 }
 
 HttpServer::~HttpServer()
 {
 	_running = false;
 	// Close the listen socket to unblock accept()
-	if (_listenSock >= 0)
-	{
-		shutdown(_listenSock, 2);
-		closeSocket(_listenSock);
-	}
+	closeListenSocket();
 	if (_acceptThread.joinable())
 	{
 		_acceptThread.join();
@@ -115,6 +146,45 @@ void HttpServer::acceptLoop()
 {
 	while (_running)
 	{
+		// PLAN_ADMIN_HTTP_ONLY.md Phase 2: recompute open/closed every tick.
+		// Unprovisioned devices always stay open (matches the constructor's
+		// initial state). A provisioned device is open only within a live
+		// admin-open deadline; ambiguous/missing handler resolves to closed
+		// (invariant I1 — fail closed).
+		bool shouldBeOpen;
+		if (!AdminAuth::isProvisioned())
+		{
+			shouldBeOpen = true;
+		}
+		else
+		{
+			RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+			uint64_t deadline = handler ? handler->getAdminHttpOpenUntilMs() : 0;
+			shouldBeOpen = (deadline != 0) && (currentTimeMs() < deadline);
+		}
+
+		bool currentlyOpen = (_listenSock >= 0);
+		if (shouldBeOpen && !currentlyOpen)
+		{
+			if (openListenSocket())
+			{
+				std::cerr << "[HttpServer] admin HTTP plane opened\n";
+			}
+		}
+		else if (!shouldBeOpen && currentlyOpen)
+		{
+			closeListenSocket();
+			std::cerr << "[HttpServer] admin HTTP plane closed\n";
+		}
+
+		if (_listenSock < 0)
+		{
+			// Dark: nothing to select() on. Poll at the same ~250ms cadence as
+			// the open path so re-provisioning or TTL expiry is observed promptly.
+			std::this_thread::sleep_for(std::chrono::milliseconds(250));
+			continue;
+		}
+
 		fd_set readfds;
 		FD_ZERO(&readfds);
 		FD_SET(static_cast<unsigned int>(_listenSock), &readfds);
@@ -541,6 +611,18 @@ void HttpServer::handleClient(int clientSock)
 		else
 		{
 			sendApiAdminLogout(clientSock, req);
+		}
+	}
+	else if (req.method == "POST" && req.path == "/api/admin/keepalive")
+	{
+		if (!isSameOrigin(req))
+		{
+			sendResponse(clientSock, 403, "Forbidden", "application/json",
+			             "{\"error\":\"cross-origin request rejected\"}");
+		}
+		else
+		{
+			sendApiAdminKeepAlive(clientSock, req);
 		}
 	}
 	else if (req.method == "GET" && req.path == "/api/ota/status")
@@ -1341,11 +1423,35 @@ void HttpServer::sendApiAdminSetPin(int sock, const HttpRequest& req)
 		return;
 	}
 
+	// The DTMF HTTP-open star-code is *4887 (no '#'); onDtmfInfo fires it the
+	// instant the accumulated sequence equals "*4887", before the *PIN#code
+	// parser runs. A PIN beginning with those four digits would be shadowed —
+	// the star-code opens HTTP mid-entry and clears the accumulator, so the
+	// admin's *PIN#code command never completes. Reserve the prefix at the one
+	// choke point where PINs are set. (Does not retroactively fix a device
+	// already provisioned with a 4887-prefixed PIN; only new/changed PINs.)
+	if (pin.rfind("4887", 0) == 0)
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"PIN must not begin with 4887 (reserved for the HTTP-open star code)\"}");
+		return;
+	}
+
 	if (!AdminAuth::setPin(pin))
 	{
 		sendResponse(sock, 500, "Internal Server Error", "application/json",
 		             "{\"error\":\"failed to store PIN\"}");
 		return;
+	}
+
+	// PLAN_ADMIN_HTTP_ONLY.md: setting a PIN flips AdminAuth::isProvisioned() to
+	// true, which is exactly the condition that puts the accept-loop's
+	// dark-by-default gate into effect. Grant the same TTL window a DTMF trigger
+	// would so the operator who just provisioned (or is changing an existing
+	// PIN, same call path) doesn't lose HTTP access before finishing onboarding.
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		handler->grantAdminHttpGraceWindow();
 	}
 
 	sendResponse(sock, 200, "OK", "application/json",
@@ -1416,6 +1522,26 @@ void HttpServer::sendApiAdminLogout(int sock, const HttpRequest& req)
 	std::string cookie = "Set-Cookie: pd_session=; HttpOnly; Path=/; SameSite=Strict; Max-Age=0";
 	sendResponseWithHeader(sock, 200, "OK", "application/json",
 	                       "{\"status\":\"ok\"}", cookie);
+}
+
+void HttpServer::sendApiAdminKeepAlive(int sock, const HttpRequest& req)
+{
+	if (!isAuthed(req))
+	{
+		sendResponse(sock, 401, "Unauthorized", "application/json",
+		             "{\"error\":\"authentication required\"}");
+		return;
+	}
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	if (!handler)
+	{
+		sendResponse(sock, 503, "Service Unavailable", "application/json",
+		             "{\"error\":\"registrar not ready\"}");
+		return;
+	}
+	handler->extendAdminHttpWindowOneHour();
+	sendResponse(sock, 200, "OK", "application/json",
+	             "{\"status\":\"ok\",\"extendedSeconds\":3600}");
 }
 
 bool HttpServer::streamBody(int sock, const char* prefix, size_t prefixLen,

@@ -6,6 +6,33 @@ This document serves as the active issue tracker and architectural roadmap for *
 
 ## Active Issues & Backlog Roadmap
 
+### 🟡 Issue #77: DTMF CLASS codes bypass `setDnd()`/`setForward()`, dashboard goes stale
+* **Status**: ⏳ Open / Planned
+* **Labels**: `concurrency`, `dashboard`, `tech-debt`
+* **Severity**: Medium
+
+#### Description
+`onDtmfInfo` runs inside `handle()`'s `_mutex` lock (`RequestsHandler.cpp:175`, non-recursive). `setDnd()`/`setForward()` (`RequestsHandler.cpp:2249`/`2330`) each independently take that same `_mutex`, so `onDtmfInfo` cannot call them without deadlocking — and doesn't. Instead, `*60`/`*80` (`RequestsHandler.cpp:4056`/`4066`) write `_dnd` directly, and `*73`/`*72NNNN` (`RequestsHandler.cpp:4078`/`4160`) write `_forwards` directly, bypassing the setters entirely (comment at `:4048` acknowledges this: "We're already inside `_mutex`"). Consequence: `_snapshot.dnd`/`_snapshot.forwards`, which the HTTP dashboard's status endpoint reads, are refreshed *only* inside those setters — a DTMF-triggered DND/forward change never appears on the dashboard until an unrelated HTTP-side call happens to touch the same extension. `*72NNNN`'s inline path also skips a guard `setForward()` has (rejecting virtual extensions as forward targets).
+
+Found during a mutation-path audit of the admin plane (2026-07-15); a real fix needs either a recursive mutex or lock-already-held internal setter variants, not a one-line patch. Related check while here: `*PIN#999`'s DTMF factory-reset (`RequestsHandler.cpp:3987`) does a full `nvs_flash_erase()` where the HTTP factory-reset path only erases a scoped set of keys — worth confirming that divergence is intentional before closing this out.
+
+---
+
+### 🟡 Issue #76: `SipMessage` representation — parse-mutate-reparse on every setter
+* **Status**: ⏳ Open / Planned
+* **Labels**: `performance`, `sip-core`, `tech-debt`
+* **Severity**: Medium
+* **Priority**: do this before taking on any further SIP-layer language/parsing work — it's the load-bearing piece underneath all of it.
+
+#### Description
+`src/SIP/SipMessage.cpp` (740 lines) still represents a message as a single mutable string (`_messageStr`), with every setter (`setHeader`/`setVia`/`setTo`/`setContact`/`setBody`/`syncContentLength`/...) doing an in-place `.replace()` on that string followed by a full reparse. A normal outbound response that touches five or six of those setters therefore re-scans the entire datagram five or six times to emit one packet — on an S3, not a spare-cycles platform.
+
+This is already flagged yellow in `docs/REALITY_CHECK.md` ("transient stack-to-heap cloning of `SipMessage` objects remains") — not new information, just not yet actioned.
+
+Not a memory-safety bug. The fix is a representation change, not a hardening pass: parse once into an immutable typed message, then build responses instead of mutating raw text in place. Pure C++, no new dependency.
+
+---
+
 ### 🟡 Issue #74: Hold/resume on broadcast (ring-group) calls is not yet supported
 * **Status**: ⏳ Open / Planned
 * **Labels**: `bug`, `hold-resume`, `broadcast`

@@ -137,6 +137,8 @@ Each row: threat → current mitigation → **residual risk**.
 |----|--------|-----------|---------------|
 | E-1 | Anonymous AP peer → full admin control | **FIXED**: PIN/session gate on all mutating endpoints. | First-run gap; physical/OTA paths (T-4/T-5). |
 | E-2 | Read endpoints leaking privileged actions | `/api/status`, `/api/wifi/scan`, `/api/admin/status` are read-only and intentionally unauthenticated (the dashboard needs them to render). `/api/admin/status` returns only booleans (`provisioned`, `authenticated`) — no secrets. | Low. SSID list / status are observable by any AP peer (already visible on an open AP anyway). |
+| E-3 | **SSH sysop terminal as a second, unbounded admin surface** | **REMOVED this phase.** `SshServer`/`Tui` and their wolfSSH transport were deleted entirely rather than further hardened — see §5.5. HTTP is now the only admin surface. | None; the surface no longer exists. |
+| E-4 | **Spoofed DTMF admin trigger** — an attacker on the local link sends a crafted SIP INFO `*4887` claiming to be the admin extension | Revised: the original design gated this on a PIN embedded in the DTMF sequence (`*<PIN>#010`), but `#` is bound to Send/Call on Yealink and most SIP hardphones, so a PIN+`#` sequence never reaches the DTMF-relay path intact — real hardphones can't dial it. The trigger is now `*4887` (spells HTTP on the keypad), no PIN, and trust shifts entirely to: caller extension == the admin extension, that extension currently registered, **and** the INFO's source IP matches the registration's bound IP (mirrors the existing dialog-source-IP check used for BYE/teardown). A spoofed `From:` header from a different IP is rejected regardless. | Weaker than the original PIN-gated design in one respect: anyone who can register as the admin extension (from the right IP) can open the transport without knowing the PIN — opening still does not bypass PIN/session auth on the endpoints themselves (§5.1–5.3). An attacker who has *also* spoofed the source IP defeats the IP check the same way IP spoofing defeats any IP-based check on the open AP — see §5.5's residual. |
 
 ---
 
@@ -183,7 +185,42 @@ foreign page from driving the *real* device's API, but it cannot stop a user fro
 secrets into a look-alike. Mitigation is again **WPA2** (raises the bar to join/impersonate)
 plus user guidance to provision over a trusted link.
 
-### 5.5 Cleartext SIP + RTP on the open AP
+### 5.5 HTTP admin plane: dark-by-default transport gate + DTMF trigger, SSH removed
+Summary of what changed and what it does and does not buy:
+
+- **Before**: once provisioned, the HTTP listen socket accepted connections continuously;
+  `/api/*` was gated by PIN/session auth (§5.1–5.3), not by whether the transport was
+  reachable at all. SSH (`SshServer`/`Tui`, wolfSSH) was a **second**, separately-wired admin
+  surface with no comparable auth-gate discipline, always listening on port 22 whenever the
+  display transport was built.
+- **After**: SSH is deleted, not hardened — it no longer exists as an attack surface (E-3).
+  HTTP is dark by default the instant a device is provisioned. It opens only for a bounded
+  TTL (default 10 min, NVS-configurable) after one of three events: (a) a DTMF trigger from
+  the registered admin extension, source-IP-verified against that registration (E-4), (b) the
+  moment a PIN is first set/changed via the web UI itself (a grace window, so onboarding isn't
+  self-defeating — found and fixed during this rollout by exercising the existing
+  `tests/http/test_api.sh` CI smoke suite end-to-end, not just new unit tests), or (c) an
+  already-authenticated operator clicking "Keep open" in the dashboard (`POST
+  /api/admin/keepalive`, gated on a valid `pd_session` cookie — unauthenticated calls get
+  `401` and cannot move the deadline), which extends the window by a flat 1 hour so extended
+  configuration work doesn't get cut off mid-session. **Opening the transport does not bypass
+  PIN/session auth** — §5.1–5.3 apply unchanged once a connection is accepted.
+- **What this buys**: an attacker who has NOT compromised a registered handset (or timed
+  their attempt to land inside someone else's legitimate open window) cannot even reach
+  `/api/admin/login` to attempt PIN brute force (D-3, S-1) — the socket simply refuses the
+  connection. This shrinks the PIN-brute-force and session-token-theft (§5.2, §5.3) exposure
+  window from "always" to "minutes, gated behind a second factor."
+- **Residual, stated honestly**: HTTP is still **plaintext**. During an open window, a
+  same-AP attacker can sniff the admin session exactly as described in §5.3 and §5.6 — this
+  plan does not add TLS (see §6). It only shrinks *when* that sniffing is possible, not
+  whether it's possible during the window. The DTMF trigger's source-IP check is an IP-layer
+  control; it does not defend against an attacker who has ALSO achieved IP spoofing on the
+  local link (the same limitation every IP-based check in this document shares — see T-2's
+  and I-1's WPA2 recommendation as the actual fix for the shared link-layer trust problem).
+  The 250ms accept-loop poll interval means the open/close transition is not instantaneous;
+  this is a scheduling latency, not a security gap (invariant: fails closed on ambiguity).
+
+### 5.6 Cleartext SIP + RTP on the open AP
 This is the largest *confidentiality* gap and is **independent of the dashboard auth fix**.
 The admin PIN protects *control*, not *media*. SIP signaling and G.711 RTP traverse the open
 link in cleartext, so any associated peer can record calls and map who-calls-whom. App-layer
@@ -242,6 +279,11 @@ do it eyes-open about the warning UX and MCU cost.
 - **Mandatory admin PIN — DONE this phase** (PIN + server-side session on all mutating HTTP
   endpoints; lockout; factory reset clears the credential). Make setting the PIN the first
   onboarding step in the UI/docs.
+- **HTTP admin plane dark-by-default + SSH removed — DONE this phase** (see §5.5). The
+  transport itself, not just the auth layer, is now unreachable on a provisioned device
+  except for a bounded TTL after a source-IP-verified DTMF trigger or a fresh provisioning
+  grace window. SSH (`SshServer`/`Tui`, wolfSSH) is deleted, removing the second
+  admin surface entirely rather than hardening it further.
 - **Guidance/UX**: require a PIN of ≥6 alphanumeric chars; warn against 4-digit numeric PINs.
 
 ### P1 — soon (meaningful, moderate effort)

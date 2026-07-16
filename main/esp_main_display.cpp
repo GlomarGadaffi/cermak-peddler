@@ -39,7 +39,6 @@
 #include "OtaUpdater.hpp"
 #include "DnsServer.hpp"
 #include "IPHelper.hpp"
-#include "SshServer.hpp"
 #include "host_compat.h"
 
 static const char *TAG = "main_display";
@@ -408,11 +407,6 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
 static void sip_server_task(void *pvParameters) {
     ESP_LOGI("SipTask", "Starting SipServer engine on Core 0 IP %s:%d", g_localIp.c_str(), 5060);
     SipServer* srv = new SipServer(g_localIp, 5060);
-    // Plumb the live registrar into the SSH sysop-terminal TUI so its hub status
-    // line + title-bar clock show real extension/call counts (thread-safe: the
-    // handler's dashboard getters snapshot-copy under their own mutex). Attaching
-    // a raw pointer is safe — the SipServer lives for the process lifetime.
-    SshServer::instance().attachHandler(&srv->getHandler());
     // Publish with release so the http/status tasks' acquire-load sees a fully
     // constructed object the moment they observe the non-null pointer.
     g_sipServer.store(srv, std::memory_order_release);
@@ -857,20 +851,6 @@ extern "C" void app_main(void) {
     // fails closed.
     //
     // Plumb the real network identity into the SSH sysop-terminal TUI so its banner
-    // ADDR shows the live IP (not 0.0.0.0) and the hub status tail names the real
-    // network role (STATION / AP / SETUP) instead of a hardcoded "AP mode". g_localIp
-    // is set in every branch above (STATION: DHCP lease; Standalone/captive:
-    // 192.168.4.1); the captive-portal path runs with wifi_mode 0 → SETUP. We pass
-    // an effective mode so a decay/standalone fallback reads AP even if wifi_mode
-    // was 0 in NVS.
-    {
-        uint8_t effMode = go_captive ? 0          // captive onboarding → SETUP
-                        : go_standalone ? 2        // own hotspot → AP
-                        : 1;                       // joined an AP → STATION
-        SshServer::instance().setNetInfo(g_localIp.c_str(), effMode, g_wifiSsid);
-    }
-    SshServer::instance().start();
-
     // 5. Spin up periodic status and battery updater task
     xTaskCreatePinnedToCore(&system_status_task, "status_task", 4096, NULL, 3, NULL, 0);
 }

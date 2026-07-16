@@ -6,15 +6,6 @@ dependencies:
     version: "^1.0.1"
     rules:
       - if: "idf_version >= 6.0.0"
-  # Real SSH (wolfSSH) for the "config over SSH" redesign. wolfSSL's ESP port defaults to
-  # ESP32 HARDWARE crypto, which on ESP-IDF v6.0.1 pulls in v5-only headers removed in v6
-  # (driver/periph_ctrl.h, hal/clk_gate_ll.h, PERIPH_*_MODULE) and leaves the wc_ShaXXX.ctx
-  # HW state members half-defined. The fix is to force SOFTWARE crypto via NO_ESP32_CRYPT in
-  # main/user_settings.h (WOLFSSL_USER_SETTINGS_DIR points the component at it). With pure
-  # software crypto none of the removed peripheral headers are touched.
-  # wolfSSH requires wolfSSL >= 5.7.4; 5.8.2 / 1.4.20 are the current registry releases.
-  wolfssl/wolfssl: "^5.8.2"
-  wolfssl/wolfssh: "^1.4.20"
   # LAN8720 (LAN87xx-family) PHY driver. ESP-IDF v6.0 removed the chip-specific
   # Ethernet PHY drivers from core esp_eth into standalone managed components; this
   # provides esp_eth_phy_new_lan87xx() / esp_eth_phy_lan87xx.h for the classic-ESP32

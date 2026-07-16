@@ -42,6 +42,22 @@ public:
 	}
 
 private:
+	// PLAN_ADMIN_HTTP_ONLY.md Phase 2: idempotent socket lifecycle, called only
+	// from this class's own thread (the constructor, before acceptLoop starts;
+	// or acceptLoop itself once running) — never from another thread, so
+	// _listenSock needs no separate lock (invariant I2).
+	bool openListenSocket();                    // no-op + true if already open
+	void closeListenSocket();                   // no-op if already closed; only
+	                                             // stops accepting NEW connections —
+	                                             // it does NOT terminate already-accepted
+	                                             // connections, but the dark-by-default
+	                                             // invariant holds anyway because
+	                                             // handleClient serves exactly one
+	                                             // request/response then closes (no
+	                                             // keep-alive), each on its own detached
+	                                             // thread. Keep that property if you ever
+	                                             // add keep-alive, or this gate leaks.
+
 	void acceptLoop();
 	void handleClient(int clientSock);
 
@@ -89,6 +105,10 @@ private:
 	void sendApiAdminSetPin(int sock, const HttpRequest& req);
 	void sendApiAdminLogin(int sock, const HttpRequest& req);
 	void sendApiAdminLogout(int sock, const HttpRequest& req);
+	// Authenticated keep-alive: extends the admin HTTP-open window by a fixed
+	// 1 hour from an already-logged-in session, so an operator doing extended
+	// configuration work doesn't get cut off by the DTMF trigger's shorter TTL.
+	void sendApiAdminKeepAlive(int sock, const HttpRequest& req);
 
 	// --- OTA firmware-update endpoints (see OtaUpdater.hpp + docs/OTA.md) ---
 	// Streams the request body straight into the inactive OTA slot. This MUST

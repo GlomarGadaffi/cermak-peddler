@@ -36,12 +36,9 @@ add_executable(sip_parser_tests
     AnchorClient_test.cpp
     MediaBridge_test.cpp
     MixBus_test.cpp
-    Tui_test.cpp
-    # The ANSI sysop-terminal renderer is transport-agnostic and host-compilable
-    # (no wolfSSH, no ESP — only an esp_timer guard, behind ESP_PLATFORM). It links
-    # cleanly into the host test binary so the banner/hub/mono-fallback render is
-    # asserted on the desktop.
-    ../src/Helpers/Tui.cpp
+    # Phase 0 of docs/PLAN_ADMIN_HTTP_ONLY.md: dark-by-default HTTP admin plane
+    # test contract. Pulls in HttpServer.cpp for the first time in this target.
+    AdminHttpGate_test.cpp
     # SIP digest-auth primitives + per-extension HA1 secret store. Both are
     # host-compilable: SipDigest vendors a portable MD5 (no mbedTLS) and
     # SipSecretStore uses an in-memory map under !ESP_PLATFORM (no NVS).
@@ -85,6 +82,11 @@ add_executable(sip_parser_tests
     ../src/SIP/SipSdpMessage.cpp
     ../src/SIP/SipClient.cpp
     ../src/SIP/Session.cpp
+    # HttpServer + its OTA dependency, both already host-compilable (platform
+    # guards on every ESP-only branch) but not previously linked into this
+    # target. Needed by AdminHttpGate_test.cpp above.
+    ../src/Helpers/HttpServer.cpp
+    ../src/Helpers/OtaUpdater.cpp
 )
 
 target_link_libraries(sip_parser_tests PRIVATE gtest gtest_main)
