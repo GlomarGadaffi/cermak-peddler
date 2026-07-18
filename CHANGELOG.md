@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased (admin-http-only) - 2026-07-16
+
+Admin-plane hardening: the HTTP dashboard becomes the only admin surface and goes
+dark by default on a provisioned device. Host-verified (130/130 GoogleTest).
+
+### Changed — dark-by-default HTTP admin plane
+
+- **Transport gate**: on a provisioned device the HTTP listener is closed by default.
+  `HttpServer`'s bind/listen moved out of the constructor into
+  `openListenSocket()`/`closeListenSocket()`; the accept loop re-evaluates the gate
+  every ~250 ms and fails closed. An unprovisioned device still listens immediately
+  (onboarding needs the web UI before any credential exists).
+- **DTMF trigger `*4887`** (spells HTTP on the keypad, no PIN): opens the dashboard
+  for a bounded TTL (default 600 s), gated on caller extension == admin extension
+  (default now `1001`), that extension currently registered, and the SIP INFO's
+  source IP matching the registration's bound IP.
+- **Provisioning grace window**: a successful `POST /api/admin/set-pin` grants the
+  same TTL window, so first-run onboarding isn't cut off the instant provisioning
+  flips the gate on.
+- **`POST /api/admin/keepalive`** (authenticated): extends the open window by 1 hour;
+  surfaced as a "Keep open (1h)" dashboard button.
+- **Admin PINs may not begin `4887`** (reserved for the star-code): a PIN with that
+  prefix would be shadowed mid-entry by the trigger and could never drive the DTMF
+  admin menu. Enforced at set-pin; previously-provisioned PINs are unaffected (see
+  ISSUES.md).
+
+### Removed — SSH sysop terminal
+
+- `SshServer`/`Tui` and the wolfSSH transport are **deleted, not hardened** — the
+  second, separately-wired admin surface no longer exists (THREAT_MODEL.md E-3/§5.5).
+  Removes wolfSSL/wolfSSH from `main/idf_component.yml` and all build wiring; the
+  `docs/design/` TUI design folder is retained as historical reference only.
+
+### Fixed
+
+- Removed dead `persistAdminHttpTtl()` (no runtime path ever changed the TTL).
+- Stale comments claiming the admin extension defaults to `101` (actual: `1001`).
+
 ## Unreleased (anchor-bridge-port) - 2026-06-30
 
 Lands the previously-prepared `sip-backport` branch (below) onto `main`, relicenses

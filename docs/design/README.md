@@ -1,5 +1,11 @@
 # pocket-dial — Design System Index (SSH Sysop Terminal)
 
+> **⚠️ HISTORICAL — describes a removed surface.** The SSH sysop terminal and its ANSI TUI
+> were deleted from pocket-dial (see `docs/THREAT_MODEL.md` §5.5: the admin plane is now
+> HTTP-only and dark by default). This folder is preserved as design history — the width
+> discipline, glyph lexicon, and accessibility rules remain good reference material — but
+> nothing in it describes current firmware behavior.
+
 > **Phase-A design sprint · Design-system index & locked decisions.** pocket-dial is a self-contained
 > SIP PBX on a single ESP32-S3 (Guition JC3248W535, 3.5" 320×480 touch display). The redesign reframes
 > it as an **SSH-first "sysop terminal"**: all configuration happens over a retro telco/BBS ANSI TUI

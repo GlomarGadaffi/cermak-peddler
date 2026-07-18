@@ -6,6 +6,26 @@ This document serves as the active issue tracker and architectural roadmap for *
 
 ## Active Issues & Backlog Roadmap
 
+### 🟡 Issue #93: Already-provisioned admin PINs beginning `4887` are shadowed by the `*4887` HTTP-open star-code
+* **Status**: ⏳ Open / Documented residual
+* **Labels**: `security`, `dtmf`
+* **Severity**: Low
+
+#### Description
+`*4887` is matched incrementally in `onDtmfInfo` before the `*PIN#code` parser, so a PIN beginning with those four digits can never complete a DTMF admin command — the star-code fires mid-entry and clears the accumulator. `POST /api/admin/set-pin` now rejects the `4887` prefix (regression test `AdminHttpGate.SetPin_RejectsReservedStarCodePrefix`), but that only covers new/changed PINs; a device provisioned before the guard keeps the collision. The PIN is stored salted+hashed, so a boot-time scan is impossible — the practical ceiling is documentation (done: CHANGELOG) plus optionally a behavioral warning when the star-code fires and the same call continues with `#`-digits. GitHub #93.
+
+---
+
+### 🔵 Issue #94: `docs/API.md` endpoint catalog is stale
+* **Status**: ⏳ Open / Doc debt
+* **Labels**: `documentation`
+* **Severity**: Low
+
+#### Description
+API.md's detailed specs (§4–§5) cover only the original five endpoints. `/api/cdr`, `/api/dnd`, `/api/forward`, `/api/group`, `/api/factory-reset`, `/api/configuring`, `/api/ota/*`, and the admin session endpoints have no per-endpoint specs. §0 (added 2026-07-17) summarizes the admin layer + dark-by-default reachability and carries a partial-catalog banner, so the doc is honest but incomplete. Source of truth: `HttpServer::handleClient()`. GitHub #94.
+
+---
+
 ### 🟡 Issue #77: DTMF CLASS codes bypass `setDnd()`/`setForward()`, dashboard goes stale
 * **Status**: ⏳ Open / Planned
 * **Labels**: `concurrency`, `dashboard`, `tech-debt`

@@ -85,16 +85,18 @@ the box trusts the first device to claim an extension on the LAN.
 > "re-register") to adopt it immediately rather than waiting for its lease to lapse.
 
 ### Step 3 — Verify the adopted roster
-Open the **devices / registrar screen** (SSH sysop terminal → Security/Registrar, or the
-config panel). Confirm every expected phone appears with the right **MAC · extension ·
+Open the **devices / registrar view on the web dashboard** (on a provisioned device the
+dashboard is dark by default — open it first via the `*4887` DTMF trigger or your
+provisioning grace window; see THREAT_MODEL.md §5.5). Confirm every expected phone
+appears with the right **MAC · extension ·
 state** (`LEARNED` / `ONLINE`). **This is the trust-on-first-use checkpoint — verify it
 before you secure anything.** If a MAC is blank, see §2 (first-packet caveat); wait one
 cycle. If an *unexpected* MAC adopted an extension, you have a rogue/duplicate device on
 the segment — stop, investigate, and forget it (§6) before proceeding.
 
 ### Step 4 — Assign / rotate per-extension secrets
-For each extension, **set or rotate a secret** from the config panel (M1: manual, in the
-SSH config panel; M2 auto-reprovision is later — see §7). The box stores
+For each extension, **set or rotate a secret** from the config panel (M1: manual, on the
+web dashboard; M2 auto-reprovision is later — see §7). The box stores
 **HA1 = MD5(extension : realm : secret)** per extension — the recoverable-equivalent digest
 credential, **not** a one-way hash (digest auth requires the server to be able to recompute
 the response). Then put that secret on the matching handset (type it into the phone's web UI

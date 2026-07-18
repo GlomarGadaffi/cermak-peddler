@@ -2,6 +2,48 @@
 
 This document provides the formal API specification for the HTTP control interface of the **pocket-dial** firmware. The API handles status reporting, client management, and Wi-Fi onboarding.
 
+> [!NOTE]
+> **Partial catalog.** The detailed endpoint specs below (§4–§5) cover the original
+> status/kill/Wi-Fi surface. Endpoints added since — `/api/cdr`, `/api/dnd`,
+> `/api/forward`, `/api/group`, `/api/factory-reset`, `/api/configuring`,
+> `/api/ota/status`, `/api/ota/reboot`, and the admin session endpoints summarized
+> in §0 below — are not yet fully specified here (tracked in ISSUES.md). Source of
+> truth: `src/Helpers/HttpServer.cpp` (`handleClient()` dispatch).
+
+---
+
+## 0. Reachability & Admin Session Layer (read this first)
+
+**The HTTP server is dark by default on a provisioned device.** Once an admin PIN
+exists, the TCP listener itself is closed except within a bounded open window
+(default 600 s) granted by one of:
+
+1. **DTMF trigger** — the admin extension (default `1001`), while registered, dials
+   `*4887`; the SIP INFO's source IP must match the registration's bound IP.
+2. **Provisioning grace** — a successful `POST /api/admin/set-pin` grants the same
+   window (first-run onboarding and PIN changes).
+3. **Keep-alive** — an authenticated `POST /api/admin/keepalive` extends the window
+   by 1 hour.
+
+Outside a window, connections are refused at the socket level — every endpoint in
+this document is unreachable. An **unprovisioned** device listens unconditionally
+(onboarding requires the web UI before any credential exists). Threat analysis:
+`docs/THREAT_MODEL.md` §5.5.
+
+**Admin session endpoints** (all JSON; mutating ones are Same-Origin checked):
+
+| Endpoint | Method | Auth | Purpose |
+| :--- | :--- | :--- | :--- |
+| `/api/admin/status` | `GET` | None | `{provisioned, authenticated}` booleans for dashboard render. |
+| `/api/admin/set-pin` | `POST` | None if unprovisioned; session if changing | Set/change the admin PIN (`pin=` form param, ≥4 chars, **must not begin `4887`** — reserved for the DTMF star-code). Grants the provisioning grace window. |
+| `/api/admin/login` | `POST` | PIN in body | Issues the `pd_session` cookie (HttpOnly, SameSite=Strict). Rate-limited with lockout. |
+| `/api/admin/logout` | `POST` | Session | Invalidates the session cookie. |
+| `/api/admin/keepalive` | `POST` | Session | Extends the HTTP-open window by 3600 s. |
+
+Once provisioned, all state-mutating endpoints (`/api/kill`, `/api/dnd`,
+`/api/forward`, `/api/group`, `/api/wifi/*`, `/api/factory-reset`, OTA upload)
+additionally require the `pd_session` cookie.
+
 ---
 
 ## 1. Global Server Settings & Connection Behavior
