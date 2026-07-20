@@ -15,6 +15,8 @@
 #include <string_view>
 #include <stdexcept>
 #include <optional>
+#include <vector>
+#include <cstdint>
 
 #include "SipStatus.hpp"
 
@@ -27,8 +29,11 @@ public:
 
 	void reset(std::string message, sockaddr_in src);
 
-	SipMessage(const SipMessage& other);
-	SipMessage& operator=(const SipMessage& other);
+	// No shared buffer means no string_view to fix up after a copy — plain
+	// member-wise copy of the owned start line / header lines / body is already
+	// correct.
+	SipMessage(const SipMessage& other) = default;
+	SipMessage& operator=(const SipMessage& other) = default;
 
 	// setType() removed (audit #68): dead, and conflated a header-relative offset
 	// with a replace() length. Use setHeader() to rewrite the full start line.
@@ -81,7 +86,10 @@ public:
 	// is fed to SipDigest::parseAuthorization, which tolerates the header name.
 	std::string_view getAuthorization() const;
 	sockaddr_in getSource() const;
-	std::optional<PocketDial::SipStatusInfo> getStatusInfo() const { return _statusInfo; }
+	std::optional<PocketDial::SipStatusInfo> getStatusInfo() const
+	{
+		return PocketDial::parseSipStatusLine(_startLine);
+	}
 
 	// SDP media-direction attribute (RFC 4566 / RFC 3264): the line-anchored
 	// a=sendrecv / a=sendonly / a=recvonly / a=inactive attribute in the message
@@ -99,29 +107,31 @@ public:
 	bool isValidMessage() const;
 
 protected:
-	virtual void reparse() { parse(); }
-	void parse();
 	std::string_view extractNumber(std::string_view header) const;
-	size_t findHeader(std::string_view field) const;
 
-	std::string_view _type;
-	std::string_view _header;
-	std::string_view _via;
-	std::string_view _from;
-	std::string_view _fromNumber;
-	std::string_view _to;
-	std::string_view _toNumber;
-	std::string_view _callID;
-	std::string_view _cSeq;
-	std::string_view _contact;
-	std::string_view _contactNumber;
-	std::string_view _contentLength;
-	std::string_view _authorization;
-	std::string _messageStr;
 	bool _hasSdp = false;
-	std::optional<PocketDial::SipStatusInfo> _statusInfo;
+
+private:
+	// Every getter/setter below resolves against these three owned pieces —
+	// no shared buffer, so mutating one header cannot shift or invalidate any
+	// other. There is deliberately no cached "parsed field" state left to keep
+	// in sync: named getters look their header up by name on every call (a
+	// handful of short string compares against _headerLines, not a rescan of
+	// the whole message), so nothing needs a reparse step after a mutation.
+	std::string              _startLine;
+	std::vector<std::string> _headerLines;
+	std::string              _body;
 
 	sockaddr_in _src{};
+
+	size_t findHeaderIndex(std::string_view fullName, std::string_view compactName = {}) const;
+	// Inserts a new header line just before Content-Length (matching the wire
+	// position addHeader() has always used), or at the end of the header block
+	// if there is no Content-Length header.
+	void insertHeaderLine(std::string value);
+	// Shared body for the six setters that only ever replace-or-insert a single
+	// named header line (setVia/setFrom/setTo/setCallID/setCSeq/setContact).
+	void setNamedHeader(std::string_view fullName, std::string_view compactName, std::string value);
 };
 
 #endif

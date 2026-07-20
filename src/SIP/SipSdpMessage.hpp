@@ -21,20 +21,8 @@ public:
 	std::string_view getMedia() const;
 	int getRtpPort() const;
 
-protected:
-	void reparse() override;
-
 private:
-	void parseSdp();
 	int extractRtpPort(std::string_view data) const;
-
-	std::string_view _version;
-	std::string_view _originator;
-	std::string_view _sessionName;
-	std::string_view _connectionInformation;
-	std::string_view _time;
-	std::string_view _media;
-	int _rtpPort = 0;
 };
 
 #endif

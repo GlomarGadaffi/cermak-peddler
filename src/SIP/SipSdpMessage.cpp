@@ -5,159 +5,123 @@
 #include <iostream>
 #include <cctype>
 
-SipSdpMessage::SipSdpMessage(std::string message, sockaddr_in src) : SipMessage(std::move(message), src)
+namespace
 {
-	parseSdp();
+	// The six SDP fields SipSdpMessage exposes, extracted in a single pass over
+	// the body. Mirrors the old parseSdp() line-splitting exactly (primary
+	// "\r\n" delimiter, bare "\n" fallback) so behavior on mixed/malformed line
+	// endings is unchanged.
+	struct SdpFields
+	{
+		std::string_view version, originator, sessionName, connectionInformation, time, media;
+	};
+
+	SdpFields parseSdpFields(std::string_view body)
+	{
+		SdpFields f;
+		size_t pos_start = 0;
+		while (pos_start < body.size())
+		{
+			size_t pos_end = body.find("\r\n", pos_start);
+			size_t next_start = pos_end + 2;
+			if (pos_end == std::string_view::npos)
+			{
+				pos_end = body.find('\n', pos_start);
+				next_start = pos_end + 1;
+			}
+
+			std::string_view line;
+			if (pos_end == std::string_view::npos)
+			{
+				line = body.substr(pos_start);
+				pos_start = body.size();
+			}
+			else
+			{
+				line = body.substr(pos_start, pos_end - pos_start);
+				pos_start = next_start;
+			}
+
+			if (line.empty()) continue;
+
+			if (line.compare(0, 2, "v=") == 0)      f.version = line;
+			else if (line.compare(0, 2, "o=") == 0) f.originator = line;
+			else if (line.compare(0, 2, "s=") == 0) f.sessionName = line;
+			else if (line.compare(0, 2, "c=") == 0) f.connectionInformation = line;
+			else if (line.compare(0, 2, "t=") == 0) f.time = line;
+			else if (line.compare(0, 2, "m=") == 0) f.media = line;
+		}
+		return f;
+	}
 }
 
-void SipSdpMessage::reparse()
+SipSdpMessage::SipSdpMessage(std::string message, sockaddr_in src) : SipMessage(std::move(message), src)
 {
-	SipMessage::reparse();
-	if (_hasSdp)
-	{
-		parseSdp();
-	}
-	else
-	{
-		_version = {};
-		_originator = {};
-		_sessionName = {};
-		_connectionInformation = {};
-		_time = {};
-		_media = {};
-		_rtpPort = 0;
-	}
 }
 
 void SipSdpMessage::setMedia(std::string value)
 {
-	size_t mPos = findHeader(_media);
-	if (mPos != std::string::npos)
+	// Operate on a local copy of the body so the search offset and the mutation
+	// stay consistent within the same buffer (no cross-object pointer math
+	// against the base class's storage).
+	std::string body(getBody());
+	size_t pos_start = 0;
+	while (pos_start < body.size())
 	{
-		_messageStr.replace(mPos, _media.length(), value);
+		size_t pos_end = body.find("\r\n", pos_start);
+		size_t next_start = pos_end + 2;
+		if (pos_end == std::string::npos)
+		{
+			pos_end = body.find('\n', pos_start);
+			next_start = pos_end + 1;
+		}
+		size_t lineLen = (pos_end == std::string::npos) ? (body.size() - pos_start) : (pos_end - pos_start);
+
+		if (lineLen >= 2 && body.compare(pos_start, 2, "m=") == 0)
+		{
+			body.replace(pos_start, lineLen, value);
+			setBody(body);
+			return;
+		}
+		pos_start = (pos_end == std::string::npos) ? body.size() : next_start;
 	}
-	reparse();
+	// No "m=" line found: no-op, matching the original's behavior when there
+	// was no media line to replace.
 }
 
 std::string_view SipSdpMessage::getVersion() const
 {
-	return _version;
+	return parseSdpFields(getBody()).version;
 }
 
 std::string_view SipSdpMessage::getOriginator() const
 {
-	return _originator;
+	return parseSdpFields(getBody()).originator;
 }
 
 std::string_view SipSdpMessage::getSessionName() const
 {
-	return _sessionName;
+	return parseSdpFields(getBody()).sessionName;
 }
 
 std::string_view SipSdpMessage::getConnectionInformation() const
 {
-	return _connectionInformation;
+	return parseSdpFields(getBody()).connectionInformation;
 }
 
 std::string_view SipSdpMessage::getTime() const
 {
-	return _time;
+	return parseSdpFields(getBody()).time;
 }
 
 std::string_view SipSdpMessage::getMedia() const
 {
-	return _media;
+	return parseSdpFields(getBody()).media;
 }
 
 int SipSdpMessage::getRtpPort() const
 {
-	return _rtpPort;
-}
-
-void SipSdpMessage::parseSdp()
-{
-	_version = {};
-	_originator = {};
-	_sessionName = {};
-	_connectionInformation = {};
-	_time = {};
-	_media = {};
-	_rtpPort = 0;
-
-	size_t bodyStart = _messageStr.find("\r\n\r\n");
-	if (bodyStart != std::string::npos)
-	{
-		bodyStart += 4;
-	}
-	else if ((bodyStart = _messageStr.find("\n\n")) != std::string::npos)
-	{
-		bodyStart += 2;
-	}
-	else
-	{
-		bodyStart = 0;
-	}
-
-	size_t pos_start = _messageStr.find("v=", bodyStart);
-	if (pos_start == std::string::npos)
-	{
-		return;
-	}
-
-	size_t pos_end;
-	while (pos_start < _messageStr.size())
-	{
-		pos_end = _messageStr.find("\r\n", pos_start);
-		size_t next_start = pos_end + 2;
-		if (pos_end == std::string::npos)
-		{
-			pos_end = _messageStr.find("\n", pos_start);
-			next_start = pos_end + 1;
-		}
-
-		std::string_view line;
-		if (pos_end == std::string::npos)
-		{
-			line = std::string_view(_messageStr.data() + pos_start, _messageStr.size() - pos_start);
-			pos_start = _messageStr.size();
-		}
-		else
-		{
-			line = std::string_view(_messageStr.data() + pos_start, pos_end - pos_start);
-			pos_start = next_start;
-		}
-
-		if (line.empty())
-		{
-			continue;
-		}
-
-		if (line.compare(0, 2, "v=") == 0)
-		{
-			_version = line;
-		}
-		else if (line.compare(0, 2, "o=") == 0)
-		{
-			_originator = line;
-		}
-		else if (line.compare(0, 2, "s=") == 0)
-		{
-			_sessionName = line;
-		}
-		else if (line.compare(0, 2, "c=") == 0)
-		{
-			_connectionInformation = line;
-		}
-		else if (line.compare(0, 2, "t=") == 0)
-		{
-			_time = line;
-		}
-		else if (line.compare(0, 2, "m=") == 0)
-		{
-			_media = line;
-			_rtpPort = extractRtpPort(line);
-		}
-	}
+	return extractRtpPort(getMedia());
 }
 
 int SipSdpMessage::extractRtpPort(std::string_view data) const

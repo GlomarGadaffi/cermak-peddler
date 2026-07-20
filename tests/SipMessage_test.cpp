@@ -57,3 +57,58 @@ TEST(SipMessage, EnforceG711ResyncsContentLength) {
     ASSERT_EQ(std::string(m.getContentLength()),
               "Content-Length: " + std::to_string(actualBody));
 }
+
+// Guard test for the SipMessage storage rewrite (owned header-line list replacing
+// the shared _messageStr + string_view fields). SipMessage only ever names ~8
+// headers (Via/From/To/Call-ID/CSeq/Contact/Content-Length/Authorization); every
+// other header on the wire — including headers repeated more than once, like the
+// triple Alert-Info the intercom auto-answer path emits (RequestsHandler.cpp) —
+// must ride along untouched. A naive "N owned fields, drop the shared buffer"
+// rewrite would silently lose all of these on the first mutation. This test must
+// stay green across the rewrite.
+TEST(SipMessage, PreservesUnknownAndRepeatedHeadersOnMutation) {
+    sockaddr_in s; s.sin_addr.s_addr = inet_addr("127.0.0.1");
+    std::string raw =
+        "INVITE sip:999@server SIP/2.0\r\n"
+        "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=1\r\n"
+        "From: <sip:100@server>\r\n"
+        "To: <sip:999@server>\r\n"
+        "Call-ID: guard-id\r\n"
+        "CSeq: 1 INVITE\r\n"
+        "Contact: <sip:100@127.0.0.1:5060>\r\n"
+        "Call-Info: <sip:any>;answer-after=0\r\n"
+        "Alert-Info: info=alert-autoanswer\r\n"
+        "Alert-Info: answer-after=0\r\n"
+        "Alert-Info: intercom=true\r\n"
+        "P-Auto-Answer: normal\r\n"
+        "WWW-Authenticate: Digest realm=\"pocketdial\", nonce=\"abc123\"\r\n"
+        "Content-Type: application/sdp\r\n"
+        "Content-Length: 0\r\n\r\n";
+
+    SipMessage unmodified(raw, s);
+    ASSERT_EQ(unmodified.toString(), raw) << "byte-identical round trip with no mutation";
+
+    SipMessage m(raw, s);
+    m.setVia("Via: SIP/2.0/UDP 127.0.0.1:5060;branch=1;received=10.0.0.1");
+    const std::string out = m.toString();
+
+    ASSERT_NE(out.find("Call-Info: <sip:any>;answer-after=0"), std::string::npos);
+    ASSERT_NE(out.find("P-Auto-Answer: normal"), std::string::npos);
+    ASSERT_NE(out.find("WWW-Authenticate: Digest realm=\"pocketdial\", nonce=\"abc123\""), std::string::npos);
+    ASSERT_NE(out.find("Content-Type: application/sdp"), std::string::npos);
+
+    size_t alertInfoCount = 0;
+    for (size_t pos = out.find("Alert-Info:"); pos != std::string::npos;
+         pos = out.find("Alert-Info:", pos + 1))
+    {
+        ++alertInfoCount;
+    }
+    ASSERT_EQ(alertInfoCount, 3u) << "all three repeated Alert-Info headers must survive a mutation";
+    ASSERT_NE(out.find("Alert-Info: info=alert-autoanswer"), std::string::npos);
+    ASSERT_NE(out.find("Alert-Info: answer-after=0"), std::string::npos);
+    ASSERT_NE(out.find("Alert-Info: intercom=true"), std::string::npos);
+
+    // Fields untouched by the mutation must still read correctly too.
+    ASSERT_EQ(std::string(m.getCallID()), "Call-ID: guard-id");
+    ASSERT_EQ(std::string(m.getContact()), "Contact: <sip:100@127.0.0.1:5060>");
+}
