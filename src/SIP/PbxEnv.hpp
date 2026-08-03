@@ -12,6 +12,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 class SipMessage;
 class SipClient;
@@ -62,6 +63,13 @@ struct PbxEnv
 	virtual std::shared_ptr<SipMessage> serverBye(const std::string& destExt,
 		const sockaddr_in& destAddr, const std::string& callId,
 		const std::string& fromHeader, const std::string& toHeader) = 0;
+	// Read-only view of the live-session table (BLF dialog-state computation).
+	virtual const std::unordered_map<std::string, std::shared_ptr<Session>>& sessionsView() const = 0;
+	// AOR charset validation (the engine's isValidAor policy).
+	virtual bool validAor(std::string_view s) const = 0;
+	// Parse the requested registration/subscription lease from Expires/Contact
+	// (RFC 3261 §10.2.1), clamped to the engine's default when absent.
+	virtual int requestedExpires(const std::shared_ptr<SipMessage>& msg) const = 0;
 };
 
 #endif

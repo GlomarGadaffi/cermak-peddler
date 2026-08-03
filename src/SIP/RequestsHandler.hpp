@@ -36,6 +36,7 @@
 #include "Registrar.hpp"
 #include "RegisterBeeper.hpp"
 #include "ParkOrbit.hpp"
+#include "BlfSubscriptions.hpp"
 
 class RequestsHandler : private PbxEnv
 {
@@ -206,48 +207,12 @@ private:
 	void onReinvite(std::shared_ptr<SipMessage> data);  // mid-dialog re-INVITE (hold/resume, RFC 3261 §14)
 	void onUpdate(std::shared_ptr<SipMessage> data);    // RFC 3311 mid-dialog UPDATE
 
-	// onSubscribe: Event-package gate (489 on anything but "dialog"), AOR validation
-	// (404 for unregistered targets), fixed-slot allocation (503 on exhaustion),
-	// 202 Accepted + an immediate full-state NOTIFY. Called from handle() — caller holds _mutex.
+	// onSubscribe: thin dispatch-table shim into the BlfSubscriptions machine
+	// (see BlfSubscriptions.hpp). Called from handle() — caller holds _mutex.
 	void onSubscribe(std::shared_ptr<SipMessage> data);
 
-	// One BLF watcher dialog. Fixed-size record in a std::array — no heap growth.
-	struct DialogSubscription
-	{
-		bool        used = false;
-		std::string callId;        // subscription dialog id (refresh/unsubscribe key)
-		std::string watcherFrom;   // subscriber's full From header (incl. its tag)
-		std::string subTo;         // our full To header (incl. the tag we minted)
-		std::string targetAor;     // the extension being watched (the To user-part)
-		std::string lastState;     // last NOTIFYed state token (change detection)
-		unsigned    version = 0;   // dialog-info version counter (monotonic)
-		unsigned    cseq = 1;      // NOTIFY CSeq within the subscription dialog
-		int         expiresSec = 0;
-		sockaddr_in addr{};        // where NOTIFYs go (the SUBSCRIBE source)
-		std::chrono::steady_clock::time_point deadline{};
-	};
-	std::array<DialogSubscription, POCKETDIAL_MAX_SUBSCRIPTIONS> _subscriptions;
-
-	// Compute the current RFC 4235 dialog state of `targetAor` from the registrar +
-	// session tables: ""=idle, else trying/early/confirmed plus direction and dialog id.
-	// Caller holds _mutex.
-	std::string computeDialogState(const std::string& targetAor,
-		std::string& outDirection, std::string& outDialogId) const;
-
-	// Build one NOTIFY for a subscription slot carrying a dialog-info+xml body.
-	// `terminated` selects Subscription-State: terminated;reason=<termReason>.
-	// Caller holds _mutex.
-	std::shared_ptr<SipMessage> buildDialogNotify(DialogSubscription& sub,
-		const std::string& state, const std::string& direction, const std::string& dialogId,
-		bool terminated, const char* termReason);
-
-	// Recompute every watched target's state and NOTIFY slots whose state changed.
-	// Called at the end of handle() and from tick() (inside _mutex). Caller holds _mutex.
-	void refreshSubscriptions();
-
-	// Expire overdue subscriptions: terminal NOTIFY (reason=timeout) + slot free.
-	// Called from tick(); caller holds _mutex.
-	void sweepSubscriptions();
+	// BLF presence (RFC 6665 / RFC 4235) watcher-dialog FSM. Guarded by _mutex.
+	BlfSubscriptions _blf{*this};
 
 	// ── DTMF SIP INFO handler (Task 2C) ──────────────────────────────────────────
 	// Invoked from handle() when a SIP INFO arrives carrying
@@ -310,6 +275,18 @@ private:
 		const std::string& fromHeader, const std::string& toHeader) override
 	{
 		return buildServerBye(destExt, destAddr, callId, fromHeader, toHeader);
+	}
+	const std::unordered_map<std::string, std::shared_ptr<Session>>& sessionsView() const override
+	{
+		return _sessions;
+	}
+	bool validAor(std::string_view s) const override
+	{
+		return isValidAor(s);
+	}
+	int requestedExpires(const std::shared_ptr<SipMessage>& msg) const override
+	{
+		return parseRequestedExpires(msg);
 	}
 
 	// RFC 3261 §17 INVITE client transactions (Timer A/B/L). Guarded by _mutex.
@@ -563,14 +540,6 @@ private:
 	void persistRingGroups();             // write-through after a setRingGroup mutation
 	void persistPageZones();              // write-through after a setPageZone mutation
 	bool _pbxConfigLoaded = false;
-
-	// BLF event-package parsing helper (pure / static / host-testable).
-	// Returns the canonical package name (e.g. "dialog") or "unknown".
-	static std::string parseEventPackage(const std::string& raw);
-
-	// RFC 4235 dialog-info XML builder (pure). Called from buildDialogNotify().
-	static std::string buildDialogInfoXml(const std::string& entity, unsigned version,
-		const std::string& dialogId, const std::string& state, const std::string& direction);
 
 	// Persistent CDR (Class A sweep). The CDR ring is flushed to the "cdrlog" NVS
 	// namespace on teardown (write-through) and reloaded on boot, so records survive

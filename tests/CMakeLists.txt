@@ -83,6 +83,7 @@ add_executable(sip_parser_tests
     ../src/SIP/Registrar.cpp
     ../src/SIP/RegisterBeeper.cpp
     ../src/SIP/ParkOrbit.cpp
+    ../src/SIP/BlfSubscriptions.cpp
     ../src/SIP/SipSdpMessage.cpp
     ../src/SIP/SipClient.cpp
     ../src/SIP/Session.cpp

@@ -80,6 +80,7 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/Registrar.cpp"
                             "../src/SIP/RegisterBeeper.cpp"
                             "../src/SIP/ParkOrbit.cpp"
+                            "../src/SIP/BlfSubscriptions.cpp"
                             "../src/SIP/Session.cpp"
                             "../src/SIP/SipClient.cpp"
                             "../src/SIP/SipMessage.cpp"
