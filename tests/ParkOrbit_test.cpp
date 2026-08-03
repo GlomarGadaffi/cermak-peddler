@@ -113,6 +113,41 @@ TEST(ParkOrbit, ReinviteOkIsAckedWithSingleCallIdHeader)
 	EXPECT_EQ(countOf(ack, "To:"), 1) << ack;
 }
 
+// The dashboard mirror is driven by a dirty flag rather than by each call site
+// remembering to refresh, so every path that moves slot state must signal — and
+// a state-neutral response must not.
+TEST(ParkOrbit, ParkChangedFlagTracksSlotStateNotTraffic)
+{
+	FakePbxEnv env;
+	ParkOrbit park(env);
+	const sockaddr_in parkedAddr = FakePbxEnv::addr("192.168.1.50", 5060);
+
+	EXPECT_FALSE(park.consumeParkChanged());   // nothing has happened yet
+
+	park.onInvite(inviteTo("700", "101", "parked-call-4@192.168.1.50", parkedAddr, "192.168.1.50"),
+		std::make_shared<SipClient>("101", parkedAddr), 0);
+	EXPECT_TRUE(park.consumeParkChanged());    // a call landed in an orbit
+	EXPECT_FALSE(park.consumeParkChanged());   // consuming resets it
+
+	// A 200 OK that belongs to no park dialog changes nothing.
+	const std::string strayOk =
+		"SIP/2.0 200 OK\r\n"
+		"Via: SIP/2.0/UDP 192.168.1.10:5060;branch=z9hG4bKstray\r\n"
+		"From: <sip:700@192.168.1.10:5060>;tag=t\r\n"
+		"To: <sip:101@192.168.1.10>;tag=u\r\n"
+		"Call-ID: not-a-park-dialog@192.168.1.50\r\n"
+		"CSeq: 2 INVITE\r\n"
+		"Content-Length: 0\r\n\r\n";
+	EXPECT_FALSE(park.handleOk(std::make_shared<SipMessage>(strayOk, parkedAddr)));
+	EXPECT_FALSE(park.consumeParkChanged());
+
+	// Teardown of the parked call frees the slot and must signal, even though it
+	// reaches ParkOrbit through freeForCallId() rather than a park call site.
+	park.freeForCallId("Call-ID: parked-call-4@192.168.1.50");
+	EXPECT_TRUE(park.consumeParkChanged());
+	EXPECT_TRUE(park.snapshotRows(std::chrono::steady_clock::now(), /*onlyParked=*/false).empty());
+}
+
 // A retrieve that cannot get a session must 503 the retriever and leave the
 // orbit occupied rather than half-tearing-down the parked leg (#71).
 TEST(ParkOrbit, RetrieveWithExhaustedSessionPoolLeavesSlotParked)

@@ -56,6 +56,7 @@ void ParkOrbit::onInvite(const std::shared_ptr<SipMessage>& data,
 		slot.localTag   = toTag;
 		slot.parker     = caller->getNumber();
 		slot.parkedAt   = std::chrono::steady_clock::now();
+		_parkChanged    = true;
 
 		auto virt = _env.allocVirtualPeer(orbit, data->getSource());
 		if (auto session = _env.allocSession(std::string(data->getCallID()), caller))
@@ -114,7 +115,7 @@ void ParkOrbit::onInvite(const std::shared_ptr<SipMessage>& data,
 	sendReinvite(slot, retrieverSdp);
 	_env.log("Park: " + caller->getNumber() + " retrieved " + slot.parkedExt + " from " + orbit);
 
-	slot = ParkSlot{};
+	releaseSlot(slot);
 }
 
 void ParkOrbit::sendReinvite(ParkSlot& slot, const std::string& sdp)
@@ -179,6 +180,7 @@ void ParkOrbit::startRingback(ParkSlot& slot, const std::shared_ptr<SipClient>& 
 	slot.rbAddr    = addr;
 	slot.state     = ParkState::RingingBack;
 	slot.deadline  = now + std::chrono::seconds(30);
+	_parkChanged   = true;   // leaves the Parked view: the dashboard row must drop
 
 	std::ostringstream ss;
 	ss << "INVITE sip:" << parker->getNumber() << "@" << destIpPort << " SIP/2.0\r\n"
@@ -270,7 +272,7 @@ bool ParkOrbit::handleOk(const std::shared_ptr<SipMessage>& data)
 			}
 
 			_env.log("Park: parker answered ring-back on " + slot.orbit + " — bridging");
-			slot = ParkSlot{};
+			releaseSlot(slot);
 			return true;
 		}
 	}
@@ -306,13 +308,26 @@ void ParkOrbit::sweep(std::chrono::steady_clock::time_point now)
 	}
 }
 
+void ParkOrbit::releaseSlot(ParkSlot& slot)
+{
+	slot = ParkSlot{};
+	_parkChanged = true;
+}
+
+bool ParkOrbit::consumeParkChanged()
+{
+	const bool changed = _parkChanged;
+	_parkChanged = false;
+	return changed;
+}
+
 void ParkOrbit::freeForCallId(std::string_view callID)
 {
 	for (auto& slot : _slots)
 	{
 		if (slot.state != ParkState::Free && slot.callID == callID)
 		{
-			slot = ParkSlot{};
+			releaseSlot(slot);
 		}
 	}
 	_pendingAcks.erase(

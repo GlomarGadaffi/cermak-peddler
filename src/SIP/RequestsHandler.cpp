@@ -289,6 +289,14 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 			refreshDeviceSnapshot();
 		}
 
+		// Park-orbit change detection, same contract. Polling here (rather than
+		// making every mutating call site remember refreshParkSnapshot()) means a
+		// new park path cannot silently leave a stale row on the dashboard.
+		if (_park.consumeParkChanged())
+		{
+			refreshParkSnapshot();
+		}
+
 		// BLF change detection: one pass after every handled packet covers
 		// registration appear/disappear, session create/transition/teardown.
 		// NOTIFYs land in _outbox and ride out with this pass (after unlock).
@@ -483,7 +491,6 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 	if (_park.orbitIndex(destNumber) >= 0)
 	{
 		endCall(data->getCallID(), data->getFromNumber(), destNumber);
-		refreshParkSnapshot();
 		return;
 	}
 
@@ -695,7 +702,6 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		if (orbitIdx >= 0)
 		{
 			_park.onInvite(data, caller.value(), orbitIdx);
-			refreshParkSnapshot();
 			return;
 		}
 	}
@@ -1252,10 +1258,11 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	// Park dialogs (server-originated re-INVITE ACKs + ring-back answers).
+	// Park dialogs (server-originated re-INVITE ACKs + ring-back answers). The
+	// snapshot mirror is driven by _park.consumeParkChanged() in handle(), so a
+	// state-neutral ACK confirmation no longer pays a rebuild.
 	if (_park.handleOk(data))
 	{
-		refreshParkSnapshot();
 		return;
 	}
 	// Attended-transfer re-INVITE ACKs.
@@ -2818,8 +2825,12 @@ void RequestsHandler::tick()
 				pbx::joinMembers(g.members));
 		}
 
-		// Parked calls view: {orbit, parkedExt, parker, secondsParked}.
+		// Parked calls view: {orbit, parkedExt, parker, secondsParked}. This full
+		// rebuild already reflects anything _park.sweep() just did above, so clear
+		// the dirty flag here rather than leaving it to trigger a redundant mirror
+		// on the next packet.
 		nextSnapshot.parkedCalls = _park.snapshotRows(now, /*onlyParked=*/true);
+		_park.consumeParkChanged();
 
 		{
 			std::lock_guard<std::mutex> snapLock(_snapshotMutex);
