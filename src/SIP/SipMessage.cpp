@@ -122,13 +122,13 @@ namespace
 	}
 }
 
-SipMessage::SipMessage(std::string message, sockaddr_in src) : _src(src)
+SipMessage::SipMessage(const std::string& message, sockaddr_in src) : _src(src)
 {
 	_hasSdp = (message.find("application/sdp") != std::string::npos);
 	splitMessage(message, _startLine, _headerLines, _body);
 }
 
-void SipMessage::reset(std::string message, sockaddr_in src)
+void SipMessage::reset(const std::string& message, sockaddr_in src)
 {
 	_src = src;
 	_hasSdp = (message.find("application/sdp") != std::string::npos);
@@ -220,7 +220,7 @@ void SipMessage::enforceG711()
 		if (lineEnd == std::string::npos) lineEnd = _body.find("\n", mPos);
 		if (lineEnd == std::string::npos) lineEnd = _body.size();
 
-		std::string_view mLine(_body.data() + mPos, lineEnd - mPos);
+		std::string_view mLine = std::string_view(_body).substr(mPos, lineEnd - mPos);
 		size_t rtpPos = mLine.find("RTP/AVP ");
 		if (rtpPos != std::string_view::npos)
 		{

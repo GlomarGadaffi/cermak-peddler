@@ -24,10 +24,10 @@ class SipMessage
 {
 public:
 
-	SipMessage(std::string message, sockaddr_in src);
+	SipMessage(const std::string& message, sockaddr_in src);
 	virtual ~SipMessage() = default;
 
-	void reset(std::string message, sockaddr_in src);
+	void reset(const std::string& message, sockaddr_in src);
 
 	// No shared buffer means no string_view to fix up after a copy — plain
 	// member-wise copy of the owned start line / header lines / body is already

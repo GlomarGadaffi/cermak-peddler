@@ -55,7 +55,7 @@ namespace
 	}
 }
 
-SipSdpMessage::SipSdpMessage(std::string message, sockaddr_in src) : SipMessage(std::move(message), src)
+SipSdpMessage::SipSdpMessage(const std::string& message, sockaddr_in src) : SipMessage(message, src)
 {
 }
 
