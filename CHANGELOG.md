@@ -1,5 +1,59 @@
 # Changelog
 
+## Unreleased (sip-decomposition-followups) - 2026-08-03
+
+Review follow-ups on the SIP engine decomposition. Host-verified (142/142
+GoogleTest, up from 131 — the park, register-beep and BLF machines had no host
+coverage at all, which is how the wire defects below survived a green suite).
+
+### Fixed — malformed headers on server-minted requests
+
+`SipMessage::getCallID()` / `getTo()` / `getFrom()` return the **full header
+line**, not the bare value. Four hand-built request paths treated them as bare
+values and re-stamped the header name on top. All predate the decomposition
+(they came in with the `b3cf191` protocol backport) and were carried through it
+untouched:
+
+- **Park retrieve re-INVITE** shipped `Call-ID: Call-ID: x@host`, so the parked
+  phone could not match the request to its dialog and media never renegotiated.
+- **Register beep** matched dialogs by comparing the bare Call-ID it generated
+  against the full header line — a comparison that could never succeed. An
+  answered beep was therefore never ACKed and never BYEd, and five seconds later
+  `sweep()` sent a CANCEL for an INVITE that already had a final response
+  (illegal per RFC 3261 §9.1). Its ACK also emitted `To: To: <...>`.
+- **REFER progress NOTIFY** (RFC 3515 §2.4.5) emitted `From: To: ...`,
+  `To: From: ...` and `Call-ID: Call-ID: ...`.
+
+### Changed — shared plumbing instead of per-machine copies
+
+- `SipWireUtil.hpp` owns `addrToIpPort()` and the `a=inactive` hold offer, which
+  had been pasted into ParkOrbit, RegisterBeeper and BlfSubscriptions (each with
+  its own socket-include block, none with a Windows branch — `inet_ntop` needs
+  `ws2tcpip.h`, so those files could not build on MSVC).
+- `BlfSubscriptions` drops its three private header parsers for the shared
+  `siphdr::stripHeaderName` and a new `SipMessage::getEvent()` accessor. The old
+  event-package scanner re-serialised the whole message and matched any line
+  named `o` — which is also the SDP origin line's name.
+- `ParkOrbit::consumeParkChanged()` mirrors `Registrar::consumeDevicesChanged()`,
+  so the dashboard mirror is polled once per packet instead of being a duty each
+  mutating call site had to remember. Paths that never signalled at all
+  (`sweep()`, `freeForCallId()` via `endCall`) now do.
+- `PbxEnv::sessionsView()` (a reference to `RequestsHandler`'s whole `_sessions`
+  map) is replaced by `forEachSessionInvolving()`, keeping the session table's
+  representation private.
+- `RequestsHandler::drainOutbox()` is the single point messages leave the outbox
+  by, so RFC 3261 §17 retransmit registration is structural rather than a scan
+  duplicated at each flush site.
+- Registrar registry changes are now classified: an online-flag flip patches the
+  snapshot rows in place instead of rebuilding the vector and two strings per
+  device, which is what a post-reboot registration storm would otherwise cost.
+
+### Removed
+
+- `handleTransferOk()` and `_transferPendingAcks` — unreachable since they were
+  introduced; no commit ever added an entry to the list, so the lookup always
+  failed and `onOk()` paid a wasted call on every 200 OK.
+
 ## Unreleased (sip-engine-decomposition) - 2026-08-03
 
 Structural refactor, behavior-neutral by design. Host-verified (131/131 GoogleTest).

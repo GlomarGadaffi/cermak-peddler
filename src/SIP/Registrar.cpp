@@ -177,7 +177,7 @@ Registrar::AuthDecision Registrar::admitLearn(
 		rec.state = DeviceState::Learned;
 		_devices.emplace(mac, std::move(rec));
 		persistDevices();
-		_devicesChanged = true;
+		noteChange(Change::Structural);
 		_env.log("Learn: adopted device " + mac + " as ext " + ext);
 		return AuthDecision::Accept;
 	}
@@ -187,7 +187,7 @@ Registrar::AuthDecision Registrar::admitLearn(
 	{
 		it->second.extension = ext;
 		persistDevices();
-		_devicesChanged = true;
+		noteChange(Change::Structural);
 	}
 
 	if (it->second.state == DeviceState::Secured)
@@ -228,7 +228,9 @@ void Registrar::markOnline(const std::string& mac, bool online)
 	if (it->second.online != online)
 	{
 		it->second.online = online;
-		_devicesChanged = true;
+		// Row set is unchanged — the mirror only needs the flag patched, not a
+		// rebuild of every mac/extension string.
+		noteChange(Change::OnlineOnly);
 	}
 }
 
@@ -254,7 +256,7 @@ bool Registrar::secure(const std::string& macOrExt)
 				it->second.state = DeviceState::Secured;
 				persistDevices();
 				changed = true;
-				_devicesChanged = true;
+				noteChange(Change::Structural);
 			}
 			_env.log("Device " + it->first + " (ext " + it->second.extension + ") secured");
 		}
@@ -277,7 +279,7 @@ bool Registrar::forget(const std::string& macOrExt)
 	_env.log("Device " + it->first + " (ext " + it->second.extension + ") forgotten");
 	_devices.erase(it);
 	persistDevices();
-	_devicesChanged = true;
+	noteChange(Change::Structural);
 	return true;
 }
 
@@ -297,11 +299,30 @@ std::vector<Registrar::AdoptedDevice> Registrar::adoptedDevices() const
 	return out;
 }
 
-bool Registrar::consumeDevicesChanged()
+void Registrar::noteChange(Change kind)
 {
-	bool was = _devicesChanged;
-	_devicesChanged = false;
+	// Structural is sticky: if the row set gained or lost an entry in this pass,
+	// a later online flip must not downgrade it to the patch-only path.
+	if (kind == Change::Structural || _devicesChanged == Change::None)
+	{
+		_devicesChanged = kind;
+	}
+}
+
+Registrar::Change Registrar::consumeDevicesChange()
+{
+	Change was = _devicesChanged;
+	_devicesChanged = Change::None;
 	return was;
+}
+
+void Registrar::copyOnlineFlagsInto(std::vector<AdoptedDevice>& rows) const
+{
+	for (auto& row : rows)
+	{
+		auto it = _devices.find(row.mac);
+		if (it != _devices.end()) row.online = it->second.online;
+	}
 }
 
 void Registrar::loadDevices()
@@ -334,7 +355,7 @@ void Registrar::loadDevices()
 		}
 	}
 	nvs_close(h);
-	_devicesChanged = !_devices.empty();
+	if (!_devices.empty()) noteChange(Change::Structural);
 #endif
 }
 

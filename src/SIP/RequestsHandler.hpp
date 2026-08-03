@@ -540,6 +540,9 @@ private:
 	// Mirror the Registrar's adopted-device registry into the dashboard snapshot.
 	// Caller holds _mutex; takes _snapshotMutex internally.
 	void refreshDeviceSnapshot();
+	// Mirror a Registrar registry change into the dashboard snapshot, taking the
+	// cheap in-place path for an online-flag-only change. Caller holds _mutex.
+	void applyDeviceChange(Registrar::Change change);
 
 	// NVS persistence for _forwards / _ringGroups / _pageZones. No-ops on host (the
 	// maps are the store); on ESP they read/write the "pbxcfg" NVS namespace.

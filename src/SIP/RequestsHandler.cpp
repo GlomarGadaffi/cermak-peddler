@@ -284,10 +284,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 		// Device-registry change detection: a REGISTER may have adopted a device,
 		// re-synced its extension, or flipped its online flag inside the Registrar
 		// machine — mirror the registry into the dashboard snapshot once per packet.
-		if (_registrar.consumeDevicesChanged())
-		{
-			refreshDeviceSnapshot();
-		}
+		applyDeviceChange(_registrar.consumeDevicesChange());
 
 		// Park-orbit change detection, same contract. Polling here (rather than
 		// making every mutating call site remember refreshParkSnapshot()) means a
@@ -2500,6 +2497,31 @@ void RequestsHandler::refreshDeviceSnapshot()
 	_snapshot.devices = std::move(devices);
 }
 
+void RequestsHandler::applyDeviceChange(Registrar::Change change)
+{
+	// Caller holds _mutex; takes _snapshotMutex internally.
+	//
+	// An online flip leaves the row set identical, so patching the flags in place
+	// avoids rebuilding the vector and its two strings per device. That is the
+	// common case by a wide margin — every registration and every lease expiry
+	// flips a flag, and a post-reboot storm flips one per phone, which would
+	// otherwise make the mirror cost O(devices) allocations per REGISTER.
+	switch (change)
+	{
+		case Registrar::Change::None:
+			return;
+		case Registrar::Change::OnlineOnly:
+		{
+			std::lock_guard<std::mutex> snapLock(_snapshotMutex);
+			_registrar.copyOnlineFlagsInto(_snapshot.devices);
+			return;
+		}
+		case Registrar::Change::Structural:
+			refreshDeviceSnapshot();
+			return;
+	}
+}
+
 std::vector<RequestsHandler::AdoptedDevice> RequestsHandler::getAdoptedDevices()
 {
 	std::lock_guard<std::mutex> lock(_snapshotMutex);
@@ -2513,7 +2535,7 @@ bool RequestsHandler::secureDevice(const std::string& macOrExt)
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		changed = _registrar.secure(macOrExt);
-		if (_registrar.consumeDevicesChanged()) refreshDeviceSnapshot();
+		applyDeviceChange(_registrar.consumeDevicesChange());
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
@@ -2532,7 +2554,7 @@ bool RequestsHandler::forgetDevice(const std::string& macOrExt)
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		removed = _registrar.forget(macOrExt);
-		if (_registrar.consumeDevicesChanged()) refreshDeviceSnapshot();
+		applyDeviceChange(_registrar.consumeDevicesChange());
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}

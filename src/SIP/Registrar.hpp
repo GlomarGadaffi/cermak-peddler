@@ -86,9 +86,24 @@ public:
 	// Current registry contents (MAC-sorted by map order) for the dashboard
 	// snapshot mirror.
 	std::vector<AdoptedDevice> adoptedDevices() const;
-	// True (and resets the flag) if the registry changed since the last call —
-	// the cue to re-mirror adoptedDevices() into the dashboard snapshot.
-	bool consumeDevicesChanged();
+
+	// What moved in the registry since the last consume. Online is by far the
+	// most frequent (every registration and every lease expiry flips it, and a
+	// post-reboot storm flips it once per phone) and is the only kind that needs
+	// no new strings in the mirror — separating it keeps that case off the
+	// allocating path.
+	enum class Change : uint8_t
+	{
+		None = 0,
+		OnlineOnly,   // only volatile online flags moved; row set is unchanged
+		Structural,   // a device was adopted / re-extensioned / secured / forgotten
+	};
+	// Report (and reset) what changed since the last call. Structural outranks
+	// OnlineOnly when both happened in the same pass.
+	Change consumeDevicesChange();
+	// Refresh just the online flags of an already-mirrored row set, matched by
+	// MAC. No allocation: the mac/extension strings in `rows` are left alone.
+	void copyOnlineFlagsInto(std::vector<AdoptedDevice>& rows) const;
 
 private:
 	struct DeviceRecord
@@ -109,7 +124,9 @@ private:
 	// flood of distinct MACs cannot grow the heap without limit). NVS-persisted
 	// (namespace "pbxcfg", key "devices") minus the volatile online flags.
 	std::unordered_map<std::string, DeviceRecord> _devices;
-	bool _devicesChanged = false;
+	Change _devicesChanged = Change::None;
+	// Raise the pending change to at least `kind` (Structural is sticky).
+	void noteChange(Change kind);
 };
 
 #endif
