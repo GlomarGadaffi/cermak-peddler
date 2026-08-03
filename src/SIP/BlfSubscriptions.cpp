@@ -58,14 +58,14 @@ std::string BlfSubscriptions::computeDialogState(const std::string& targetAor,
 		if (s == "trying")    return 1;
 		return 0;
 	};
-	for (const auto& [callID, session] : _env.sessionsView())
+	_env.forEachSessionInvolving(targetAor,
+		[&](const std::string& callID, const Session& session)
 	{
-		bool isSrc  = session->getSrc()  && session->getSrc()->getNumber()  == targetAor;
-		bool isDest = session->getDest() && session->getDest()->getNumber() == targetAor;
-		if (!isSrc && !isDest) continue;
+		const bool isSrc  = session.getSrc()  && session.getSrc()->getNumber()  == targetAor;
+		const bool isDest = session.getDest() && session.getDest()->getNumber() == targetAor;
 
 		std::string state, dir;
-		switch (session->getState())
+		switch (session.getState())
 		{
 			case Session::State::Invited:
 				state = isDest ? "early" : "trying";
@@ -79,7 +79,7 @@ std::string BlfSubscriptions::computeDialogState(const std::string& targetAor,
 				dir   = isSrc ? "initiator" : "recipient";
 				break;
 			default:
-				continue;
+				return;
 		}
 		if (rank(state) > rank(best))
 		{
@@ -87,7 +87,7 @@ std::string BlfSubscriptions::computeDialogState(const std::string& targetAor,
 			outDirection = dir;
 			outDialogId  = callID;
 		}
-	}
+	});
 	if (best.empty()) { outDirection.clear(); outDialogId.clear(); }
 	return best;
 }

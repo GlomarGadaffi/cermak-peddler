@@ -121,9 +121,16 @@ public:
 			"Content-Length: 0\r\n\r\n";
 		return std::make_shared<SipMessage>(raw, destAddr);
 	}
-	const std::unordered_map<std::string, std::shared_ptr<Session>>& sessionsView() const override
+	void forEachSessionInvolving(std::string_view aor,
+		const std::function<void(const std::string&, const Session&)>& fn) const override
 	{
-		return sessions;
+		for (const auto& [callID, session] : sessions)
+		{
+			if (!session) continue;
+			const bool isSrc  = session->getSrc()  && session->getSrc()->getNumber()  == aor;
+			const bool isDest = session->getDest() && session->getDest()->getNumber() == aor;
+			if (isSrc || isDest) fn(callID, *session);
+		}
 	}
 	bool validAor(std::string_view s) const override
 	{
