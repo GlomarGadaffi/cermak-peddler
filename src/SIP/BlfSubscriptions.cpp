@@ -8,12 +8,7 @@
 #include "Session.hpp"
 #include "SipClient.hpp"
 #include "SipMessageTypes.h"
-
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-#include <lwip/sockets.h>
-#elif defined(__linux__)
-#include <arpa/inet.h>
-#endif
+#include "SipWireUtil.hpp"
 
 std::string BlfSubscriptions::parseEventPackage(const std::string& raw)
 {
@@ -118,12 +113,10 @@ std::shared_ptr<SipMessage> BlfSubscriptions::buildDialogNotify(DialogSubscripti
 	const std::string& state, const std::string& direction, const std::string& dialogId,
 	bool terminated, const char* termReason)
 {
-	std::string activeIp = _env.localIp();
-	std::string srcIpPort = activeIp + ":" + std::to_string(_env.serverPort());
-	char ipBuf[INET_ADDRSTRLEN]{};
-	inet_ntop(AF_INET, &sub.addr.sin_addr, ipBuf, sizeof(ipBuf));
-	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(sub.addr.sin_port));
-	std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
+	const std::string& activeIp = _env.localIp();
+	const std::string srcIpPort = activeIp + ":" + std::to_string(_env.serverPort());
+	const std::string destIpPort = sipwire::addrToIpPort(sub.addr);
+	const std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
 
 	std::string entity = "sip:" + sub.targetAor + "@" + srcIpPort;
 	std::string body = buildDialogInfoXml(entity, sub.version, dialogId, state, direction);

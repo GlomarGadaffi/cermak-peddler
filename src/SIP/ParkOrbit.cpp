@@ -7,22 +7,9 @@
 #include "Session.hpp"
 #include "SipHeaderUtil.hpp"
 #include "SipMessageTypes.h"
+#include "SipWireUtil.hpp"
 
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-#include <lwip/sockets.h>
-#elif defined(__linux__)
-#include <arpa/inet.h>
-#endif
-
-namespace
-{
-	std::string addrToIpPort(const sockaddr_in& addr)
-	{
-		char ipBuf[INET_ADDRSTRLEN]{};
-		inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf));
-		return std::string(ipBuf) + ":" + std::to_string(ntohs(addr.sin_port));
-	}
-}
+using sipwire::addrToIpPort;
 
 int ParkOrbit::orbitIndex(std::string_view ext) const
 {
@@ -47,14 +34,7 @@ void ParkOrbit::onInvite(const std::shared_ptr<SipMessage>& data,
 	if (slot.state == ParkState::Free)
 	{
 		// ── PARK ── answer with an a=inactive hold SDP so the parked party is held.
-		const std::string holdSdp =
-			"v=0\r\n"
-			"o=- 0 0 IN IP4 " + activeIp + "\r\n"
-			"s=pocket-dial\r\n"
-			"c=IN IP4 " + activeIp + "\r\n"
-			"t=0 0\r\n"
-			"m=audio 9 RTP/AVP 0\r\n"
-			"a=inactive\r\n";
+		const std::string holdSdp = sipwire::makeInactiveHoldSdp(activeIp);
 		auto ok = _env.messageFromPool(data->toString(), data->getSource());
 		ok->setHeader(SipMessageTypes::OK);
 		ok->setVia(std::string(data->getVia()) + ";received=" + activeIp);

@@ -4,22 +4,9 @@
 
 #include "IDGen.hpp"
 #include "SipMessageTypes.h"
+#include "SipWireUtil.hpp"
 
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-#include <lwip/sockets.h>
-#elif defined(__linux__)
-#include <arpa/inet.h>
-#endif
-
-namespace
-{
-	std::string addrToIpPort(const sockaddr_in& addr)
-	{
-		char ipBuf[INET_ADDRSTRLEN]{};
-		inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf));
-		return std::string(ipBuf) + ":" + std::to_string(ntohs(addr.sin_port));
-	}
-}
+using sipwire::addrToIpPort;
 
 RegisterBeeper::BeepDialog* RegisterBeeper::findByCallID(std::string_view callID)
 {
@@ -74,14 +61,7 @@ void RegisterBeeper::sendBeep(const std::shared_ptr<SipClient>& phone)
 	slot->deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
 
 	// Minimal, well-formed SDP. a=inactive: no RTP will flow (server sources none).
-	std::string body =
-		"v=0\r\n"
-		"o=- 0 0 IN IP4 " + activeIp + "\r\n"
-		"s=pocket-dial\r\n"
-		"c=IN IP4 " + activeIp + "\r\n"
-		"t=0 0\r\n"
-		"m=audio 9 RTP/AVP 0\r\n"
-		"a=inactive\r\n";
+	const std::string body = sipwire::makeInactiveHoldSdp(activeIp);
 
 	std::ostringstream ss;
 	ss << "INVITE sip:" << clientNum << "@" << destIpPort << " SIP/2.0\r\n"
