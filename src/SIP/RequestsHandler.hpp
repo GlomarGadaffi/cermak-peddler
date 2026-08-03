@@ -35,6 +35,7 @@
 #include "TransactionLayer.hpp"
 #include "Registrar.hpp"
 #include "RegisterBeeper.hpp"
+#include "ParkOrbit.hpp"
 
 class RequestsHandler : private PbxEnv
 {
@@ -277,6 +278,39 @@ private:
 	}
 	const std::string& localIp() const override { return _localIp; }
 	int serverPort() const override { return _serverPort; }
+	std::shared_ptr<SipClient> findRegistered(std::string_view number) override
+	{
+		auto c = findClient(number);
+		return c.has_value() ? c.value() : nullptr;
+	}
+	std::shared_ptr<SipClient> allocVirtualPeer(std::string number, const sockaddr_in& addr) override
+	{
+		return allocateVirtualPeer(std::move(number), addr);
+	}
+	std::shared_ptr<Session> allocSession(const std::string& callID,
+		const std::shared_ptr<SipClient>& src) override
+	{
+		return allocateSession(callID, src);
+	}
+	void insertSession(const std::string& callID, const std::shared_ptr<Session>& session) override
+	{
+		_sessions.emplace(callID, session);
+	}
+	std::shared_ptr<Session> findSession(std::string_view callID) override
+	{
+		auto s = getSession(callID);
+		return s.has_value() ? s.value() : nullptr;
+	}
+	std::string contactFor(std::string_view number) const override
+	{
+		return buildContact(number);
+	}
+	std::shared_ptr<SipMessage> serverBye(const std::string& destExt,
+		const sockaddr_in& destAddr, const std::string& callId,
+		const std::string& fromHeader, const std::string& toHeader) override
+	{
+		return buildServerBye(destExt, destAddr, callId, fromHeader, toHeader);
+	}
 
 	// RFC 3261 §17 INVITE client transactions (Timer A/B/L). Guarded by _mutex.
 	TransactionLayer _txLayer{*this};
@@ -295,50 +329,14 @@ private:
 	void armSessionTimer(Session* session, const std::shared_ptr<SipMessage>& ok200);
 	void sweepSessionTimers(std::chrono::steady_clock::time_point now);
 
-	// ── Call parking / park-orbit ──────────────────────────────────────────────
-	// Virtual orbit extensions 700..70(N-1). An INVITE to a FREE orbit parks the
-	// caller's leg there; an INVITE to an OCCUPIED orbit retrieves it: the retriever
-	// is answered with the parked party's SDP and the parked party is re-INVITEd so
-	// media renegotiates peer-to-peer. tick() sweeps timed-out parks: ring back the
-	// parker (Referred-By) when registered, else tear down with BYE. All helpers
-	// assume the caller holds _mutex and only enqueue to _outbox.
-	enum class ParkState : uint8_t { Free, Parked, RingingBack, Retrieving };
-	struct ParkSlot
-	{
-		ParkState state = ParkState::Free;
-		std::string orbit;              // "700".."70N"
-		std::string callID;             // Call-ID of the parked dialog
-		std::string parkedExt;          // the parked party's extension
-		sockaddr_in parkedAddr{};       // the parked party's signaling address
-		bool        parked = false;     // slot has a captured parked dialog
-		std::string parkedSdp;          // parked party's SDP (for retrieve / ring-back offers)
-		std::string parkedFromTag;      // parked party's From-tag (re-INVITE / BYE To-tag)
-		std::string localTag;           // our UAS To-tag on the parked dialog
-		std::string parker;             // ring-back target on timeout
-		std::chrono::steady_clock::time_point parkedAt{};
-		// Ring-back UAC dialog toward the parker (server-minted, fresh Call-ID).
-		std::string rbCallID;
-		std::string rbFromTag;
-		std::string rbBranch;
-		sockaddr_in rbAddr{};
-		std::chrono::steady_clock::time_point deadline{};
-	};
-	std::array<ParkSlot, POCKETDIAL_PARK_SLOTS> _parkSlots;
-	std::chrono::seconds _parkTimeout{POCKETDIAL_PARK_TIMEOUT_SEC};
-	std::vector<std::string> _parkPendingAcks;    // park re-INVITE ACKs pending
+	// Call parking / park-orbit: the orbit FSM lives in ParkOrbit (see
+	// ParkOrbit.hpp). Guarded by _mutex.
+	ParkOrbit _park{*this};
 	std::vector<std::string> _transferPendingAcks; // attended-transfer re-INVITE ACKs pending
 
-	int parkOrbitIndex(std::string_view ext) const;
-	void onParkInvite(std::shared_ptr<SipMessage> data,
-		const std::shared_ptr<SipClient>& caller, int orbitIdx);
-	void sendParkReinvite(ParkSlot& slot, const std::string& sdp);
-	void byeParkedParty(const ParkSlot& slot);
-	void startParkRingback(ParkSlot& slot, const std::shared_ptr<SipClient>& parker,
-		std::chrono::steady_clock::time_point now);
-	bool handleParkOk(const std::shared_ptr<SipMessage>& data);
 	bool handleTransferOk(const std::shared_ptr<SipMessage>& data);
-	void parkSweep(std::chrono::steady_clock::time_point now);
-	void freeParkSlot(std::string_view callID);
+	// Mirror the park orbits into the dashboard snapshot. Caller holds _mutex;
+	// takes _snapshotMutex internally.
 	void refreshParkSnapshot();
 
 	bool setCallState(std::string_view callID, Session::State state);

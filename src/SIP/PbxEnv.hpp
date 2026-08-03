@@ -11,8 +11,11 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 
 class SipMessage;
+class SipClient;
+class Session;
 
 // Narrow service surface the decomposed SIP state machines (TransactionLayer,
 // Registrar, ParkOrbit, BlfSubscriptions, ...) use to reach the shared engine
@@ -37,6 +40,28 @@ struct PbxEnv
 	// the identity the machines stamp into Via/From/Contact headers they build.
 	virtual const std::string& localIp() const = 0;
 	virtual int serverPort() const = 0;
+
+	// ── Engine services (registration + session tables) ───────────────────────
+	// Look up a live registration binding; nullptr when `number` isn't registered.
+	virtual std::shared_ptr<SipClient> findRegistered(std::string_view number) = 0;
+	// Draw a transient virtual-peer SipClient (777/440/park leg) from the fixed
+	// pool (heap fallback on exhaustion — graceful, never a crash).
+	virtual std::shared_ptr<SipClient> allocVirtualPeer(std::string number, const sockaddr_in& addr) = 0;
+	// Draw a Session from the fixed pool; nullptr on exhaustion. NOT yet visible
+	// to lookups — pair with insertSession once it is wired up.
+	virtual std::shared_ptr<Session> allocSession(const std::string& callID,
+		const std::shared_ptr<SipClient>& src) = 0;
+	// Publish a session into the live-session table under its Call-ID.
+	virtual void insertSession(const std::string& callID, const std::shared_ptr<Session>& session) = 0;
+	// Find a live session by Call-ID; nullptr when unknown.
+	virtual std::shared_ptr<Session> findSession(std::string_view callID) = 0;
+	// Build the server's Contact header value for `number`.
+	virtual std::string contactFor(std::string_view number) const = 0;
+	// Build a server-initiated in-dialog BYE. From/To must include tags because
+	// the dialog role differs per call path (beep = server UAC; park = server UAS).
+	virtual std::shared_ptr<SipMessage> serverBye(const std::string& destExt,
+		const sockaddr_in& destAddr, const std::string& callId,
+		const std::string& fromHeader, const std::string& toHeader) = 0;
 };
 
 #endif
