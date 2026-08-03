@@ -62,8 +62,13 @@ private:
 	};
 
 	BeepDialog* findByCallID(std::string_view callID);
-	std::shared_ptr<SipMessage> buildAck(const std::shared_ptr<SipMessage>& ok);
-	std::shared_ptr<SipMessage> buildBye(const std::shared_ptr<SipMessage>& ok);
+	// buildAck/buildBye take the dialog handleOk() already located plus the two
+	// authority strings it already formatted — they used to re-scan the table by
+	// Call-ID and re-derive both ip:port strings, three times over per answered
+	// beep, all inside the _mutex-held 200-OK dispatch.
+	std::shared_ptr<SipMessage> buildAck(const BeepDialog& bd, const std::shared_ptr<SipMessage>& ok,
+		const std::string& destIpPort, const std::string& srcIpPort);
+	std::shared_ptr<SipMessage> buildBye(const BeepDialog& bd, const std::shared_ptr<SipMessage>& ok);
 	std::shared_ptr<SipMessage> buildCancel(std::size_t slot);
 
 	// Bounded outbound-UAC dialog table. Tiny fixed footprint; if all slots are

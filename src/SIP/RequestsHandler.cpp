@@ -1786,9 +1786,13 @@ std::shared_ptr<SipMessage> RequestsHandler::buildReferNotify(const std::shared_
 	std::ostringstream ss;
 	ss << "NOTIFY sip:" << transferor->getNumber() << "@" << destIpPort << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
-	   << "From: " << refer->getTo() << "\r\n"
-	   << "To: " << refer->getFrom() << "\r\n"
-	   << "Call-ID: " << refer->getCallID() << "\r\n"
+	   // getTo()/getFrom()/getCallID() hand back the FULL header line, so the value
+	   // has to be unwrapped before it is re-stamped under a new name — otherwise
+	   // this NOTIFY goes out as "From: To: <sip:...>" and the transferor cannot
+	   // match it to the REFER dialog. Roles swap (RFC 3515 §2.4.5).
+	   << "From: " << stripHeaderName(refer->getTo()) << "\r\n"
+	   << "To: " << stripHeaderName(refer->getFrom()) << "\r\n"
+	   << "Call-ID: " << stripHeaderName(refer->getCallID()) << "\r\n"
 	   << "CSeq: 2 NOTIFY\r\n"
 	   << "Max-Forwards: 70\r\n"
 	   << "Event: refer\r\n"

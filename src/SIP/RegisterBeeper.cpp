@@ -3,6 +3,7 @@
 #include <sstream>
 
 #include "IDGen.hpp"
+#include "SipHeaderUtil.hpp"
 #include "SipMessageTypes.h"
 #include "SipWireUtil.hpp"
 
@@ -10,9 +11,15 @@ using sipwire::addrToIpPort;
 
 RegisterBeeper::BeepDialog* RegisterBeeper::findByCallID(std::string_view callID)
 {
+	// Callers hand us SipMessage::getCallID(), which returns the FULL header line
+	// ("Call-ID: x@host"), while slot.callID holds the bare id we generated in
+	// sendBeep(). Normalise before comparing — matching the raw line against the
+	// bare id never succeeded, so an answered beep was never ACKed or BYEd and
+	// sweep() went on to CANCEL an INVITE that already had a final response.
+	const std::string key = siphdr::stripHeaderName(callID);
 	for (auto& bd : _dialogs)
 	{
-		if (bd.state != BeepState::Free && bd.callID == callID)
+		if (bd.state != BeepState::Free && bd.callID == key)
 		{
 			return &bd;
 		}
@@ -109,9 +116,11 @@ bool RegisterBeeper::handleOk(const std::shared_ptr<SipMessage>& data)
 	if (bd->state == BeepState::AwaitingInviteOk &&
 		cseq.find(SipMessageTypes::INVITE) != std::string::npos)
 	{
-		auto ack = buildAck(data);
+		const std::string destIpPort = addrToIpPort(bd->addr);
+		const std::string srcIpPort = _env.localIp() + ":" + std::to_string(_env.serverPort());
+		auto ack = buildAck(*bd, data, destIpPort, srcIpPort);
 		if (ack) _env.enqueue(bd->addr, std::move(ack));
-		auto bye = buildBye(data);
+		auto bye = buildBye(*bd, data);
 		if (bye) _env.enqueue(bd->addr, std::move(bye));
 		bd->state    = BeepState::AwaitingByeOk;
 		// Re-arm the deadline so a phone that never 200s our BYE still frees its
@@ -149,58 +158,38 @@ void RegisterBeeper::sweep(std::chrono::steady_clock::time_point now)
 	}
 }
 
-std::shared_ptr<SipMessage> RegisterBeeper::buildAck(const std::shared_ptr<SipMessage>& ok)
+std::shared_ptr<SipMessage> RegisterBeeper::buildAck(const BeepDialog& bd,
+	const std::shared_ptr<SipMessage>& ok,
+	const std::string& destIpPort, const std::string& srcIpPort)
 {
 	// ACK the phone's 200 OK to our beep INVITE (RFC 3261 §13.2.2.4 / §17.1.1.3).
 	// Same Call-ID/branch/From-tag as the INVITE; To carries the phone's tag from the
 	// 200. CSeq stays "1 ACK" (matches the INVITE transaction). No body.
-	BeepDialog* bd = findByCallID(ok->getCallID());
-	if (!bd)
-	{
-		return nullptr;
-	}
-
-	std::string destIpPort = addrToIpPort(bd->addr);
-	std::string srcIpPort = _env.localIp() + ":" + std::to_string(_env.serverPort());
-
 	std::ostringstream ss;
-	ss << "ACK sip:" << bd->ext << "@" << destIpPort << " SIP/2.0\r\n"
-	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << bd->branch << "\r\n"
-	   << "From: \"PocketDial\" <sip:pbx@" << srcIpPort << ">;tag=" << bd->fromTag << "\r\n"
-	   << "To: " << ok->getTo() << "\r\n"
-	   << "Call-ID: " << bd->callID << "\r\n"
+	ss << "ACK sip:" << bd.ext << "@" << destIpPort << " SIP/2.0\r\n"
+	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << bd.branch << "\r\n"
+	   << "From: \"PocketDial\" <sip:pbx@" << srcIpPort << ">;tag=" << bd.fromTag << "\r\n"
+	   << "To: " << siphdr::stripHeaderName(ok->getTo()) << "\r\n"
+	   << "Call-ID: " << bd.callID << "\r\n"
 	   << "CSeq: 1 ACK\r\n"
 	   << "Max-Forwards: 70\r\n"
 	   << "Content-Length: 0\r\n\r\n";
 
-	return _env.messageFromPool(ss.str(), bd->addr);
+	return _env.messageFromPool(ss.str(), bd.addr);
 }
 
-std::shared_ptr<SipMessage> RegisterBeeper::buildBye(const std::shared_ptr<SipMessage>& ok)
+std::shared_ptr<SipMessage> RegisterBeeper::buildBye(const BeepDialog& bd,
+	const std::shared_ptr<SipMessage>& ok)
 {
-	// BYE to end the beep call immediately after the tone. New transaction (fresh
-	// branch, CSeq 2 BYE) within the established dialog. To carries the phone's tag.
-	BeepDialog* bd = findByCallID(ok->getCallID());
-	if (!bd)
-	{
-		return nullptr;
-	}
-
-	std::string destIpPort = addrToIpPort(bd->addr);
-	std::string srcIpPort = _env.localIp() + ":" + std::to_string(_env.serverPort());
-	std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
-
-	std::ostringstream ss;
-	ss << "BYE sip:" << bd->ext << "@" << destIpPort << " SIP/2.0\r\n"
-	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
-	   << "From: \"PocketDial\" <sip:pbx@" << srcIpPort << ">;tag=" << bd->fromTag << "\r\n"
-	   << "To: " << ok->getTo() << "\r\n"
-	   << "Call-ID: " << bd->callID << "\r\n"
-	   << "CSeq: 2 BYE\r\n"
-	   << "Max-Forwards: 70\r\n"
-	   << "Content-Length: 0\r\n\r\n";
-
-	return _env.messageFromPool(ss.str(), bd->addr);
+	// BYE to end the beep call immediately after the tone. Delegated to the engine's
+	// one server-BYE builder (PbxEnv::serverBye) so hardening applied there — CSeq 2
+	// BYE, header-name stripping, Max-Forwards policy — reaches the beep teardown
+	// too, exactly as ParkOrbit::byeParkedParty does. To carries the phone's tag.
+	const std::string srcIpPort = _env.localIp() + ":" + std::to_string(_env.serverPort());
+	const std::string fromHeader =
+		"\"PocketDial\" <sip:pbx@" + srcIpPort + ">;tag=" + bd.fromTag;
+	return _env.serverBye(bd.ext, bd.addr, bd.callID,
+		fromHeader, std::string(ok->getTo()));
 }
 
 std::shared_ptr<SipMessage> RegisterBeeper::buildCancel(std::size_t slot)
