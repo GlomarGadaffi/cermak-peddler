@@ -9,14 +9,6 @@
 
 namespace
 {
-	int countOf(const std::string& hay, const std::string& needle)
-	{
-		int n = 0;
-		for (size_t p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + needle.size()))
-			++n;
-		return n;
-	}
-
 	std::shared_ptr<SipMessage> subscribe(const std::string& watcher, const std::string& target,
 		const std::string& callId, const std::string& eventHdr, int expires,
 		const sockaddr_in& src)
@@ -50,9 +42,9 @@ TEST(BlfSubscriptions, AcceptsDialogSubscribeAndNotifiesWithSwappedDialogRoles)
 	const std::string notify = env.sentRaw(1);
 	EXPECT_EQ(notify.rfind("NOTIFY sip:192.168.1.60:5060", 0), 0u) << notify;
 	// Exactly one From/To/Call-ID, each a bare value under the right name.
-	EXPECT_EQ(countOf(notify, "From:"), 1) << notify;
-	EXPECT_EQ(countOf(notify, "To:"), 1) << notify;
-	EXPECT_EQ(countOf(notify, "Call-ID:"), 1) << notify;
+	EXPECT_EQ(FakePbxEnv::countOf(notify, "From:"), 1) << notify;
+	EXPECT_EQ(FakePbxEnv::countOf(notify, "To:"), 1) << notify;
+	EXPECT_EQ(FakePbxEnv::countOf(notify, "Call-ID:"), 1) << notify;
 	EXPECT_EQ(notify.find("From: To:"), std::string::npos) << notify;
 	EXPECT_EQ(notify.find("To: From:"), std::string::npos) << notify;
 	// RFC 6665 §4.4.1: roles swap — our To (with our tag) becomes the NOTIFY From.

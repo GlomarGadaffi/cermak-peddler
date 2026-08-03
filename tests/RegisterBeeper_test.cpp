@@ -10,14 +10,6 @@
 
 namespace
 {
-	int countOf(const std::string& hay, const std::string& needle)
-	{
-		int n = 0;
-		for (size_t p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + needle.size()))
-			++n;
-		return n;
-	}
-
 	// The phone's 200 OK to our beep INVITE, echoing the Call-ID we generated.
 	std::shared_ptr<SipMessage> okFor(const std::string& callId, const sockaddr_in& from)
 	{
@@ -64,20 +56,23 @@ TEST(RegisterBeeper, AnsweredBeepAcksAndByesWithWellFormedHeaders)
 
 	const std::string ack = env.sentRaw(1);
 	EXPECT_EQ(ack.rfind("ACK sip:101@", 0), 0u) << ack;
-	EXPECT_EQ(countOf(ack, "To:"), 1) << ack;
-	EXPECT_EQ(countOf(ack, "From:"), 1) << ack;
-	EXPECT_EQ(countOf(ack, "Call-ID:"), 1) << ack;
+	EXPECT_EQ(FakePbxEnv::countOf(ack, "To:"), 1) << ack;
+	EXPECT_EQ(FakePbxEnv::countOf(ack, "From:"), 1) << ack;
+	EXPECT_EQ(FakePbxEnv::countOf(ack, "Call-ID:"), 1) << ack;
 	// The phone's tag must survive onto the ACK or the dialog does not match.
 	EXPECT_NE(ack.find("tag=phonetag"), std::string::npos) << ack;
 	EXPECT_NE(ack.find("Call-ID: " + callId + "\r\n"), std::string::npos) << ack;
 
-	const std::string bye = env.sentRaw(2);
-	EXPECT_EQ(bye.rfind("BYE sip:101@", 0), 0u) << bye;
-	EXPECT_EQ(countOf(bye, "To:"), 1) << bye;
-	EXPECT_EQ(countOf(bye, "Call-ID:"), 1) << bye;
-	EXPECT_NE(bye.find("CSeq: 2 BYE"), std::string::npos) << bye;
-	EXPECT_NE(bye.find("tag=phonetag"), std::string::npos) << bye;
-	EXPECT_NE(bye.find("Call-ID: " + callId + "\r\n"), std::string::npos) << bye;
+	// The BYE is delegated to PbxEnv::serverBye (the engine's single server-BYE
+	// builder), so assert on what the beeper handed it — asserting on the bytes
+	// would only be testing FakePbxEnv's own stand-in for that builder.
+	ASSERT_EQ(env.byeCalls.size(), 1u);
+	const auto& bye = env.byeCalls[0];
+	EXPECT_EQ(bye.destExt, "101");
+	EXPECT_EQ(bye.callId, callId);                    // bare value, not the header line
+	EXPECT_NE(bye.toHeader.find("tag=phonetag"), std::string::npos) << bye.toHeader;
+	EXPECT_NE(bye.fromHeader.find("<sip:pbx@"), std::string::npos) << bye.fromHeader;
+	EXPECT_NE(bye.fromHeader.find(";tag="), std::string::npos) << bye.fromHeader;
 }
 
 // A 200 OK for an unknown Call-ID is not ours — handleOk must decline it so the

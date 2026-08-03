@@ -277,14 +277,15 @@ private:
 		return buildServerBye(destExt, destAddr, callId, fromHeader, toHeader);
 	}
 	void forEachSessionInvolving(std::string_view aor,
-		const std::function<void(const std::string&, const Session&)>& fn) const override
+		const std::function<void(const std::string&, const Session&, DialogRole)>& fn) const override
 	{
 		for (const auto& [callID, session] : _sessions)
 		{
 			if (!session) continue;
-			const bool isSrc  = session->getSrc()  && session->getSrc()->getNumber()  == aor;
-			const bool isDest = session->getDest() && session->getDest()->getNumber() == aor;
-			if (isSrc || isDest) fn(callID, *session);
+			if (session->getSrc() && session->getSrc()->getNumber() == aor)
+				fn(callID, *session, DialogRole::Caller);
+			else if (session->getDest() && session->getDest()->getNumber() == aor)
+				fn(callID, *session, DialogRole::Callee);
 		}
 	}
 	bool validAor(std::string_view s) const override

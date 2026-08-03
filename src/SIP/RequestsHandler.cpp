@@ -15,6 +15,7 @@
 #include "PbxConfig.hpp"
 #include "PbxPersist.hpp"
 #include "SipHeaderUtil.hpp"
+#include "SipWireUtil.hpp"
 #include "AdminAuth.hpp"
 #include "SipDigest.hpp"
 #include "SipSecretStore.hpp"
@@ -1767,9 +1768,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildReferNotify(const std::shared_
 	// RFC 3515 §2.4.5 NOTIFY: Event: refer + message/sipfrag body reporting the
 	// transfer result. Sent within the REFER's dialog back to the transferor.
 	std::string activeIp = _localIp;
-	char ipBuf[INET_ADDRSTRLEN]{};
-	inet_ntop(AF_INET, &transferor->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
-	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(transferor->getAddress().sin_port));
+	std::string destIpPort = sipwire::addrToIpPort(transferor->getAddress());
 	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 	std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
 
@@ -2617,8 +2616,7 @@ bool RequestsHandler::sendMessageTo(const std::string& ext, const std::string& t
 		sent = true;
 
 		// Drain into a local vector and dispatch outside the lock (no IO under lock).
-		localOutbox = std::move(_outbox);
-		_outbox.clear();
+		localOutbox = drainOutbox();
 	}
 
 	for (auto& [addr, msg] : localOutbox)
@@ -2845,6 +2843,15 @@ void RequestsHandler::tick()
 
 		{
 			std::lock_guard<std::mutex> snapLock(_snapshotMutex);
+			// `devices` and `pageZones` are NOT rebuilt above: they are mirrored out
+			// of band (applyDeviceChange on a registry change, and the page-zone
+			// config path) because their sources only move on an admin action or a
+			// REGISTER. Carry them across the swap — assigning a fresh snapshot over
+			// the old one would blank both every tick, so the dashboard's adopted
+			// devices and paging zones would flash empty a second after any update
+			// and stay empty until the next change.
+			nextSnapshot.devices   = std::move(_snapshot.devices);
+			nextSnapshot.pageZones = std::move(_snapshot.pageZones);
 			_snapshot = std::move(nextSnapshot);
 		}
 

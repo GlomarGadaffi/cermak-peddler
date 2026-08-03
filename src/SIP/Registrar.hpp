@@ -62,7 +62,7 @@ public:
 	// Learn-mode admission: resolves the source MAC, applies TOFU + MAC-lock and
 	// returns the digest decision. On a first-packet ARP miss returns Accept
 	// (deferring the lock to the next REGISTER). Records/updates the adoption
-	// entry — poll consumeDevicesChanged() afterwards to mirror the snapshot.
+	// entry — poll consumeDevicesChange() afterwards to mirror the snapshot.
 	AuthDecision admitLearn(const std::shared_ptr<SipMessage>& data,
 		const std::string& ext, std::string& outRejectReason);
 	// Emit a 401 Unauthorized with a fresh WWW-Authenticate challenge. `stale`

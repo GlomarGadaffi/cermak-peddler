@@ -33,15 +33,6 @@ namespace
 			"Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
 		return std::make_shared<SipMessage>(raw, src);
 	}
-
-	// Count non-overlapping occurrences of `needle` in `hay`.
-	int countOf(const std::string& hay, const std::string& needle)
-	{
-		int n = 0;
-		for (size_t p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + needle.size()))
-			++n;
-		return n;
-	}
 }
 
 // Park a call on 700, then retrieve it from a second extension. The retrieve
@@ -70,7 +61,7 @@ TEST(ParkOrbit, RetrieveReinviteCarriesSingleCallIdHeader)
 
 	const std::string reinvite = env.sentRaw(2);
 	EXPECT_EQ(reinvite.rfind("INVITE sip:101@", 0), 0u) << reinvite;
-	EXPECT_EQ(countOf(reinvite, "Call-ID:"), 1) << reinvite;
+	EXPECT_EQ(FakePbxEnv::countOf(reinvite, "Call-ID:"), 1) << reinvite;
 	EXPECT_NE(reinvite.find("Call-ID: parked-call-1@192.168.1.50\r\n"), std::string::npos)
 		<< reinvite;
 	// The re-INVITE must offer the retriever's SDP so media re-points at them.
@@ -108,9 +99,9 @@ TEST(ParkOrbit, ReinviteOkIsAckedWithSingleCallIdHeader)
 
 	const std::string ack = env.sentRaw(before);
 	EXPECT_EQ(ack.rfind("ACK sip:", 0), 0u) << ack;
-	EXPECT_EQ(countOf(ack, "Call-ID:"), 1) << ack;
-	EXPECT_EQ(countOf(ack, "From:"), 1) << ack;
-	EXPECT_EQ(countOf(ack, "To:"), 1) << ack;
+	EXPECT_EQ(FakePbxEnv::countOf(ack, "Call-ID:"), 1) << ack;
+	EXPECT_EQ(FakePbxEnv::countOf(ack, "From:"), 1) << ack;
+	EXPECT_EQ(FakePbxEnv::countOf(ack, "To:"), 1) << ack;
 }
 
 // The dashboard mirror is driven by a dirty flag rather than by each call site

@@ -11,14 +11,13 @@
 #include "SipMessageTypes.h"
 #include "SipWireUtil.hpp"
 
-std::string BlfSubscriptions::parseEventPackage(const std::shared_ptr<SipMessage>& data)
+std::string BlfSubscriptions::parseEventPackage(std::string_view eventHeader)
 {
-	// SipMessage already parsed the header block (full name + compact form), so
-	// ask it for the Event line instead of re-serialising the whole message and
-	// running a second, weaker header scan over it — the old one also matched any
-	// line named "o", which is the SDP origin line's name too.
-	if (!data) return "";
-	std::string pkg = siphdr::stripHeaderName(data->getEvent());
+	// Takes the already-parsed Event header line (SipMessage::getEvent), rather
+	// than re-serialising the whole message and running a second, weaker header
+	// scan over it — the old scanner also matched any line named "o", which is
+	// the SDP origin line's name too.
+	std::string pkg = siphdr::stripHeaderName(eventHeader);
 	size_t semi = pkg.find(';');            // drop ;id=... and friends
 	if (semi != std::string::npos) pkg.erase(semi);
 	size_t e = pkg.find_last_not_of(" \t\r\n");
@@ -59,10 +58,10 @@ std::string BlfSubscriptions::computeDialogState(const std::string& targetAor,
 		return 0;
 	};
 	_env.forEachSessionInvolving(targetAor,
-		[&](const std::string& callID, const Session& session)
+		[&](const std::string& callID, const Session& session, PbxEnv::DialogRole role)
 	{
-		const bool isSrc  = session.getSrc()  && session.getSrc()->getNumber()  == targetAor;
-		const bool isDest = session.getDest() && session.getDest()->getNumber() == targetAor;
+		const bool isSrc  = (role == PbxEnv::DialogRole::Caller);
+		const bool isDest = !isSrc;
 
 		std::string state, dir;
 		switch (session.getState())
@@ -146,7 +145,7 @@ void BlfSubscriptions::onSubscribe(const std::shared_ptr<SipMessage>& data)
 	const std::string& activeIp = _env.localIp();
 
 	// 1. Event-package gate: only the RFC 4235 "dialog" package is implemented.
-	std::string pkg = parseEventPackage(data);
+	std::string pkg = parseEventPackage(data->getEvent());
 	if (pkg != "dialog")
 	{
 		auto resp = _env.messageFromPool(data->toString(), data->getSource());

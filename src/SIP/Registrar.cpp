@@ -1,5 +1,6 @@
 #include "Registrar.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 
 #include "ArpLookup.hpp"
@@ -301,12 +302,10 @@ std::vector<Registrar::AdoptedDevice> Registrar::adoptedDevices() const
 
 void Registrar::noteChange(Change kind)
 {
-	// Structural is sticky: if the row set gained or lost an entry in this pass,
-	// a later online flip must not downgrade it to the patch-only path.
-	if (kind == Change::Structural || _devicesChanged == Change::None)
-	{
-		_devicesChanged = kind;
-	}
+	// The enum is ordered None < OnlineOnly < Structural, so taking the max keeps
+	// Structural sticky: once the row set gained or lost an entry in this pass, a
+	// later online flip must not downgrade it to the patch-only path.
+	_devicesChanged = std::max(_devicesChanged, kind);
 }
 
 Registrar::Change Registrar::consumeDevicesChange()

@@ -116,9 +116,7 @@ bool RegisterBeeper::handleOk(const std::shared_ptr<SipMessage>& data)
 	if (bd->state == BeepState::AwaitingInviteOk &&
 		cseq.find(SipMessageTypes::INVITE) != std::string::npos)
 	{
-		const std::string destIpPort = addrToIpPort(bd->addr);
-		const std::string srcIpPort = _env.localIp() + ":" + std::to_string(_env.serverPort());
-		auto ack = buildAck(*bd, data, destIpPort, srcIpPort);
+		auto ack = buildAck(*bd, data);
 		if (ack) _env.enqueue(bd->addr, std::move(ack));
 		auto bye = buildBye(*bd, data);
 		if (bye) _env.enqueue(bd->addr, std::move(bye));
@@ -159,12 +157,14 @@ void RegisterBeeper::sweep(std::chrono::steady_clock::time_point now)
 }
 
 std::shared_ptr<SipMessage> RegisterBeeper::buildAck(const BeepDialog& bd,
-	const std::shared_ptr<SipMessage>& ok,
-	const std::string& destIpPort, const std::string& srcIpPort)
+	const std::shared_ptr<SipMessage>& ok)
 {
 	// ACK the phone's 200 OK to our beep INVITE (RFC 3261 §13.2.2.4 / §17.1.1.3).
 	// Same Call-ID/branch/From-tag as the INVITE; To carries the phone's tag from the
 	// 200. CSeq stays "1 ACK" (matches the INVITE transaction). No body.
+	const std::string destIpPort = addrToIpPort(bd.addr);
+	const std::string srcIpPort = _env.localIp() + ":" + std::to_string(_env.serverPort());
+
 	std::ostringstream ss;
 	ss << "ACK sip:" << bd.ext << "@" << destIpPort << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << bd.branch << "\r\n"

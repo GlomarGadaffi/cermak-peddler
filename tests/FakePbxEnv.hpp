@@ -35,8 +35,21 @@ public:
 		std::string raw;
 	};
 
+	// One recorded serverBye() call. Asserting on these rather than on the bytes
+	// the fake minted is what actually pins the delegation: the real builder is
+	// RequestsHandler::buildServerBye, which is private and not linked into this
+	// target, so any BYE text here is the fake's own and proves nothing about it.
+	struct ByeCall
+	{
+		std::string destExt;
+		std::string callId;
+		std::string fromHeader;
+		std::string toHeader;
+	};
+
 	std::vector<Sent>        sent;
 	std::vector<std::string> logs;
+	std::vector<ByeCall>     byeCalls;
 
 	// Registered extensions findRegistered() resolves against.
 	std::unordered_map<std::string, std::shared_ptr<SipClient>> registered;
@@ -58,6 +71,19 @@ public:
 	std::string sentRaw(std::size_t i) const
 	{
 		return i < sent.size() ? sent[i].raw : std::string{};
+	}
+
+	// Count non-overlapping occurrences of `needle` in `hay` — the header-shape
+	// assertion every machine test needs ("exactly one To: line").
+	static int countOf(const std::string& hay, const std::string& needle)
+	{
+		int n = 0;
+		for (size_t p = hay.find(needle); p != std::string::npos;
+			p = hay.find(needle, p + needle.size()))
+		{
+			++n;
+		}
+		return n;
 	}
 
 	// ── PbxEnv ───────────────────────────────────────────────────────────────
@@ -108,6 +134,7 @@ public:
 		const sockaddr_in& destAddr, const std::string& callId,
 		const std::string& fromHeader, const std::string& toHeader) override
 	{
+		byeCalls.push_back(ByeCall{destExt, callId, fromHeader, toHeader});
 		// Mirrors RequestsHandler::buildServerBye: strips any header-name prefix
 		// off the three dialog fields and emits CSeq 2 BYE.
 		std::string raw =
@@ -122,14 +149,15 @@ public:
 		return std::make_shared<SipMessage>(raw, destAddr);
 	}
 	void forEachSessionInvolving(std::string_view aor,
-		const std::function<void(const std::string&, const Session&)>& fn) const override
+		const std::function<void(const std::string&, const Session&, DialogRole)>& fn) const override
 	{
 		for (const auto& [callID, session] : sessions)
 		{
 			if (!session) continue;
-			const bool isSrc  = session->getSrc()  && session->getSrc()->getNumber()  == aor;
-			const bool isDest = session->getDest() && session->getDest()->getNumber() == aor;
-			if (isSrc || isDest) fn(callID, *session);
+			if (session->getSrc() && session->getSrc()->getNumber() == aor)
+				fn(callID, *session, DialogRole::Caller);
+			else if (session->getDest() && session->getDest()->getNumber() == aor)
+				fn(callID, *session, DialogRole::Callee);
 		}
 	}
 	bool validAor(std::string_view s) const override

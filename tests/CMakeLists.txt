@@ -46,6 +46,7 @@ add_executable(sip_parser_tests
     ParkOrbit_test.cpp
     RegisterBeeper_test.cpp
     BlfSubscriptions_test.cpp
+    DashboardSnapshot_test.cpp
     # SIP digest-auth primitives + per-extension HA1 secret store. Both are
     # host-compilable: SipDigest vendors a portable MD5 (no mbedTLS) and
     # SipSecretStore uses an in-memory map under !ESP_PLATFORM (no NVS).

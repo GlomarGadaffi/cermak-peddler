@@ -55,7 +55,7 @@ public:
 
 	// True (and resets the flag) if an orbit slot changed since the last call —
 	// the cue to re-mirror snapshotRows() into the dashboard snapshot. Same
-	// contract as Registrar::consumeDevicesChanged(), and polled from the same
+	// contract as Registrar::consumeDevicesChange(), and polled from the same
 	// once-per-packet spot, so mirroring is no longer a duty each mutating call
 	// site has to remember: sweep() and freeForCallId() self-signal too.
 	bool consumeParkChanged();
