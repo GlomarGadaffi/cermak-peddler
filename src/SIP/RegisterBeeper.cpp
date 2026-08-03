@@ -1,0 +1,252 @@
+#include "RegisterBeeper.hpp"
+
+#include <sstream>
+
+#include "IDGen.hpp"
+#include "SipMessageTypes.h"
+
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+#include <lwip/sockets.h>
+#elif defined(__linux__)
+#include <arpa/inet.h>
+#endif
+
+namespace
+{
+	std::string addrToIpPort(const sockaddr_in& addr)
+	{
+		char ipBuf[INET_ADDRSTRLEN]{};
+		inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf));
+		return std::string(ipBuf) + ":" + std::to_string(ntohs(addr.sin_port));
+	}
+}
+
+RegisterBeeper::BeepDialog* RegisterBeeper::findByCallID(std::string_view callID)
+{
+	for (auto& bd : _dialogs)
+	{
+		if (bd.state != BeepState::Free && bd.callID == callID)
+		{
+			return &bd;
+		}
+	}
+	return nullptr;
+}
+
+void RegisterBeeper::sendBeep(const std::shared_ptr<SipClient>& phone)
+{
+	if (!phone || phone->getNumber().empty())
+	{
+		return;
+	}
+
+	// Grab a free beep slot. Full table → skip (cosmetic); no leak, no blocking.
+	BeepDialog* slot = nullptr;
+	for (auto& bd : _dialogs)
+	{
+		if (bd.state == BeepState::Free) { slot = &bd; break; }
+	}
+	if (!slot)
+	{
+		_env.log("Register beep: table full, skipping beep for " + phone->getNumber());
+		return;
+	}
+
+	std::string clientNum = phone->getNumber();
+	const sockaddr_in& addr = phone->getAddress();
+	std::string destIpPort = addrToIpPort(addr);
+
+	std::string activeIp = _env.localIp();
+	std::string srcIpPort = activeIp + ":" + std::to_string(_env.serverPort());
+
+	std::string callId  = IDGen::GenerateID(16) + "@" + activeIp;
+	std::string branch  = "z9hG4bK" + IDGen::GenerateID(12);
+	std::string fromTag = IDGen::GenerateID(9);
+
+	// Record the dialog BEFORE sending so a (synchronous) response can never race
+	// ahead of the bookkeeping.
+	slot->state    = BeepState::AwaitingInviteOk;
+	slot->callID   = callId;
+	slot->branch   = branch;
+	slot->fromTag  = fromTag;
+	slot->ext      = clientNum;
+	slot->addr     = addr;
+	slot->deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+
+	// Minimal, well-formed SDP. a=inactive: no RTP will flow (server sources none).
+	std::string body =
+		"v=0\r\n"
+		"o=- 0 0 IN IP4 " + activeIp + "\r\n"
+		"s=pocket-dial\r\n"
+		"c=IN IP4 " + activeIp + "\r\n"
+		"t=0 0\r\n"
+		"m=audio 9 RTP/AVP 0\r\n"
+		"a=inactive\r\n";
+
+	std::ostringstream ss;
+	ss << "INVITE sip:" << clientNum << "@" << destIpPort << " SIP/2.0\r\n"
+	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
+	   << "From: \"PocketDial\" <sip:pbx@" << srcIpPort << ">;tag=" << fromTag << "\r\n"
+	   << "To: <sip:" << clientNum << "@" << activeIp << ">\r\n"
+	   << "Call-ID: " << callId << "\r\n"
+	   << "CSeq: 1 INVITE\r\n"
+	   << "Max-Forwards: 70\r\n"
+	   << "Contact: <sip:pbx@" << srcIpPort << ";transport=UDP>\r\n"
+	   // Auto-answer / intercom headers — identical intent to the 999 all-page fork:
+	   // make a Yealink auto-answer in intercom mode and so play its alert tone.
+	   << "Call-Info: <sip:any>;answer-after=0\r\n"
+	   << "Alert-Info: info=alert-autoanswer\r\n"
+	   << "Alert-Info: answer-after=0\r\n"
+	   << "Alert-Info: intercom=true\r\n"
+	   << "P-Auto-Answer: normal\r\n"
+	   << "User-Agent: pocket-dial\r\n"
+	   << "Content-Type: application/sdp\r\n"
+	   << "Content-Length: " << body.size() << "\r\n\r\n"
+	   << body;
+
+	auto invite = _env.messageFromPool(ss.str(), addr);
+	// Normalise the codec list and (re)derive Content-Length from the actual body —
+	// a wrong Content-Length silently breaks the offer on UDP (the 777-path bug).
+	invite->enforceG711();
+	invite->syncContentLength();
+	_env.enqueue(addr, std::move(invite));
+	_env.log("Register beep: INVITE -> " + clientNum);
+}
+
+bool RegisterBeeper::handleOk(const std::shared_ptr<SipMessage>& data)
+{
+	// Register-beep dialogs (server-originated UAC) have NO Session — they are
+	// tracked here by Call-ID. A 200 OK to our INVITE means the phone auto-answered
+	// (the tone played): ACK it, then BYE to end the call. A 200 OK to our BYE just
+	// frees the slot.
+	BeepDialog* bd = findByCallID(data->getCallID());
+	if (!bd)
+	{
+		return false;
+	}
+
+	std::string cseq(data->getCSeq());
+	if (bd->state == BeepState::AwaitingInviteOk &&
+		cseq.find(SipMessageTypes::INVITE) != std::string::npos)
+	{
+		auto ack = buildAck(data);
+		if (ack) _env.enqueue(bd->addr, std::move(ack));
+		auto bye = buildBye(data);
+		if (bye) _env.enqueue(bd->addr, std::move(bye));
+		bd->state    = BeepState::AwaitingByeOk;
+		// Re-arm the deadline so a phone that never 200s our BYE still frees its
+		// slot from sweep() rather than lingering until the original INVITE timeout.
+		bd->deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		_env.log("Register beep: answered by " + bd->ext + ", ACK+BYE sent");
+	}
+	else if (cseq.find(SipMessageTypes::BYE) != std::string::npos)
+	{
+		*bd = BeepDialog{};   // BYE acknowledged: dialog fully torn down, free slot
+	}
+	return true;
+}
+
+void RegisterBeeper::sweep(std::chrono::steady_clock::time_point now)
+{
+	// Any beep dialog whose deadline has passed without the phone answering
+	// (AwaitingInviteOk) is CANCELled and freed — no retransmit storm, no leak. A
+	// dialog still awaiting the 200-to-BYE just frees its slot (the BYE was
+	// already sent best-effort).
+	for (std::size_t i = 0; i < _dialogs.size(); ++i)
+	{
+		auto& bd = _dialogs[i];
+		if (bd.state == BeepState::Free || now < bd.deadline)
+		{
+			continue;
+		}
+		if (bd.state == BeepState::AwaitingInviteOk)
+		{
+			auto cancel = buildCancel(i);
+			if (cancel) _env.enqueue(bd.addr, std::move(cancel));
+			_env.log("Register beep: no answer from " + bd.ext + ", cancelled");
+		}
+		bd = BeepDialog{};   // free the slot
+	}
+}
+
+std::shared_ptr<SipMessage> RegisterBeeper::buildAck(const std::shared_ptr<SipMessage>& ok)
+{
+	// ACK the phone's 200 OK to our beep INVITE (RFC 3261 §13.2.2.4 / §17.1.1.3).
+	// Same Call-ID/branch/From-tag as the INVITE; To carries the phone's tag from the
+	// 200. CSeq stays "1 ACK" (matches the INVITE transaction). No body.
+	BeepDialog* bd = findByCallID(ok->getCallID());
+	if (!bd)
+	{
+		return nullptr;
+	}
+
+	std::string destIpPort = addrToIpPort(bd->addr);
+	std::string srcIpPort = _env.localIp() + ":" + std::to_string(_env.serverPort());
+
+	std::ostringstream ss;
+	ss << "ACK sip:" << bd->ext << "@" << destIpPort << " SIP/2.0\r\n"
+	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << bd->branch << "\r\n"
+	   << "From: \"PocketDial\" <sip:pbx@" << srcIpPort << ">;tag=" << bd->fromTag << "\r\n"
+	   << "To: " << ok->getTo() << "\r\n"
+	   << "Call-ID: " << bd->callID << "\r\n"
+	   << "CSeq: 1 ACK\r\n"
+	   << "Max-Forwards: 70\r\n"
+	   << "Content-Length: 0\r\n\r\n";
+
+	return _env.messageFromPool(ss.str(), bd->addr);
+}
+
+std::shared_ptr<SipMessage> RegisterBeeper::buildBye(const std::shared_ptr<SipMessage>& ok)
+{
+	// BYE to end the beep call immediately after the tone. New transaction (fresh
+	// branch, CSeq 2 BYE) within the established dialog. To carries the phone's tag.
+	BeepDialog* bd = findByCallID(ok->getCallID());
+	if (!bd)
+	{
+		return nullptr;
+	}
+
+	std::string destIpPort = addrToIpPort(bd->addr);
+	std::string srcIpPort = _env.localIp() + ":" + std::to_string(_env.serverPort());
+	std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
+
+	std::ostringstream ss;
+	ss << "BYE sip:" << bd->ext << "@" << destIpPort << " SIP/2.0\r\n"
+	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
+	   << "From: \"PocketDial\" <sip:pbx@" << srcIpPort << ">;tag=" << bd->fromTag << "\r\n"
+	   << "To: " << ok->getTo() << "\r\n"
+	   << "Call-ID: " << bd->callID << "\r\n"
+	   << "CSeq: 2 BYE\r\n"
+	   << "Max-Forwards: 70\r\n"
+	   << "Content-Length: 0\r\n\r\n";
+
+	return _env.messageFromPool(ss.str(), bd->addr);
+}
+
+std::shared_ptr<SipMessage> RegisterBeeper::buildCancel(std::size_t slot)
+{
+	// CANCEL the outstanding beep INVITE when the phone never auto-answered. Same
+	// Call-ID/branch/From-tag as the INVITE; To has NO tag yet (no final response).
+	// CSeq method becomes CANCEL but keeps the INVITE sequence number (RFC 3261 §9.1).
+	if (slot >= _dialogs.size())
+	{
+		return nullptr;
+	}
+	BeepDialog& bd = _dialogs[slot];
+
+	std::string destIpPort = addrToIpPort(bd.addr);
+	std::string activeIp = _env.localIp();
+	std::string srcIpPort = activeIp + ":" + std::to_string(_env.serverPort());
+
+	std::ostringstream ss;
+	ss << "CANCEL sip:" << bd.ext << "@" << destIpPort << " SIP/2.0\r\n"
+	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << bd.branch << "\r\n"
+	   << "From: \"PocketDial\" <sip:pbx@" << srcIpPort << ">;tag=" << bd.fromTag << "\r\n"
+	   << "To: <sip:" << bd.ext << "@" << activeIp << ">\r\n"
+	   << "Call-ID: " << bd.callID << "\r\n"
+	   << "CSeq: 1 CANCEL\r\n"
+	   << "Max-Forwards: 70\r\n"
+	   << "Content-Length: 0\r\n\r\n";
+
+	return _env.messageFromPool(ss.str(), bd.addr);
+}

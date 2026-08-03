@@ -80,6 +80,8 @@ add_executable(sip_parser_tests
     ../src/SIP/mix_kernels_scalar.cpp
     ../src/SIP/RequestsHandler.cpp
     ../src/SIP/TransactionLayer.cpp
+    ../src/SIP/Registrar.cpp
+    ../src/SIP/RegisterBeeper.cpp
     ../src/SIP/SipSdpMessage.cpp
     ../src/SIP/SipClient.cpp
     ../src/SIP/Session.cpp

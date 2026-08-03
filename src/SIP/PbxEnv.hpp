@@ -32,6 +32,11 @@ struct PbxEnv
 
 	// Append to the deferred log queue (flushed off-lock).
 	virtual void log(std::string msg, bool isError = false) = 0;
+
+	// The server's active local IP (resolved once at construction) and SIP port —
+	// the identity the machines stamp into Via/From/Contact headers they build.
+	virtual const std::string& localIp() const = 0;
+	virtual int serverPort() const = 0;
 };
 
 #endif

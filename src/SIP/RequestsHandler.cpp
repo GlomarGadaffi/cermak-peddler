@@ -13,6 +13,7 @@
 #include "PoolConfig.hpp"
 #include "CallDetailRecord.hpp"
 #include "PbxConfig.hpp"
+#include "PbxPersist.hpp"
 #include "AdminAuth.hpp"
 #include "SipDigest.hpp"
 #include "SipSecretStore.hpp"
@@ -103,9 +104,9 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	loadAdminExt();
 	// STAGE 2: load the registrar mode (defaults to the POCKETDIAL_OPEN_REGISTRAR
 	// seed) and the adopted-device registry from NVS.
-	loadRegistrarMode();
+	_registrar.loadMode();
 	loadAdminHttpTtl();
-	loadDevices();
+	_registrar.loadDevices();
 	// Prewarm the per-extension HA1 cache off the REGISTER hot path so the first
 	// Secure REGISTER does not pay a blocking NVS read while holding _mutex.
 	SipSecretStore::warmCache();
@@ -280,6 +281,14 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 			}
 		}
 
+		// Device-registry change detection: a REGISTER may have adopted a device,
+		// re-synced its extension, or flipped its online flag inside the Registrar
+		// machine — mirror the registry into the dashboard snapshot once per packet.
+		if (_registrar.consumeDevicesChanged())
+		{
+			refreshDeviceSnapshot();
+		}
+
 		// BLF change detection: one pass after every handled packet covers
 		// registration appear/disappear, session create/transition/teardown.
 		// NOTIFYs land in _outbox and ride out with this pass (after unlock).
@@ -347,22 +356,22 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	// On Challenge the helper has already enqueued the 401 + WWW-Authenticate; on
 	// Reject we emit the 403 here from rejectReason. Either way a non-Accept stops.
 	const std::string extStr(fromNumber);
-	const RegistrarMode mode = _registrarMode.load(std::memory_order_relaxed);
+	const RegistrarMode mode = _registrar.getMode();
 	if (mode != RegistrarMode::Open)
 	{
 		std::string rejectReason;
-		AuthDecision decision = (mode == RegistrarMode::Secure)
-			? admitSecure(data, extStr, rejectReason)
-			: admitLearn(data, extStr, rejectReason);
+		Registrar::AuthDecision decision = (mode == RegistrarMode::Secure)
+			? _registrar.admitSecure(data, extStr, rejectReason)
+			: _registrar.admitLearn(data, extStr, rejectReason);
 
-		if (decision == AuthDecision::Challenge)
+		if (decision == Registrar::AuthDecision::Challenge)
 		{
 			// admitSecure already enqueued the 401 + WWW-Authenticate.
 			return;
 		}
-		if (decision == AuthDecision::Reject)
+		if (decision == Registrar::AuthDecision::Reject)
 		{
-			sendForbidden(data, rejectReason.empty() ? "Forbidden" : rejectReason);
+			_registrar.sendForbidden(data, rejectReason.empty() ? "Forbidden" : rejectReason);
 			return;
 		}
 		// decision == Accept → fall through to the normal binding path below.
@@ -380,7 +389,7 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	{
 		// expires=0 (or an explicit zero) is a de-registration request.
 		unregisterClient(fromNumber);
-		if (deviceMac.has_value()) markDeviceOnline(*deviceMac, false);
+		if (deviceMac.has_value()) _registrar.markOnline(*deviceMac, false);
 	}
 	else
 	{
@@ -403,9 +412,9 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 			// and best-effort — if the beep table is full the beep is simply skipped.
 			if (isNewBinding)
 			{
-				sendRegisterBeep(newClient);
+				_beeper.sendBeep(newClient);
 			}
-			if (deviceMac.has_value()) markDeviceOnline(*deviceMac, true);
+			if (deviceMac.has_value()) _registrar.markOnline(*deviceMac, true);
 		}
 		else
 		{
@@ -453,7 +462,7 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 	{
 		queueLog("CANCEL for Call-ID " + std::string(data->getCallID()) +
 			" rejected: source not a dialog leg (spoofed teardown)", true);
-		sendForbidden(data, "Forbidden");
+		_registrar.sendForbidden(data, "Forbidden");
 		return;
 	}
 
@@ -1157,7 +1166,7 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 	{
 		queueLog("BYE for Call-ID " + std::string(data->getCallID()) +
 			" rejected: source not a dialog leg (spoofed teardown)", true);
-		sendForbidden(data, "Forbidden");
+		_registrar.sendForbidden(data, "Forbidden");
 		return;
 	}
 
@@ -1235,30 +1244,10 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	// Register-beep dialog (server-originated UAC). These have NO Session — they are
-	// tracked in _beepDialogs by Call-ID. A 200 OK to our INVITE means the phone
-	// auto-answered (the tone played): ACK it, then BYE to end the call. A 200 OK to
-	// our BYE just frees the slot. Recognised before the normal session lookup.
-	if (BeepDialog* bd = findBeepByCallID(data->getCallID()))
+	// Register-beep dialog (server-originated UAC, no Session): recognised by
+	// Call-ID before the normal session lookup. handleOk drives ACK→BYE→free.
+	if (_beeper.handleOk(data))
 	{
-		std::string cseq(data->getCSeq());
-		if (bd->state == BeepState::AwaitingInviteOk &&
-			cseq.find(SipMessageTypes::INVITE) != std::string::npos)
-		{
-			auto ack = buildBeepAck(data);
-			if (ack) _outbox.emplace_back(bd->addr, std::move(ack));
-			auto bye = buildBeepBye(data);
-			if (bye) _outbox.emplace_back(bd->addr, std::move(bye));
-			bd->state    = BeepState::AwaitingByeOk;
-			// Re-arm the deadline so a phone that never 200s our BYE still frees its
-			// slot from tick() rather than lingering until the original INVITE timeout.
-			bd->deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-			queueLog("Register beep: answered by " + bd->ext + ", ACK+BYE sent");
-		}
-		else if (cseq.find(SipMessageTypes::BYE) != std::string::npos)
-		{
-			*bd = BeepDialog{};   // BYE acknowledged: dialog fully torn down, free slot
-		}
 		return;
 	}
 
@@ -2478,12 +2467,7 @@ void RequestsHandler::setRegistrarMode(RegistrarMode mode)
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-		_registrarMode.store(mode, std::memory_order_relaxed);
-		persistRegistrarMode();
-		const char* name = (mode == RegistrarMode::Open)   ? "open"
-		                 : (mode == RegistrarMode::Learn)  ? "learn"
-		                                                   : "secure";
-		queueLog(std::string("Registrar mode set to ") + name);
+		_registrar.setMode(mode);
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
@@ -2497,54 +2481,19 @@ void RequestsHandler::setRegistrarMode(RegistrarMode mode)
 RequestsHandler::RegistrarMode RequestsHandler::getRegistrarMode() const
 {
 	// Lock-free read: the dashboard polls this; onRegister() branches on it on the
-	// hot path. The atomic guarantees a torn-free load.
-	return _registrarMode.load(std::memory_order_relaxed);
+	// hot path. The Registrar's atomic guarantees a torn-free load.
+	return _registrar.getMode();
 }
 
 // ── Device registry (STAGE 2: Learn-mode adoption) ────────────────────────────
 
 void RequestsHandler::refreshDeviceSnapshot()
 {
-	// Caller holds _mutex. Mirror _devices into the dashboard snapshot, preserving
-	// the previously-published online flags (online is tracked in the snapshot, not
-	// in _devices, since it is volatile registration state — not persisted).
+	// Caller holds _mutex. Mirror the Registrar's registry (including the volatile
+	// online flags it tracks) into the dashboard snapshot.
+	auto devices = _registrar.adoptedDevices();
 	std::lock_guard<std::mutex> snapLock(_snapshotMutex);
-
-	// Index the existing online flags by MAC so a rebuild doesn't lose them.
-	std::unordered_map<std::string, bool> wasOnline;
-	wasOnline.reserve(_snapshot.devices.size());
-	for (const auto& d : _snapshot.devices)
-	{
-		wasOnline[d.mac] = d.online;
-	}
-
-	_snapshot.devices.clear();
-	_snapshot.devices.reserve(_devices.size());
-	for (const auto& [mac, rec] : _devices)
-	{
-		AdoptedDevice d;
-		d.mac = mac;
-		d.extension = rec.extension;
-		d.state = rec.state;
-		auto it = wasOnline.find(mac);
-		d.online = (it != wasOnline.end()) ? it->second : false;
-		_snapshot.devices.push_back(std::move(d));
-	}
-}
-
-void RequestsHandler::markDeviceOnline(const std::string& mac, bool online)
-{
-	// Caller holds _mutex. Online state lives only in the snapshot (volatile, not
-	// persisted). No-op if the device isn't adopted (e.g. Open mode never records).
-	std::lock_guard<std::mutex> snapLock(_snapshotMutex);
-	for (auto& d : _snapshot.devices)
-	{
-		if (d.mac == mac)
-		{
-			d.online = online;
-			return;
-		}
-	}
+	_snapshot.devices = std::move(devices);
 }
 
 std::vector<RequestsHandler::AdoptedDevice> RequestsHandler::getAdoptedDevices()
@@ -2559,46 +2508,8 @@ bool RequestsHandler::secureDevice(const std::string& macOrExt)
 	bool changed = false;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-
-		// Accept either a 12-hex MAC (direct key) or an extension (find the device
-		// currently adopted under it).
-		auto it = _devices.find(macOrExt);
-		if (it == _devices.end())
-		{
-			for (auto cand = _devices.begin(); cand != _devices.end(); ++cand)
-			{
-				if (cand->second.extension == macOrExt) { it = cand; break; }
-			}
-		}
-
-		if (it != _devices.end())
-		{
-			// Footgun guard: promoting a device to Secured makes admitSecure() demand a
-			// digest for it. If the extension has NO stored secret, that would lock the
-			// phone out on its next REGISTER ("Extension Not Provisioned"). Refuse, and
-			// tell the operator to assign a secret first.
-			if (!SipSecretStore::hasSecret(it->second.extension))
-			{
-				queueLog("secureDevice: ext " + it->second.extension +
-					" has no SIP secret — assign one before securing", true);
-			}
-			else
-			{
-				if (it->second.state != DeviceState::Secured)
-				{
-					it->second.state = DeviceState::Secured;
-					persistDevices();
-					changed = true;
-				}
-				queueLog("Device " + it->first + " (ext " + it->second.extension + ") secured");
-			}
-		}
-		else
-		{
-			queueLog("secureDevice: no adopted device for '" + macOrExt + "'", true);
-		}
-
-		if (changed) refreshDeviceSnapshot();
+		changed = _registrar.secure(macOrExt);
+		if (_registrar.consumeDevicesChanged()) refreshDeviceSnapshot();
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
@@ -2616,29 +2527,8 @@ bool RequestsHandler::forgetDevice(const std::string& macOrExt)
 	bool removed = false;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-
-		auto it = _devices.find(macOrExt);
-		if (it == _devices.end())
-		{
-			for (auto cand = _devices.begin(); cand != _devices.end(); ++cand)
-			{
-				if (cand->second.extension == macOrExt) { it = cand; break; }
-			}
-		}
-
-		if (it != _devices.end())
-		{
-			queueLog("Device " + it->first + " (ext " + it->second.extension + ") forgotten");
-			_devices.erase(it);
-			persistDevices();
-			removed = true;
-			refreshDeviceSnapshot();
-		}
-		else
-		{
-			queueLog("forgetDevice: no adopted device for '" + macOrExt + "'", true);
-		}
-
+		removed = _registrar.forget(macOrExt);
+		if (_registrar.consumeDevicesChanged()) refreshDeviceSnapshot();
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
@@ -2648,150 +2538,6 @@ bool RequestsHandler::forgetDevice(const std::string& macOrExt)
 		else std::cout << log.second << std::endl;
 	}
 	return removed;
-}
-
-// ── REGISTER admission helpers (STAGE 2) ──────────────────────────────────────
-// All run under _mutex (called from onRegister, which holds it via handle()).
-
-void RequestsHandler::sendChallenge(const std::shared_ptr<SipMessage>& data, bool stale)
-{
-	auto response = getMessageFromPool(data->toString(), data->getSource());
-	response->setHeader("SIP/2.0 401 Unauthorized");
-	response->clearBody();
-	std::string activeIp = _localIp;
-	response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
-	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
-	// Fresh stateless nonce per challenge; realm MUST match SipSecretStore::kRealm.
-	response->addHeader("WWW-Authenticate",
-		SipDigest::buildWwwAuthenticate(SipSecretStore::kRealm,
-			SipDigest::generateNonce(), stale));
-	response->syncContentLength();
-	_outbox.emplace_back(data->getSource(), std::move(response));
-}
-
-void RequestsHandler::sendForbidden(const std::shared_ptr<SipMessage>& data, const std::string& reason)
-{
-	auto response = getMessageFromPool(data->toString(), data->getSource());
-	response->setHeader("SIP/2.0 403 " + reason);
-	response->clearBody();
-	std::string activeIp = _localIp;
-	response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
-	response->syncContentLength();
-	_outbox.emplace_back(data->getSource(), std::move(response));
-}
-
-RequestsHandler::AuthDecision RequestsHandler::admitSecure(
-	const std::shared_ptr<SipMessage>& data, const std::string& ext, std::string& outRejectReason)
-{
-	// Secure mode: a provisioned extension MUST present a valid digest. An ext with
-	// NO stored secret is unprovisioned — reject with a clear reason (the SAFE
-	// default; "allow first-time" would defeat the point of secure mode).
-	auto ha1 = SipSecretStore::getHa1(ext);
-	if (!ha1.has_value())
-	{
-		outRejectReason = "Extension Not Provisioned";
-		queueLog("Secure REGISTER for unprovisioned ext " + ext + " rejected", true);
-		return AuthDecision::Reject;
-	}
-
-	SipDigest::DigestAuth auth;
-	std::string_view authHdr = data->getAuthorization();
-	if (authHdr.empty() || !SipDigest::parseAuthorization(std::string(authHdr), auth))
-	{
-		// No (parseable) credentials → challenge with a fresh nonce.
-		sendChallenge(data, /*stale=*/false);
-		return AuthDecision::Challenge;
-	}
-
-	// Validate the nonce we issued. A forged/garbage nonce is a hard re-challenge
-	// (not stale); an expired-but-ours nonce → challenge with stale=true so the
-	// phone silently retries.
-	bool expired = false;
-	if (!SipDigest::validateNonce(auth.nonce, &expired))
-	{
-		sendChallenge(data, /*stale=*/expired);
-		return AuthDecision::Challenge;
-	}
-
-	// Recompute + constant-time compare. Method is REGISTER.
-	if (!SipDigest::verify(auth, *ha1, std::string(data->getType())))
-	{
-		outRejectReason = "Bad Credentials";
-		queueLog("Secure REGISTER for ext " + ext + " failed digest verify", true);
-		return AuthDecision::Reject;
-	}
-
-	return AuthDecision::Accept;
-}
-
-RequestsHandler::AuthDecision RequestsHandler::admitLearn(
-	const std::shared_ptr<SipMessage>& data, const std::string& ext, std::string& outRejectReason)
-{
-	// Learn mode = TOFU + MAC-lock.
-	//   UNKNOWN mac            -> accept WITHOUT verifying, record {mac, ext, Learned}.
-	//   KNOWN + Secured mac    -> enforce digest (same path as secure mode).
-	//   ext Secured to a DIFFERENT mac -> reject (anti-spoof lock).
-	//   first-packet ARP miss  -> accept + defer the lock to the next REGISTER.
-	auto macOpt = ArpLookup::pdLookupMac(data->getSource());
-	if (!macOpt.has_value())
-	{
-		// Cache miss (or host). Accept now; the server's 200 OK + beep + OPTIONS
-		// populates the ARP cache so the NEXT REGISTER resolves and locks. Do NOT
-		// hard-fail — that would brick the very first registration.
-		queueLog("Learn REGISTER ext " + ext + ": ARP miss, deferring MAC-lock");
-		return AuthDecision::Accept;
-	}
-	const std::string mac = ArpLookup::toHex12(*macOpt);
-
-	// Anti-spoof: if this extension is already Secured to a DIFFERENT mac, reject.
-	for (const auto& [m, rec] : _devices)
-	{
-		if (rec.extension == ext && rec.state == DeviceState::Secured && m != mac)
-		{
-			outRejectReason = "Extension Locked To Another Device";
-			queueLog("Learn REGISTER ext " + ext + " from " + mac +
-				" rejected: locked to " + m, true);
-			return AuthDecision::Reject;
-		}
-	}
-
-	auto it = _devices.find(mac);
-	if (it == _devices.end())
-	{
-		// First time we've seen this MAC: trust-on-first-use. Bound the table like
-		// _dnd/_forwards — a flood of distinct MACs can't grow the heap unbounded.
-		if (_devices.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS))
-		{
-			outRejectReason = "Device Table Full";
-			queueLog("Learn REGISTER: device table full, rejecting " + mac, true);
-			return AuthDecision::Reject;
-		}
-		DeviceRecord rec;
-		rec.extension = ext;
-		rec.state = DeviceState::Learned;
-		_devices.emplace(mac, std::move(rec));
-		persistDevices();
-		refreshDeviceSnapshot();
-		queueLog("Learn: adopted device " + mac + " as ext " + ext);
-		return AuthDecision::Accept;
-	}
-
-	// Known MAC. Keep its extension in sync if the phone re-provisioned to a new AOR.
-	if (it->second.extension != ext)
-	{
-		it->second.extension = ext;
-		persistDevices();
-		refreshDeviceSnapshot();
-	}
-
-	if (it->second.state == DeviceState::Secured)
-	{
-		// Promoted device: enforce digest exactly as secure mode does.
-		return admitSecure(data, ext, outRejectReason);
-	}
-
-	// Known + still Learned → accept (TOFU continues until an admin secures it).
-	return AuthDecision::Accept;
 }
 
 // ── Outbound SIP MESSAGE (STAGE 2) ────────────────────────────────────────────
@@ -2998,26 +2744,10 @@ void RequestsHandler::tick()
 			}
 		}
 
-		// Register-beep timeouts: any beep dialog whose deadline has passed without the
-		// phone answering (AwaitingInviteOk) is CANCELled and freed — no retransmit
-		// storm, no leak. A dialog still awaiting the 200-to-BYE just frees its slot
-		// (the BYE was already sent best-effort). Done here, under _mutex, enqueuing to
-		// _outbox; the actual sendto() happens after the lock is dropped.
-		for (std::size_t i = 0; i < _beepDialogs.size(); ++i)
-		{
-			auto& bd = _beepDialogs[i];
-			if (bd.state == BeepState::Free || now < bd.deadline)
-			{
-				continue;
-			}
-			if (bd.state == BeepState::AwaitingInviteOk)
-			{
-				auto cancel = buildBeepCancel(i);
-				if (cancel) _outbox.emplace_back(bd.addr, std::move(cancel));
-				queueLog("Register beep: no answer from " + bd.ext + ", cancelled");
-			}
-			bd = BeepDialog{};   // free the slot
-		}
+		// Register-beep timeouts: CANCEL unanswered beep INVITEs and free overdue
+		// slots. Done here, under _mutex, enqueuing to _outbox; the actual sendto()
+		// happens after the lock is dropped.
+		_beeper.sweep(now);
 
 		// Build snapshot under registrar mutex lock, then save it under snapshot mutex lock
 		RegistrarSnapshot nextSnapshot;
@@ -3165,205 +2895,6 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_
 	return getMessageFromPool(ss.str(), client->getAddress());
 }
 
-// ── Register beep (signaling-only intercom tone) ─────────────────────────────
-//
-// On a new REGISTER, the registrar acts as a UAC: it sends the phone a brief
-// auto-answer INVITE (same header set the 999 all-page uses) so the handset plays
-// its intercom alert tone, then immediately tears the call back down (ACK → BYE on
-// the phone's 200, or CANCEL on timeout). NO RTP is sourced — the SDP offers a
-// single payload at a=inactive purely so the offer is well-formed. Each dialog is a
-// small fixed record in _beepDialogs, bounded by POCKETDIAL_MAX_BEEPS; if the table
-// is full the beep is simply skipped (it is cosmetic). All helpers below assume the
-// caller already holds _mutex (non-recursive) and only enqueue to _outbox.
-
-RequestsHandler::BeepDialog* RequestsHandler::findBeepByCallID(std::string_view callID)
-{
-	for (auto& bd : _beepDialogs)
-	{
-		if (bd.state != BeepState::Free && bd.callID == callID)
-		{
-			return &bd;
-		}
-	}
-	return nullptr;
-}
-
-void RequestsHandler::sendRegisterBeep(const std::shared_ptr<SipClient>& phone)
-{
-	if (!phone || phone->getNumber().empty())
-	{
-		return;
-	}
-
-	// Grab a free beep slot. Full table → skip (cosmetic); no leak, no blocking.
-	BeepDialog* slot = nullptr;
-	for (auto& bd : _beepDialogs)
-	{
-		if (bd.state == BeepState::Free) { slot = &bd; break; }
-	}
-	if (!slot)
-	{
-		queueLog("Register beep: table full, skipping beep for " + phone->getNumber());
-		return;
-	}
-
-	std::string clientNum = phone->getNumber();
-	const sockaddr_in& addr = phone->getAddress();
-
-	char ipBuf[INET_ADDRSTRLEN]{};
-	inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf));
-	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(addr.sin_port));
-
-	std::string activeIp = _localIp;
-	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
-
-	std::string callId  = IDGen::GenerateID(16) + "@" + activeIp;
-	std::string branch  = "z9hG4bK" + IDGen::GenerateID(12);
-	std::string fromTag = IDGen::GenerateID(9);
-
-	// Record the dialog BEFORE sending so a (synchronous) response can never race
-	// ahead of the bookkeeping.
-	slot->state    = BeepState::AwaitingInviteOk;
-	slot->callID   = callId;
-	slot->branch   = branch;
-	slot->fromTag  = fromTag;
-	slot->ext      = clientNum;
-	slot->addr     = addr;
-	slot->deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-
-	// Minimal, well-formed SDP. a=inactive: no RTP will flow (server sources none).
-	std::string body =
-		"v=0\r\n"
-		"o=- 0 0 IN IP4 " + activeIp + "\r\n"
-		"s=pocket-dial\r\n"
-		"c=IN IP4 " + activeIp + "\r\n"
-		"t=0 0\r\n"
-		"m=audio 9 RTP/AVP 0\r\n"
-		"a=inactive\r\n";
-
-	std::ostringstream ss;
-	ss << "INVITE sip:" << clientNum << "@" << destIpPort << " SIP/2.0\r\n"
-	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
-	   << "From: \"PocketDial\" <sip:pbx@" << srcIpPort << ">;tag=" << fromTag << "\r\n"
-	   << "To: <sip:" << clientNum << "@" << activeIp << ">\r\n"
-	   << "Call-ID: " << callId << "\r\n"
-	   << "CSeq: 1 INVITE\r\n"
-	   << "Max-Forwards: 70\r\n"
-	   << "Contact: <sip:pbx@" << srcIpPort << ";transport=UDP>\r\n"
-	   // Auto-answer / intercom headers — identical intent to the 999 all-page fork:
-	   // make a Yealink auto-answer in intercom mode and so play its alert tone.
-	   << "Call-Info: <sip:any>;answer-after=0\r\n"
-	   << "Alert-Info: info=alert-autoanswer\r\n"
-	   << "Alert-Info: answer-after=0\r\n"
-	   << "Alert-Info: intercom=true\r\n"
-	   << "P-Auto-Answer: normal\r\n"
-	   << "User-Agent: pocket-dial\r\n"
-	   << "Content-Type: application/sdp\r\n"
-	   << "Content-Length: " << body.size() << "\r\n\r\n"
-	   << body;
-
-	auto invite = getMessageFromPool(ss.str(), addr);
-	// Normalise the codec list and (re)derive Content-Length from the actual body —
-	// a wrong Content-Length silently breaks the offer on UDP (the 777-path bug).
-	invite->enforceG711();
-	invite->syncContentLength();
-	_outbox.emplace_back(addr, std::move(invite));
-	queueLog("Register beep: INVITE -> " + clientNum);
-}
-
-std::shared_ptr<SipMessage> RequestsHandler::buildBeepAck(const std::shared_ptr<SipMessage>& ok)
-{
-	// ACK the phone's 200 OK to our beep INVITE (RFC 3261 §13.2.2.4 / §17.1.1.3).
-	// Same Call-ID/branch/From-tag as the INVITE; To carries the phone's tag from the
-	// 200. CSeq stays "1 ACK" (matches the INVITE transaction). No body.
-	BeepDialog* bd = findBeepByCallID(ok->getCallID());
-	if (!bd)
-	{
-		return nullptr;
-	}
-
-	char ipBuf[INET_ADDRSTRLEN]{};
-	inet_ntop(AF_INET, &bd->addr.sin_addr, ipBuf, sizeof(ipBuf));
-	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(bd->addr.sin_port));
-
-	std::string activeIp = _localIp;
-	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
-
-	std::ostringstream ss;
-	ss << "ACK sip:" << bd->ext << "@" << destIpPort << " SIP/2.0\r\n"
-	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << bd->branch << "\r\n"
-	   << "From: \"PocketDial\" <sip:pbx@" << srcIpPort << ">;tag=" << bd->fromTag << "\r\n"
-	   << "To: " << ok->getTo() << "\r\n"
-	   << "Call-ID: " << bd->callID << "\r\n"
-	   << "CSeq: 1 ACK\r\n"
-	   << "Max-Forwards: 70\r\n"
-	   << "Content-Length: 0\r\n\r\n";
-
-	return getMessageFromPool(ss.str(), bd->addr);
-}
-
-std::shared_ptr<SipMessage> RequestsHandler::buildBeepBye(const std::shared_ptr<SipMessage>& ok)
-{
-	// BYE to end the beep call immediately after the tone. New transaction (fresh
-	// branch, CSeq 2 BYE) within the established dialog. To carries the phone's tag.
-	BeepDialog* bd = findBeepByCallID(ok->getCallID());
-	if (!bd)
-	{
-		return nullptr;
-	}
-
-	char ipBuf[INET_ADDRSTRLEN]{};
-	inet_ntop(AF_INET, &bd->addr.sin_addr, ipBuf, sizeof(ipBuf));
-	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(bd->addr.sin_port));
-
-	std::string activeIp = _localIp;
-	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
-	std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
-
-	std::ostringstream ss;
-	ss << "BYE sip:" << bd->ext << "@" << destIpPort << " SIP/2.0\r\n"
-	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
-	   << "From: \"PocketDial\" <sip:pbx@" << srcIpPort << ">;tag=" << bd->fromTag << "\r\n"
-	   << "To: " << ok->getTo() << "\r\n"
-	   << "Call-ID: " << bd->callID << "\r\n"
-	   << "CSeq: 2 BYE\r\n"
-	   << "Max-Forwards: 70\r\n"
-	   << "Content-Length: 0\r\n\r\n";
-
-	return getMessageFromPool(ss.str(), bd->addr);
-}
-
-std::shared_ptr<SipMessage> RequestsHandler::buildBeepCancel(std::size_t slot)
-{
-	// CANCEL the outstanding beep INVITE when the phone never auto-answered. Same
-	// Call-ID/branch/From-tag as the INVITE; To has NO tag yet (no final response).
-	// CSeq method becomes CANCEL but keeps the INVITE sequence number (RFC 3261 §9.1).
-	if (slot >= _beepDialogs.size())
-	{
-		return nullptr;
-	}
-	BeepDialog& bd = _beepDialogs[slot];
-
-	char ipBuf[INET_ADDRSTRLEN]{};
-	inet_ntop(AF_INET, &bd.addr.sin_addr, ipBuf, sizeof(ipBuf));
-	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(bd.addr.sin_port));
-
-	std::string activeIp = _localIp;
-	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
-
-	std::ostringstream ss;
-	ss << "CANCEL sip:" << bd.ext << "@" << destIpPort << " SIP/2.0\r\n"
-	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << bd.branch << "\r\n"
-	   << "From: \"PocketDial\" <sip:pbx@" << srcIpPort << ">;tag=" << bd.fromTag << "\r\n"
-	   << "To: <sip:" << bd.ext << "@" << activeIp << ">\r\n"
-	   << "Call-ID: " << bd.callID << "\r\n"
-	   << "CSeq: 1 CANCEL\r\n"
-	   << "Max-Forwards: 70\r\n"
-	   << "Content-Length: 0\r\n\r\n";
-
-	return getMessageFromPool(ss.str(), bd.addr);
-}
-
 std::shared_ptr<SipClient> RequestsHandler::allocateClient(std::string number, sockaddr_in address, int expiresSeconds)
 {
 	// Re-REGISTER: find existing slot by number and refresh it in-place
@@ -3492,35 +3023,7 @@ void RequestsHandler::queueLog(std::string msg, bool isError)
 // delimiters are safe. Callers hold _mutex (except construction-time loads, which
 // run single-threaded before any handler dispatches).
 
-namespace
-{
-	// Split a serialized blob into newline-delimited records, then each record into
-	// tab-separated fields. Pure; used by the loaders.
-	std::vector<std::vector<std::string>> deserializeBlob(const std::string& blob)
-	{
-		std::vector<std::vector<std::string>> records;
-		size_t pos = 0;
-		while (pos < blob.size())
-		{
-			size_t nl = blob.find('\n', pos);
-			std::string line = blob.substr(pos, (nl == std::string::npos ? blob.size() : nl) - pos);
-			pos = (nl == std::string::npos) ? blob.size() : nl + 1;
-			if (line.empty()) continue;
-
-			std::vector<std::string> fields;
-			size_t fp = 0;
-			while (true)
-			{
-				size_t tab = line.find('\t', fp);
-				fields.push_back(line.substr(fp, (tab == std::string::npos ? line.size() : tab) - fp));
-				if (tab == std::string::npos) break;
-				fp = tab + 1;
-			}
-			records.push_back(std::move(fields));
-		}
-		return records;
-	}
-}
+using pbxpersist::deserializeBlob;
 
 void RequestsHandler::loadPbxConfig()
 {
@@ -3651,39 +3154,6 @@ void RequestsHandler::persistPageZones()
 
 // ── Registrar mode + device registry persistence (STAGE 2) ───────────────────
 
-void RequestsHandler::loadRegistrarMode()
-{
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	nvs_handle_t h;
-	if (nvs_open(NVS_PBX_NS, NVS_READWRITE, &h) != ESP_OK)
-	{
-		return;
-	}
-	uint8_t v = 0;
-	esp_err_t err = nvs_get_u8(h, "reg_mode", &v);
-	nvs_close(h);
-	if (err == ESP_OK && v <= static_cast<uint8_t>(RegistrarMode::Secure))
-	{
-		_registrarMode.store(static_cast<RegistrarMode>(v), std::memory_order_relaxed);
-	}
-	// else: keep the compile-time-seeded default (Open under POCKETDIAL_OPEN_REGISTRAR).
-#endif
-}
-
-void RequestsHandler::persistRegistrarMode()
-{
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	nvs_handle_t h;
-	if (nvs_open(NVS_PBX_NS, NVS_READWRITE, &h) == ESP_OK)
-	{
-		nvs_set_u8(h, "reg_mode",
-			static_cast<uint8_t>(_registrarMode.load(std::memory_order_relaxed)));
-		nvs_commit(h);
-		nvs_close(h);
-	}
-#endif
-}
-
 void RequestsHandler::loadAdminHttpTtl()
 {
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
@@ -3700,62 +3170,6 @@ void RequestsHandler::loadAdminHttpTtl()
 		_adminHttpTtlSec.store(v, std::memory_order_relaxed);
 	}
 	// else: keep the compile-time default (600s).
-#endif
-}
-
-void RequestsHandler::loadDevices()
-{
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	nvs_handle_t h;
-	if (nvs_open(NVS_PBX_NS, NVS_READWRITE, &h) != ESP_OK)
-	{
-		return;
-	}
-	size_t len = 0;
-	if (nvs_get_str(h, "devices", nullptr, &len) == ESP_OK && len > 0)
-	{
-		std::string buf(len, '\0');
-		if (nvs_get_str(h, "devices", buf.data(), &len) == ESP_OK)
-		{
-			if (!buf.empty() && buf.back() == '\0') buf.pop_back();
-			// Record: mac \t extension \t state(int)
-			for (const auto& rec : deserializeBlob(buf))
-			{
-				if (rec.size() < 3 || rec[0].empty()) continue;
-				if (_devices.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS)) break;
-				DeviceRecord r;
-				r.extension = rec[1];
-				int si = atoi(rec[2].c_str());
-				r.state = (si == static_cast<int>(DeviceState::Secured))
-					? DeviceState::Secured : DeviceState::Learned;
-				_devices[rec[0]] = std::move(r);
-			}
-		}
-	}
-	nvs_close(h);
-#endif
-}
-
-void RequestsHandler::persistDevices()
-{
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	// mac \t extension \t state(int). Bounded by POCKETDIAL_MAX_CLIENTS, so the blob
-	// is fixed-footprint. Write-through after each adoption / secure / forget. Caller
-	// holds _mutex; online state is NOT persisted (it is volatile registration state).
-	std::string blob;
-	for (const auto& [mac, rec] : _devices)
-	{
-		blob += mac; blob += '\t';
-		blob += rec.extension; blob += '\t';
-		blob += std::to_string(static_cast<int>(rec.state)); blob += '\n';
-	}
-	nvs_handle_t h;
-	if (nvs_open(NVS_PBX_NS, NVS_READWRITE, &h) == ESP_OK)
-	{
-		nvs_set_str(h, "devices", blob.c_str());
-		nvs_commit(h);
-		nvs_close(h);
-	}
 #endif
 }
 
