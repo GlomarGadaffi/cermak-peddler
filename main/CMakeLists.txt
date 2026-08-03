@@ -76,6 +76,7 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/Helpers/ArpLookup.cpp"
                             "../src/Helpers/OtaUpdater.cpp"
                             "../src/SIP/RequestsHandler.cpp"
+                            "../src/SIP/TransactionLayer.cpp"
                             "../src/SIP/Session.cpp"
                             "../src/SIP/SipClient.cpp"
                             "../src/SIP/SipMessage.cpp"

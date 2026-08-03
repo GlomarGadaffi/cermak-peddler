@@ -1,0 +1,156 @@
+#include "TransactionLayer.hpp"
+
+#include <cstring>
+
+#include "SipStatus.hpp"
+
+TransactionLayer::SipTransaction::Type
+TransactionLayer::classify(const std::shared_ptr<SipMessage>& msg)
+{
+	if (!msg || msg->getStatusInfo().has_value()) return SipTransaction::Type::None;
+	if (msg->getType() == "INVITE") return SipTransaction::Type::InviteClient;
+	return SipTransaction::Type::None;
+}
+
+void TransactionLayer::maybeTrack(const sockaddr_in& peer,
+                                  const std::shared_ptr<SipMessage>& msg)
+{
+	if (classify(msg) == SipTransaction::Type::None) return;
+
+	SipTransaction* slot = nullptr;
+	for (auto& tx : _pool)
+	{
+		if (tx.type == SipTransaction::Type::None) { slot = &tx; break; }
+	}
+	if (!slot)
+	{
+		_env.log("[tx] pool exhausted — INVITE sent without retransmit tracking", true);
+		return;
+	}
+
+	auto raw = msg->toString();
+	auto now = std::chrono::steady_clock::now();
+	constexpr uint32_t kT1ms     = 500;
+	constexpr uint32_t kTimerBms = 64 * kT1ms; // 32 s
+
+	slot->type          = SipTransaction::Type::InviteClient;
+	slot->state         = SipTransaction::State::Calling;
+	slot->peer          = peer;
+	slot->msgTruncated  = (raw.size() >= sizeof(slot->msg));
+	slot->msgLen        = raw.size() < sizeof(slot->msg) ? raw.size() : sizeof(slot->msg) - 1;
+	std::memcpy(slot->msg, raw.data(), slot->msgLen);
+	slot->msg[slot->msgLen] = '\0';
+
+	auto branch = msg->getViaBranch();
+	auto bLen   = branch.size() < sizeof(slot->viaBranch) ? branch.size() : sizeof(slot->viaBranch) - 1;
+	std::memcpy(slot->viaBranch, branch.data(), bLen);
+	slot->viaBranch[bLen] = '\0';
+
+	auto method = msg->getCSeqMethod();
+	auto mLen   = method.size() < sizeof(slot->cseqMethod) ? method.size() : sizeof(slot->cseqMethod) - 1;
+	std::memcpy(slot->cseqMethod, method.data(), mLen);
+	slot->cseqMethod[mLen] = '\0';
+
+	auto callId = msg->getCallID();
+	auto cLen   = callId.size() < sizeof(slot->callId) ? callId.size() : sizeof(slot->callId) - 1;
+	std::memcpy(slot->callId, callId.data(), cLen);
+	slot->callId[cLen] = '\0';
+
+	slot->nextRetransmit     = now + std::chrono::milliseconds(kT1ms);
+	slot->transactionTimeout = now + std::chrono::milliseconds(kTimerBms);
+	slot->absorbDeadline     = {};
+	slot->retransmitCount    = 0;
+	slot->currentIntervalMs  = kT1ms;
+}
+
+bool TransactionLayer::matchAndAdvance(const std::shared_ptr<SipMessage>& msg)
+{
+	if (!msg) return false;
+	auto viaBranch = msg->getViaBranch();
+	if (viaBranch.empty()) return false;
+	auto cseqMethod = msg->getCSeqMethod();
+
+	bool matched = false;
+	auto now = std::chrono::steady_clock::now();
+	constexpr uint32_t kTimerLms = 64 * 500; // RFC 6026: 32 s absorb after 2xx
+
+	for (auto& tx : _pool)
+	{
+		if (tx.type == SipTransaction::Type::None) continue;
+		if (viaBranch != std::string_view(tx.viaBranch)) continue;
+		if (!cseqMethod.empty() && cseqMethod != std::string_view(tx.cseqMethod)) continue;
+
+		matched = true;
+		auto si = msg->getStatusInfo();
+		if (!si.has_value()) continue;
+
+		using Cls = PocketDial::SipStatusClass;
+		switch (si->klass)
+		{
+			case Cls::Provisional:
+				if (tx.state == SipTransaction::State::Calling)
+					tx.state = SipTransaction::State::Proceeding;
+				break;
+			case Cls::Success:
+				tx.state = SipTransaction::State::Accepted;
+				tx.absorbDeadline = now + std::chrono::milliseconds(kTimerLms);
+				break;
+			default:
+				tx.state = SipTransaction::State::Completed;
+				tx.absorbDeadline = now + std::chrono::milliseconds(kTimerLms);
+				break;
+		}
+	}
+	return matched;
+}
+
+void TransactionLayer::sweep(std::chrono::steady_clock::time_point now)
+{
+	for (auto& tx : _pool)
+	{
+		if (tx.type == SipTransaction::Type::None) continue;
+
+		if (tx.state == SipTransaction::State::Completed ||
+		    tx.state == SipTransaction::State::Accepted)
+		{
+			if (now >= tx.absorbDeadline)
+				tx.type = SipTransaction::Type::None;
+			continue;
+		}
+
+		if (tx.state == SipTransaction::State::Calling &&
+		    now >= tx.transactionTimeout)
+		{
+			_env.log(std::string("[tx] Timer B expired — INVITE for ") + tx.callId
+				+ " timed out (no provisional response)", true);
+			tx.type = SipTransaction::Type::None;
+			continue;
+		}
+
+		if (tx.state == SipTransaction::State::Calling &&
+		    now >= tx.nextRetransmit)
+		{
+			if (tx.msgLen > 0 && !tx.msgTruncated)
+			{
+				std::string retxStr(tx.msg, tx.msgLen);
+				auto retx = _env.messageFromPool(retxStr, tx.peer);
+				if (retx) _env.enqueue(tx.peer, std::move(retx));
+			}
+			tx.currentIntervalMs *= 2;
+			tx.nextRetransmit     = now + std::chrono::milliseconds(tx.currentIntervalMs);
+			tx.retransmitCount++;
+		}
+	}
+}
+
+void TransactionLayer::freeForCallId(std::string_view callId)
+{
+	for (auto& tx : _pool)
+	{
+		if (tx.type != SipTransaction::Type::None &&
+		    std::string_view(tx.callId) == callId)
+		{
+			tx.type = SipTransaction::Type::None;
+		}
+	}
+}

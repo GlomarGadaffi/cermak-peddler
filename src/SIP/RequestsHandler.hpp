@@ -31,8 +31,10 @@
 #include "CallDetailRecord.hpp"
 #include "PbxConfig.hpp"
 #include "RtpSender.hpp"
+#include "PbxEnv.hpp"
+#include "TransactionLayer.hpp"
 
-class RequestsHandler
+class RequestsHandler : private PbxEnv
 {
 public:
 
@@ -306,45 +308,25 @@ private:
 	// Find the beep slot owning a Call-ID, or nullptr. Caller holds _mutex.
 	BeepDialog* findBeepByCallID(std::string_view callID);
 
-	// ── RFC 3261 §17 INVITE client transaction layer ──────────────────────────
-	// One slot per outgoing INVITE fork.  Retransmit interval (Timer A) doubles
-	// from T1=500 ms each tick until a provisional response advances the state to
-	// Proceeding (no more retransmits) or Timer B (32 s) fires.
-	// Pool exhaustion → message sent once with no retransmit (graceful degradation).
-	// All fields guarded by _mutex.
-	struct SipTransaction
+	// ── PbxEnv: shared-infrastructure surface for the extracted machines ───────
+	// RequestsHandler is the PbxEnv implementation each decomposed state machine
+	// (TransactionLayer, ...) talks back through. All three assume the caller
+	// holds _mutex, same as the direct members they forward to.
+	void enqueue(const sockaddr_in& to, std::shared_ptr<SipMessage> msg) override
 	{
-		enum class Type  : uint8_t { None, InviteClient };
-		enum class State : uint8_t { Calling, Proceeding, Completed, Accepted };
+		_outbox.emplace_back(to, std::move(msg));
+	}
+	std::shared_ptr<SipMessage> messageFromPool(std::string raw, sockaddr_in src) override
+	{
+		return getMessageFromPool(std::move(raw), src);
+	}
+	void log(std::string msg, bool isError = false) override
+	{
+		queueLog(std::move(msg), isError);
+	}
 
-		Type  type  = Type::None;
-		State state = State::Calling;
-
-		sockaddr_in peer{};
-		char msg[1500]{};       // serialized bytes ready for retransmit (Ethernet MTU safe)
-		size_t msgLen       = 0;
-		bool   msgTruncated = false;
-
-		char callId[128]{};    // Call-ID for freeTxsForCallId() lifecycle linkage
-		char viaBranch[72]{};  // z9hG4bK… branch param (primary matching key)
-		char cseqMethod[12]{}; // "INVITE" etc. — disambiguates CANCEL sharing the branch
-
-		std::chrono::steady_clock::time_point nextRetransmit{};     // next Timer A fire
-		std::chrono::steady_clock::time_point transactionTimeout{}; // Timer B (32 s)
-		std::chrono::steady_clock::time_point absorbDeadline{};     // Timer L (RFC 6026, 2xx)
-
-		uint32_t retransmitCount   = 0;
-		uint32_t currentIntervalMs = 500; // Timer A: starts at T1, doubles each retransmit
-	};
-	std::array<SipTransaction, POCKETDIAL_MAX_TRANSACTIONS> _txPool{};
-
-	// RFC 3261 §17 transaction helpers (all callers hold _mutex).
-	static SipTransaction::Type classifyTxType(const std::shared_ptr<SipMessage>& msg);
-	void registerTx(SipTransaction::Type type, const sockaddr_in& peer,
-		const std::shared_ptr<SipMessage>& msg);
-	bool matchAndAdvanceTx(const std::shared_ptr<SipMessage>& msg);
-	void sweepTransactions(std::chrono::steady_clock::time_point now);
-	void freeTxsForCallId(std::string_view callId);
+	// RFC 3261 §17 INVITE client transactions (Timer A/B/L). Guarded by _mutex.
+	TransactionLayer _txLayer{*this};
 
 	// RFC 4028 session timer helpers. Caller holds _mutex.
 	void armSessionTimer(Session* session, const std::shared_ptr<SipMessage>& ok200);
