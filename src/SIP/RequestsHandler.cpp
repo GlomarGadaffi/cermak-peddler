@@ -13,6 +13,8 @@
 #include "PoolConfig.hpp"
 #include "CallDetailRecord.hpp"
 #include "PbxConfig.hpp"
+#include "PbxPersist.hpp"
+#include "SipHeaderUtil.hpp"
 #include "AdminAuth.hpp"
 #include "SipDigest.hpp"
 #include "SipSecretStore.hpp"
@@ -35,7 +37,6 @@ std::vector<std::shared_ptr<SipMessage>> RequestsHandler::_messagePool;
 
 // File-scope static helpers defined later in this translation unit.
 static bool sameAddress(const sockaddr_in&, const sockaddr_in&);
-static std::string parkTagOf(std::string_view header);
 static std::string stripHeaderName(std::string_view fullLine);
 
 namespace
@@ -103,9 +104,9 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	loadAdminExt();
 	// STAGE 2: load the registrar mode (defaults to the POCKETDIAL_OPEN_REGISTRAR
 	// seed) and the adopted-device registry from NVS.
-	loadRegistrarMode();
+	_registrar.loadMode();
 	loadAdminHttpTtl();
-	loadDevices();
+	_registrar.loadDevices();
 	// Prewarm the per-extension HA1 cache off the REGISTER hot path so the first
 	// Secure REGISTER does not pay a blocking NVS read while holding _mutex.
 	SipSecretStore::warmCache();
@@ -189,7 +190,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 		// RFC 3261 §17 transaction layer: advance the state machine for any tracked
 		// InviteClient transaction before the TU handler runs. A 1xx moves Calling →
 		// Proceeding (stops retransmitting); a 2xx/3xx-6xx → Accepted/Completed.
-		matchAndAdvanceTx(request);
+		_txLayer.matchAndAdvance(request);
 
 		// Route responses by parsed numeric status code so dispatch is immune to
 		// reason-phrase variation (e.g. "486 Busy" vs "486 Busy Here"). Requests and
@@ -280,20 +281,24 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 			}
 		}
 
+		// Device-registry change detection: a REGISTER may have adopted a device,
+		// re-synced its extension, or flipped its online flag inside the Registrar
+		// machine — mirror the registry into the dashboard snapshot once per packet.
+		if (_registrar.consumeDevicesChanged())
+		{
+			refreshDeviceSnapshot();
+		}
+
 		// BLF change detection: one pass after every handled packet covers
 		// registration appear/disappear, session create/transition/teardown.
 		// NOTIFYs land in _outbox and ride out with this pass (after unlock).
-		refreshSubscriptions();
+		_blf.refresh();
 
 		// RFC 3261 §17: register any new outgoing INVITE in _outbox for retransmit.
-		// Scan after BLF NOTIFYs are added so the full outbox is covered; classifyTxType
+		// Scan after BLF NOTIFYs are added so the full outbox is covered; maybeTrack
 		// filters to INVITE requests only so NOTIFYs and responses are ignored.
 		for (const auto& [addr, msg] : _outbox)
-		{
-			auto txType = classifyTxType(msg);
-			if (txType != SipTransaction::Type::None)
-				registerTx(txType, addr, msg);
-		}
+			_txLayer.maybeTrack(addr, msg);
 
 		localOutbox = std::move(_outbox);
 		_outbox.clear();
@@ -351,22 +356,22 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	// On Challenge the helper has already enqueued the 401 + WWW-Authenticate; on
 	// Reject we emit the 403 here from rejectReason. Either way a non-Accept stops.
 	const std::string extStr(fromNumber);
-	const RegistrarMode mode = _registrarMode.load(std::memory_order_relaxed);
+	const RegistrarMode mode = _registrar.getMode();
 	if (mode != RegistrarMode::Open)
 	{
 		std::string rejectReason;
-		AuthDecision decision = (mode == RegistrarMode::Secure)
-			? admitSecure(data, extStr, rejectReason)
-			: admitLearn(data, extStr, rejectReason);
+		Registrar::AuthDecision decision = (mode == RegistrarMode::Secure)
+			? _registrar.admitSecure(data, extStr, rejectReason)
+			: _registrar.admitLearn(data, extStr, rejectReason);
 
-		if (decision == AuthDecision::Challenge)
+		if (decision == Registrar::AuthDecision::Challenge)
 		{
 			// admitSecure already enqueued the 401 + WWW-Authenticate.
 			return;
 		}
-		if (decision == AuthDecision::Reject)
+		if (decision == Registrar::AuthDecision::Reject)
 		{
-			sendForbidden(data, rejectReason.empty() ? "Forbidden" : rejectReason);
+			_registrar.sendForbidden(data, rejectReason.empty() ? "Forbidden" : rejectReason);
 			return;
 		}
 		// decision == Accept → fall through to the normal binding path below.
@@ -384,7 +389,7 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 	{
 		// expires=0 (or an explicit zero) is a de-registration request.
 		unregisterClient(fromNumber);
-		if (deviceMac.has_value()) markDeviceOnline(*deviceMac, false);
+		if (deviceMac.has_value()) _registrar.markOnline(*deviceMac, false);
 	}
 	else
 	{
@@ -407,9 +412,9 @@ void RequestsHandler::onRegister(std::shared_ptr<SipMessage> data)
 			// and best-effort — if the beep table is full the beep is simply skipped.
 			if (isNewBinding)
 			{
-				sendRegisterBeep(newClient);
+				_beeper.sendBeep(newClient);
 			}
-			if (deviceMac.has_value()) markDeviceOnline(*deviceMac, true);
+			if (deviceMac.has_value()) _registrar.markOnline(*deviceMac, true);
 		}
 		else
 		{
@@ -457,7 +462,7 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 	{
 		queueLog("CANCEL for Call-ID " + std::string(data->getCallID()) +
 			" rejected: source not a dialog leg (spoofed teardown)", true);
-		sendForbidden(data, "Forbidden");
+		_registrar.sendForbidden(data, "Forbidden");
 		return;
 	}
 
@@ -475,7 +480,7 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	if (parkOrbitIndex(destNumber) >= 0)
+	if (_park.orbitIndex(destNumber) >= 0)
 	{
 		endCall(data->getCallID(), data->getFromNumber(), destNumber);
 		refreshParkSnapshot();
@@ -686,10 +691,11 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// Call parking (park-orbit, 700..70N): an INVITE to a FREE orbit parks the
 	// caller's leg there; an INVITE to an OCCUPIED orbit retrieves the parked call.
 	{
-		int orbitIdx = parkOrbitIndex(destNumber);
+		int orbitIdx = _park.orbitIndex(destNumber);
 		if (orbitIdx >= 0)
 		{
-			onParkInvite(data, caller.value(), orbitIdx);
+			_park.onInvite(data, caller.value(), orbitIdx);
+			refreshParkSnapshot();
 			return;
 		}
 	}
@@ -1161,7 +1167,7 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 	{
 		queueLog("BYE for Call-ID " + std::string(data->getCallID()) +
 			" rejected: source not a dialog leg (spoofed teardown)", true);
-		sendForbidden(data, "Forbidden");
+		_registrar.sendForbidden(data, "Forbidden");
 		return;
 	}
 
@@ -1239,36 +1245,19 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	// Register-beep dialog (server-originated UAC). These have NO Session — they are
-	// tracked in _beepDialogs by Call-ID. A 200 OK to our INVITE means the phone
-	// auto-answered (the tone played): ACK it, then BYE to end the call. A 200 OK to
-	// our BYE just frees the slot. Recognised before the normal session lookup.
-	if (BeepDialog* bd = findBeepByCallID(data->getCallID()))
+	// Register-beep dialog (server-originated UAC, no Session): recognised by
+	// Call-ID before the normal session lookup. handleOk drives ACK→BYE→free.
+	if (_beeper.handleOk(data))
 	{
-		std::string cseq(data->getCSeq());
-		if (bd->state == BeepState::AwaitingInviteOk &&
-			cseq.find(SipMessageTypes::INVITE) != std::string::npos)
-		{
-			auto ack = buildBeepAck(data);
-			if (ack) _outbox.emplace_back(bd->addr, std::move(ack));
-			auto bye = buildBeepBye(data);
-			if (bye) _outbox.emplace_back(bd->addr, std::move(bye));
-			bd->state    = BeepState::AwaitingByeOk;
-			// Re-arm the deadline so a phone that never 200s our BYE still frees its
-			// slot from tick() rather than lingering until the original INVITE timeout.
-			bd->deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-			queueLog("Register beep: answered by " + bd->ext + ", ACK+BYE sent");
-		}
-		else if (cseq.find(SipMessageTypes::BYE) != std::string::npos)
-		{
-			*bd = BeepDialog{};   // BYE acknowledged: dialog fully torn down, free slot
-		}
 		return;
 	}
 
 	// Park dialogs (server-originated re-INVITE ACKs + ring-back answers).
-	if (handleParkOk(data))
+	if (_park.handleOk(data))
+	{
+		refreshParkSnapshot();
 		return;
+	}
 	// Attended-transfer re-INVITE ACKs.
 	if (handleTransferOk(data))
 		return;
@@ -1860,9 +1849,9 @@ void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumbe
 	_dtmfState.erase(std::string(callID));
 
 	// RFC 3261 §17: free any transaction slots tracking retransmits for this call.
-	freeTxsForCallId(callID);
+	_txLayer.freeForCallId(callID);
 	// Free any park orbit slot holding this call's parked leg.
-	freeParkSlot(callID);
+	_park.freeForCallId(callID);
 
 	// Capture the session (for CDR start time / final state) BEFORE we erase it.
 	std::shared_ptr<Session> ending;
@@ -2482,12 +2471,7 @@ void RequestsHandler::setRegistrarMode(RegistrarMode mode)
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-		_registrarMode.store(mode, std::memory_order_relaxed);
-		persistRegistrarMode();
-		const char* name = (mode == RegistrarMode::Open)   ? "open"
-		                 : (mode == RegistrarMode::Learn)  ? "learn"
-		                                                   : "secure";
-		queueLog(std::string("Registrar mode set to ") + name);
+		_registrar.setMode(mode);
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
@@ -2501,54 +2485,19 @@ void RequestsHandler::setRegistrarMode(RegistrarMode mode)
 RequestsHandler::RegistrarMode RequestsHandler::getRegistrarMode() const
 {
 	// Lock-free read: the dashboard polls this; onRegister() branches on it on the
-	// hot path. The atomic guarantees a torn-free load.
-	return _registrarMode.load(std::memory_order_relaxed);
+	// hot path. The Registrar's atomic guarantees a torn-free load.
+	return _registrar.getMode();
 }
 
 // ── Device registry (STAGE 2: Learn-mode adoption) ────────────────────────────
 
 void RequestsHandler::refreshDeviceSnapshot()
 {
-	// Caller holds _mutex. Mirror _devices into the dashboard snapshot, preserving
-	// the previously-published online flags (online is tracked in the snapshot, not
-	// in _devices, since it is volatile registration state — not persisted).
+	// Caller holds _mutex. Mirror the Registrar's registry (including the volatile
+	// online flags it tracks) into the dashboard snapshot.
+	auto devices = _registrar.adoptedDevices();
 	std::lock_guard<std::mutex> snapLock(_snapshotMutex);
-
-	// Index the existing online flags by MAC so a rebuild doesn't lose them.
-	std::unordered_map<std::string, bool> wasOnline;
-	wasOnline.reserve(_snapshot.devices.size());
-	for (const auto& d : _snapshot.devices)
-	{
-		wasOnline[d.mac] = d.online;
-	}
-
-	_snapshot.devices.clear();
-	_snapshot.devices.reserve(_devices.size());
-	for (const auto& [mac, rec] : _devices)
-	{
-		AdoptedDevice d;
-		d.mac = mac;
-		d.extension = rec.extension;
-		d.state = rec.state;
-		auto it = wasOnline.find(mac);
-		d.online = (it != wasOnline.end()) ? it->second : false;
-		_snapshot.devices.push_back(std::move(d));
-	}
-}
-
-void RequestsHandler::markDeviceOnline(const std::string& mac, bool online)
-{
-	// Caller holds _mutex. Online state lives only in the snapshot (volatile, not
-	// persisted). No-op if the device isn't adopted (e.g. Open mode never records).
-	std::lock_guard<std::mutex> snapLock(_snapshotMutex);
-	for (auto& d : _snapshot.devices)
-	{
-		if (d.mac == mac)
-		{
-			d.online = online;
-			return;
-		}
-	}
+	_snapshot.devices = std::move(devices);
 }
 
 std::vector<RequestsHandler::AdoptedDevice> RequestsHandler::getAdoptedDevices()
@@ -2563,46 +2512,8 @@ bool RequestsHandler::secureDevice(const std::string& macOrExt)
 	bool changed = false;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-
-		// Accept either a 12-hex MAC (direct key) or an extension (find the device
-		// currently adopted under it).
-		auto it = _devices.find(macOrExt);
-		if (it == _devices.end())
-		{
-			for (auto cand = _devices.begin(); cand != _devices.end(); ++cand)
-			{
-				if (cand->second.extension == macOrExt) { it = cand; break; }
-			}
-		}
-
-		if (it != _devices.end())
-		{
-			// Footgun guard: promoting a device to Secured makes admitSecure() demand a
-			// digest for it. If the extension has NO stored secret, that would lock the
-			// phone out on its next REGISTER ("Extension Not Provisioned"). Refuse, and
-			// tell the operator to assign a secret first.
-			if (!SipSecretStore::hasSecret(it->second.extension))
-			{
-				queueLog("secureDevice: ext " + it->second.extension +
-					" has no SIP secret — assign one before securing", true);
-			}
-			else
-			{
-				if (it->second.state != DeviceState::Secured)
-				{
-					it->second.state = DeviceState::Secured;
-					persistDevices();
-					changed = true;
-				}
-				queueLog("Device " + it->first + " (ext " + it->second.extension + ") secured");
-			}
-		}
-		else
-		{
-			queueLog("secureDevice: no adopted device for '" + macOrExt + "'", true);
-		}
-
-		if (changed) refreshDeviceSnapshot();
+		changed = _registrar.secure(macOrExt);
+		if (_registrar.consumeDevicesChanged()) refreshDeviceSnapshot();
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
@@ -2620,29 +2531,8 @@ bool RequestsHandler::forgetDevice(const std::string& macOrExt)
 	bool removed = false;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-
-		auto it = _devices.find(macOrExt);
-		if (it == _devices.end())
-		{
-			for (auto cand = _devices.begin(); cand != _devices.end(); ++cand)
-			{
-				if (cand->second.extension == macOrExt) { it = cand; break; }
-			}
-		}
-
-		if (it != _devices.end())
-		{
-			queueLog("Device " + it->first + " (ext " + it->second.extension + ") forgotten");
-			_devices.erase(it);
-			persistDevices();
-			removed = true;
-			refreshDeviceSnapshot();
-		}
-		else
-		{
-			queueLog("forgetDevice: no adopted device for '" + macOrExt + "'", true);
-		}
-
+		removed = _registrar.forget(macOrExt);
+		if (_registrar.consumeDevicesChanged()) refreshDeviceSnapshot();
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
@@ -2652,150 +2542,6 @@ bool RequestsHandler::forgetDevice(const std::string& macOrExt)
 		else std::cout << log.second << std::endl;
 	}
 	return removed;
-}
-
-// ── REGISTER admission helpers (STAGE 2) ──────────────────────────────────────
-// All run under _mutex (called from onRegister, which holds it via handle()).
-
-void RequestsHandler::sendChallenge(const std::shared_ptr<SipMessage>& data, bool stale)
-{
-	auto response = getMessageFromPool(data->toString(), data->getSource());
-	response->setHeader("SIP/2.0 401 Unauthorized");
-	response->clearBody();
-	std::string activeIp = _localIp;
-	response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
-	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
-	// Fresh stateless nonce per challenge; realm MUST match SipSecretStore::kRealm.
-	response->addHeader("WWW-Authenticate",
-		SipDigest::buildWwwAuthenticate(SipSecretStore::kRealm,
-			SipDigest::generateNonce(), stale));
-	response->syncContentLength();
-	_outbox.emplace_back(data->getSource(), std::move(response));
-}
-
-void RequestsHandler::sendForbidden(const std::shared_ptr<SipMessage>& data, const std::string& reason)
-{
-	auto response = getMessageFromPool(data->toString(), data->getSource());
-	response->setHeader("SIP/2.0 403 " + reason);
-	response->clearBody();
-	std::string activeIp = _localIp;
-	response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
-	response->syncContentLength();
-	_outbox.emplace_back(data->getSource(), std::move(response));
-}
-
-RequestsHandler::AuthDecision RequestsHandler::admitSecure(
-	const std::shared_ptr<SipMessage>& data, const std::string& ext, std::string& outRejectReason)
-{
-	// Secure mode: a provisioned extension MUST present a valid digest. An ext with
-	// NO stored secret is unprovisioned — reject with a clear reason (the SAFE
-	// default; "allow first-time" would defeat the point of secure mode).
-	auto ha1 = SipSecretStore::getHa1(ext);
-	if (!ha1.has_value())
-	{
-		outRejectReason = "Extension Not Provisioned";
-		queueLog("Secure REGISTER for unprovisioned ext " + ext + " rejected", true);
-		return AuthDecision::Reject;
-	}
-
-	SipDigest::DigestAuth auth;
-	std::string_view authHdr = data->getAuthorization();
-	if (authHdr.empty() || !SipDigest::parseAuthorization(std::string(authHdr), auth))
-	{
-		// No (parseable) credentials → challenge with a fresh nonce.
-		sendChallenge(data, /*stale=*/false);
-		return AuthDecision::Challenge;
-	}
-
-	// Validate the nonce we issued. A forged/garbage nonce is a hard re-challenge
-	// (not stale); an expired-but-ours nonce → challenge with stale=true so the
-	// phone silently retries.
-	bool expired = false;
-	if (!SipDigest::validateNonce(auth.nonce, &expired))
-	{
-		sendChallenge(data, /*stale=*/expired);
-		return AuthDecision::Challenge;
-	}
-
-	// Recompute + constant-time compare. Method is REGISTER.
-	if (!SipDigest::verify(auth, *ha1, std::string(data->getType())))
-	{
-		outRejectReason = "Bad Credentials";
-		queueLog("Secure REGISTER for ext " + ext + " failed digest verify", true);
-		return AuthDecision::Reject;
-	}
-
-	return AuthDecision::Accept;
-}
-
-RequestsHandler::AuthDecision RequestsHandler::admitLearn(
-	const std::shared_ptr<SipMessage>& data, const std::string& ext, std::string& outRejectReason)
-{
-	// Learn mode = TOFU + MAC-lock.
-	//   UNKNOWN mac            -> accept WITHOUT verifying, record {mac, ext, Learned}.
-	//   KNOWN + Secured mac    -> enforce digest (same path as secure mode).
-	//   ext Secured to a DIFFERENT mac -> reject (anti-spoof lock).
-	//   first-packet ARP miss  -> accept + defer the lock to the next REGISTER.
-	auto macOpt = ArpLookup::pdLookupMac(data->getSource());
-	if (!macOpt.has_value())
-	{
-		// Cache miss (or host). Accept now; the server's 200 OK + beep + OPTIONS
-		// populates the ARP cache so the NEXT REGISTER resolves and locks. Do NOT
-		// hard-fail — that would brick the very first registration.
-		queueLog("Learn REGISTER ext " + ext + ": ARP miss, deferring MAC-lock");
-		return AuthDecision::Accept;
-	}
-	const std::string mac = ArpLookup::toHex12(*macOpt);
-
-	// Anti-spoof: if this extension is already Secured to a DIFFERENT mac, reject.
-	for (const auto& [m, rec] : _devices)
-	{
-		if (rec.extension == ext && rec.state == DeviceState::Secured && m != mac)
-		{
-			outRejectReason = "Extension Locked To Another Device";
-			queueLog("Learn REGISTER ext " + ext + " from " + mac +
-				" rejected: locked to " + m, true);
-			return AuthDecision::Reject;
-		}
-	}
-
-	auto it = _devices.find(mac);
-	if (it == _devices.end())
-	{
-		// First time we've seen this MAC: trust-on-first-use. Bound the table like
-		// _dnd/_forwards — a flood of distinct MACs can't grow the heap unbounded.
-		if (_devices.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS))
-		{
-			outRejectReason = "Device Table Full";
-			queueLog("Learn REGISTER: device table full, rejecting " + mac, true);
-			return AuthDecision::Reject;
-		}
-		DeviceRecord rec;
-		rec.extension = ext;
-		rec.state = DeviceState::Learned;
-		_devices.emplace(mac, std::move(rec));
-		persistDevices();
-		refreshDeviceSnapshot();
-		queueLog("Learn: adopted device " + mac + " as ext " + ext);
-		return AuthDecision::Accept;
-	}
-
-	// Known MAC. Keep its extension in sync if the phone re-provisioned to a new AOR.
-	if (it->second.extension != ext)
-	{
-		it->second.extension = ext;
-		persistDevices();
-		refreshDeviceSnapshot();
-	}
-
-	if (it->second.state == DeviceState::Secured)
-	{
-		// Promoted device: enforce digest exactly as secure mode does.
-		return admitSecure(data, ext, outRejectReason);
-	}
-
-	// Known + still Learned → accept (TOFU continues until an admin secures it).
-	return AuthDecision::Accept;
 }
 
 // ── Outbound SIP MESSAGE (STAGE 2) ────────────────────────────────────────────
@@ -2890,13 +2636,13 @@ void RequestsHandler::tick()
 		sweepExpired();
 
 		// RFC 3261 §17: retransmit timed-out INVITE forks and free completed slots.
-		sweepTransactions(now);
+		_txLayer.sweep(now);
 		// RFC 4028: BYE sessions that have exceeded their session-expires timer.
 		sweepSessionTimers(now);
 		// BLF subscription expiry.
-		sweepSubscriptions();
+		_blf.sweepExpired();
 		// Call-park timeout: ring back the parker or BYE the parked party.
-		parkSweep(now);
+		_park.sweep(now);
 
 		// Belt-and-suspenders (Fix #4): drop DTMF accumulators whose dialog is gone,
 		// in case a teardown path bypassed endCall(). Bounded by the small session pool.
@@ -3002,26 +2748,10 @@ void RequestsHandler::tick()
 			}
 		}
 
-		// Register-beep timeouts: any beep dialog whose deadline has passed without the
-		// phone answering (AwaitingInviteOk) is CANCELled and freed — no retransmit
-		// storm, no leak. A dialog still awaiting the 200-to-BYE just frees its slot
-		// (the BYE was already sent best-effort). Done here, under _mutex, enqueuing to
-		// _outbox; the actual sendto() happens after the lock is dropped.
-		for (std::size_t i = 0; i < _beepDialogs.size(); ++i)
-		{
-			auto& bd = _beepDialogs[i];
-			if (bd.state == BeepState::Free || now < bd.deadline)
-			{
-				continue;
-			}
-			if (bd.state == BeepState::AwaitingInviteOk)
-			{
-				auto cancel = buildBeepCancel(i);
-				if (cancel) _outbox.emplace_back(bd.addr, std::move(cancel));
-				queueLog("Register beep: no answer from " + bd.ext + ", cancelled");
-			}
-			bd = BeepDialog{};   // free the slot
-		}
+		// Register-beep timeouts: CANCEL unanswered beep INVITEs and free overdue
+		// slots. Done here, under _mutex, enqueuing to _outbox; the actual sendto()
+		// happens after the lock is dropped.
+		_beeper.sweep(now);
 
 		// Build snapshot under registrar mutex lock, then save it under snapshot mutex lock
 		RegistrarSnapshot nextSnapshot;
@@ -3085,16 +2815,7 @@ void RequestsHandler::tick()
 		}
 
 		// Parked calls view: {orbit, parkedExt, parker, secondsParked}.
-		nextSnapshot.parkedCalls.clear();
-		for (const auto& slot : _parkSlots)
-		{
-			if (slot.state == ParkState::Parked)
-			{
-				int sec = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
-					now - slot.parkedAt).count());
-				nextSnapshot.parkedCalls.emplace_back(slot.orbit, slot.parkedExt, slot.parker, sec);
-			}
-		}
+		nextSnapshot.parkedCalls = _park.snapshotRows(now, /*onlyParked=*/true);
 
 		{
 			std::lock_guard<std::mutex> snapLock(_snapshotMutex);
@@ -3105,11 +2826,7 @@ void RequestsHandler::tick()
 		// the same scan in handle()). tick()-originated INVITE forks (park ring-back,
 		// hunt-group next-ring, CFNA redirect) need Timer A/B coverage too. (#70)
 		for (const auto& [addr, msg] : _outbox)
-		{
-			auto txType = classifyTxType(msg);
-			if (txType != SipTransaction::Type::None)
-				registerTx(txType, addr, msg);
-		}
+			_txLayer.maybeTrack(addr, msg);
 
 		localOutbox = std::move(_outbox);
 		_outbox.clear();
@@ -3171,205 +2888,6 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_
 	   << "Content-Length: 0\r\n\r\n";
 
 	return getMessageFromPool(ss.str(), client->getAddress());
-}
-
-// ── Register beep (signaling-only intercom tone) ─────────────────────────────
-//
-// On a new REGISTER, the registrar acts as a UAC: it sends the phone a brief
-// auto-answer INVITE (same header set the 999 all-page uses) so the handset plays
-// its intercom alert tone, then immediately tears the call back down (ACK → BYE on
-// the phone's 200, or CANCEL on timeout). NO RTP is sourced — the SDP offers a
-// single payload at a=inactive purely so the offer is well-formed. Each dialog is a
-// small fixed record in _beepDialogs, bounded by POCKETDIAL_MAX_BEEPS; if the table
-// is full the beep is simply skipped (it is cosmetic). All helpers below assume the
-// caller already holds _mutex (non-recursive) and only enqueue to _outbox.
-
-RequestsHandler::BeepDialog* RequestsHandler::findBeepByCallID(std::string_view callID)
-{
-	for (auto& bd : _beepDialogs)
-	{
-		if (bd.state != BeepState::Free && bd.callID == callID)
-		{
-			return &bd;
-		}
-	}
-	return nullptr;
-}
-
-void RequestsHandler::sendRegisterBeep(const std::shared_ptr<SipClient>& phone)
-{
-	if (!phone || phone->getNumber().empty())
-	{
-		return;
-	}
-
-	// Grab a free beep slot. Full table → skip (cosmetic); no leak, no blocking.
-	BeepDialog* slot = nullptr;
-	for (auto& bd : _beepDialogs)
-	{
-		if (bd.state == BeepState::Free) { slot = &bd; break; }
-	}
-	if (!slot)
-	{
-		queueLog("Register beep: table full, skipping beep for " + phone->getNumber());
-		return;
-	}
-
-	std::string clientNum = phone->getNumber();
-	const sockaddr_in& addr = phone->getAddress();
-
-	char ipBuf[INET_ADDRSTRLEN]{};
-	inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf));
-	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(addr.sin_port));
-
-	std::string activeIp = _localIp;
-	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
-
-	std::string callId  = IDGen::GenerateID(16) + "@" + activeIp;
-	std::string branch  = "z9hG4bK" + IDGen::GenerateID(12);
-	std::string fromTag = IDGen::GenerateID(9);
-
-	// Record the dialog BEFORE sending so a (synchronous) response can never race
-	// ahead of the bookkeeping.
-	slot->state    = BeepState::AwaitingInviteOk;
-	slot->callID   = callId;
-	slot->branch   = branch;
-	slot->fromTag  = fromTag;
-	slot->ext      = clientNum;
-	slot->addr     = addr;
-	slot->deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-
-	// Minimal, well-formed SDP. a=inactive: no RTP will flow (server sources none).
-	std::string body =
-		"v=0\r\n"
-		"o=- 0 0 IN IP4 " + activeIp + "\r\n"
-		"s=pocket-dial\r\n"
-		"c=IN IP4 " + activeIp + "\r\n"
-		"t=0 0\r\n"
-		"m=audio 9 RTP/AVP 0\r\n"
-		"a=inactive\r\n";
-
-	std::ostringstream ss;
-	ss << "INVITE sip:" << clientNum << "@" << destIpPort << " SIP/2.0\r\n"
-	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
-	   << "From: \"PocketDial\" <sip:pbx@" << srcIpPort << ">;tag=" << fromTag << "\r\n"
-	   << "To: <sip:" << clientNum << "@" << activeIp << ">\r\n"
-	   << "Call-ID: " << callId << "\r\n"
-	   << "CSeq: 1 INVITE\r\n"
-	   << "Max-Forwards: 70\r\n"
-	   << "Contact: <sip:pbx@" << srcIpPort << ";transport=UDP>\r\n"
-	   // Auto-answer / intercom headers — identical intent to the 999 all-page fork:
-	   // make a Yealink auto-answer in intercom mode and so play its alert tone.
-	   << "Call-Info: <sip:any>;answer-after=0\r\n"
-	   << "Alert-Info: info=alert-autoanswer\r\n"
-	   << "Alert-Info: answer-after=0\r\n"
-	   << "Alert-Info: intercom=true\r\n"
-	   << "P-Auto-Answer: normal\r\n"
-	   << "User-Agent: pocket-dial\r\n"
-	   << "Content-Type: application/sdp\r\n"
-	   << "Content-Length: " << body.size() << "\r\n\r\n"
-	   << body;
-
-	auto invite = getMessageFromPool(ss.str(), addr);
-	// Normalise the codec list and (re)derive Content-Length from the actual body —
-	// a wrong Content-Length silently breaks the offer on UDP (the 777-path bug).
-	invite->enforceG711();
-	invite->syncContentLength();
-	_outbox.emplace_back(addr, std::move(invite));
-	queueLog("Register beep: INVITE -> " + clientNum);
-}
-
-std::shared_ptr<SipMessage> RequestsHandler::buildBeepAck(const std::shared_ptr<SipMessage>& ok)
-{
-	// ACK the phone's 200 OK to our beep INVITE (RFC 3261 §13.2.2.4 / §17.1.1.3).
-	// Same Call-ID/branch/From-tag as the INVITE; To carries the phone's tag from the
-	// 200. CSeq stays "1 ACK" (matches the INVITE transaction). No body.
-	BeepDialog* bd = findBeepByCallID(ok->getCallID());
-	if (!bd)
-	{
-		return nullptr;
-	}
-
-	char ipBuf[INET_ADDRSTRLEN]{};
-	inet_ntop(AF_INET, &bd->addr.sin_addr, ipBuf, sizeof(ipBuf));
-	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(bd->addr.sin_port));
-
-	std::string activeIp = _localIp;
-	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
-
-	std::ostringstream ss;
-	ss << "ACK sip:" << bd->ext << "@" << destIpPort << " SIP/2.0\r\n"
-	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << bd->branch << "\r\n"
-	   << "From: \"PocketDial\" <sip:pbx@" << srcIpPort << ">;tag=" << bd->fromTag << "\r\n"
-	   << "To: " << ok->getTo() << "\r\n"
-	   << "Call-ID: " << bd->callID << "\r\n"
-	   << "CSeq: 1 ACK\r\n"
-	   << "Max-Forwards: 70\r\n"
-	   << "Content-Length: 0\r\n\r\n";
-
-	return getMessageFromPool(ss.str(), bd->addr);
-}
-
-std::shared_ptr<SipMessage> RequestsHandler::buildBeepBye(const std::shared_ptr<SipMessage>& ok)
-{
-	// BYE to end the beep call immediately after the tone. New transaction (fresh
-	// branch, CSeq 2 BYE) within the established dialog. To carries the phone's tag.
-	BeepDialog* bd = findBeepByCallID(ok->getCallID());
-	if (!bd)
-	{
-		return nullptr;
-	}
-
-	char ipBuf[INET_ADDRSTRLEN]{};
-	inet_ntop(AF_INET, &bd->addr.sin_addr, ipBuf, sizeof(ipBuf));
-	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(bd->addr.sin_port));
-
-	std::string activeIp = _localIp;
-	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
-	std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
-
-	std::ostringstream ss;
-	ss << "BYE sip:" << bd->ext << "@" << destIpPort << " SIP/2.0\r\n"
-	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
-	   << "From: \"PocketDial\" <sip:pbx@" << srcIpPort << ">;tag=" << bd->fromTag << "\r\n"
-	   << "To: " << ok->getTo() << "\r\n"
-	   << "Call-ID: " << bd->callID << "\r\n"
-	   << "CSeq: 2 BYE\r\n"
-	   << "Max-Forwards: 70\r\n"
-	   << "Content-Length: 0\r\n\r\n";
-
-	return getMessageFromPool(ss.str(), bd->addr);
-}
-
-std::shared_ptr<SipMessage> RequestsHandler::buildBeepCancel(std::size_t slot)
-{
-	// CANCEL the outstanding beep INVITE when the phone never auto-answered. Same
-	// Call-ID/branch/From-tag as the INVITE; To has NO tag yet (no final response).
-	// CSeq method becomes CANCEL but keeps the INVITE sequence number (RFC 3261 §9.1).
-	if (slot >= _beepDialogs.size())
-	{
-		return nullptr;
-	}
-	BeepDialog& bd = _beepDialogs[slot];
-
-	char ipBuf[INET_ADDRSTRLEN]{};
-	inet_ntop(AF_INET, &bd.addr.sin_addr, ipBuf, sizeof(ipBuf));
-	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(bd.addr.sin_port));
-
-	std::string activeIp = _localIp;
-	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
-
-	std::ostringstream ss;
-	ss << "CANCEL sip:" << bd.ext << "@" << destIpPort << " SIP/2.0\r\n"
-	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << bd.branch << "\r\n"
-	   << "From: \"PocketDial\" <sip:pbx@" << srcIpPort << ">;tag=" << bd.fromTag << "\r\n"
-	   << "To: <sip:" << bd.ext << "@" << activeIp << ">\r\n"
-	   << "Call-ID: " << bd.callID << "\r\n"
-	   << "CSeq: 1 CANCEL\r\n"
-	   << "Max-Forwards: 70\r\n"
-	   << "Content-Length: 0\r\n\r\n";
-
-	return getMessageFromPool(ss.str(), bd.addr);
 }
 
 std::shared_ptr<SipClient> RequestsHandler::allocateClient(std::string number, sockaddr_in address, int expiresSeconds)
@@ -3500,35 +3018,7 @@ void RequestsHandler::queueLog(std::string msg, bool isError)
 // delimiters are safe. Callers hold _mutex (except construction-time loads, which
 // run single-threaded before any handler dispatches).
 
-namespace
-{
-	// Split a serialized blob into newline-delimited records, then each record into
-	// tab-separated fields. Pure; used by the loaders.
-	std::vector<std::vector<std::string>> deserializeBlob(const std::string& blob)
-	{
-		std::vector<std::vector<std::string>> records;
-		size_t pos = 0;
-		while (pos < blob.size())
-		{
-			size_t nl = blob.find('\n', pos);
-			std::string line = blob.substr(pos, (nl == std::string::npos ? blob.size() : nl) - pos);
-			pos = (nl == std::string::npos) ? blob.size() : nl + 1;
-			if (line.empty()) continue;
-
-			std::vector<std::string> fields;
-			size_t fp = 0;
-			while (true)
-			{
-				size_t tab = line.find('\t', fp);
-				fields.push_back(line.substr(fp, (tab == std::string::npos ? line.size() : tab) - fp));
-				if (tab == std::string::npos) break;
-				fp = tab + 1;
-			}
-			records.push_back(std::move(fields));
-		}
-		return records;
-	}
-}
+using pbxpersist::deserializeBlob;
 
 void RequestsHandler::loadPbxConfig()
 {
@@ -3659,39 +3149,6 @@ void RequestsHandler::persistPageZones()
 
 // ── Registrar mode + device registry persistence (STAGE 2) ───────────────────
 
-void RequestsHandler::loadRegistrarMode()
-{
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	nvs_handle_t h;
-	if (nvs_open(NVS_PBX_NS, NVS_READWRITE, &h) != ESP_OK)
-	{
-		return;
-	}
-	uint8_t v = 0;
-	esp_err_t err = nvs_get_u8(h, "reg_mode", &v);
-	nvs_close(h);
-	if (err == ESP_OK && v <= static_cast<uint8_t>(RegistrarMode::Secure))
-	{
-		_registrarMode.store(static_cast<RegistrarMode>(v), std::memory_order_relaxed);
-	}
-	// else: keep the compile-time-seeded default (Open under POCKETDIAL_OPEN_REGISTRAR).
-#endif
-}
-
-void RequestsHandler::persistRegistrarMode()
-{
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	nvs_handle_t h;
-	if (nvs_open(NVS_PBX_NS, NVS_READWRITE, &h) == ESP_OK)
-	{
-		nvs_set_u8(h, "reg_mode",
-			static_cast<uint8_t>(_registrarMode.load(std::memory_order_relaxed)));
-		nvs_commit(h);
-		nvs_close(h);
-	}
-#endif
-}
-
 void RequestsHandler::loadAdminHttpTtl()
 {
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
@@ -3708,62 +3165,6 @@ void RequestsHandler::loadAdminHttpTtl()
 		_adminHttpTtlSec.store(v, std::memory_order_relaxed);
 	}
 	// else: keep the compile-time default (600s).
-#endif
-}
-
-void RequestsHandler::loadDevices()
-{
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	nvs_handle_t h;
-	if (nvs_open(NVS_PBX_NS, NVS_READWRITE, &h) != ESP_OK)
-	{
-		return;
-	}
-	size_t len = 0;
-	if (nvs_get_str(h, "devices", nullptr, &len) == ESP_OK && len > 0)
-	{
-		std::string buf(len, '\0');
-		if (nvs_get_str(h, "devices", buf.data(), &len) == ESP_OK)
-		{
-			if (!buf.empty() && buf.back() == '\0') buf.pop_back();
-			// Record: mac \t extension \t state(int)
-			for (const auto& rec : deserializeBlob(buf))
-			{
-				if (rec.size() < 3 || rec[0].empty()) continue;
-				if (_devices.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS)) break;
-				DeviceRecord r;
-				r.extension = rec[1];
-				int si = atoi(rec[2].c_str());
-				r.state = (si == static_cast<int>(DeviceState::Secured))
-					? DeviceState::Secured : DeviceState::Learned;
-				_devices[rec[0]] = std::move(r);
-			}
-		}
-	}
-	nvs_close(h);
-#endif
-}
-
-void RequestsHandler::persistDevices()
-{
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	// mac \t extension \t state(int). Bounded by POCKETDIAL_MAX_CLIENTS, so the blob
-	// is fixed-footprint. Write-through after each adoption / secure / forget. Caller
-	// holds _mutex; online state is NOT persisted (it is volatile registration state).
-	std::string blob;
-	for (const auto& [mac, rec] : _devices)
-	{
-		blob += mac; blob += '\t';
-		blob += rec.extension; blob += '\t';
-		blob += std::to_string(static_cast<int>(rec.state)); blob += '\n';
-	}
-	nvs_handle_t h;
-	if (nvs_open(NVS_PBX_NS, NVS_READWRITE, &h) == ESP_OK)
-	{
-		nvs_set_str(h, "devices", blob.c_str());
-		nvs_commit(h);
-		nvs_close(h);
-	}
 #endif
 }
 
@@ -4228,41 +3629,11 @@ static bool sameAddress(const sockaddr_in& a, const sockaddr_in& b)
 	return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
 }
 
-// Extract the ;tag= value from a From/To header line.
-static std::string parkTagOf(std::string_view header)
-{
-	size_t p = header.find(";tag=");
-	if (p == std::string_view::npos) return {};
-	p += 5;
-	size_t e = p;
-	while (e < header.size() && header[e] != ';' && header[e] != '>' &&
-		header[e] != ' ' && header[e] != '\r' && header[e] != '\n')
-	{
-		++e;
-	}
-	return std::string(header.substr(p, e - p));
-}
-
-// Strip a leading "HeaderName:" prefix (e.g. "From:", "To:", "Call-ID:") so
-// server-minted requests emit a clean value and never ship a doubled prefix.
-// Safe on bare values (the check is that the text before ':' contains only
-// letter/hyphen chars — so "<sip:...>" is left untouched). Idempotent.
+// Forward to the shared header helper (see SipHeaderUtil.hpp) — kept as a
+// file-static name so the many call sites in this TU stay unchanged.
 static std::string stripHeaderName(std::string_view h)
 {
-	size_t colon = h.find(':');
-	if (colon == std::string_view::npos || colon == 0 || colon > 15)
-		return std::string(h);
-	for (size_t i = 0; i < colon; ++i)
-	{
-		char c = h[i];
-		if (!(std::isalpha(static_cast<unsigned char>(c)) || c == '-'))
-			return std::string(h);
-	}
-	size_t v = colon + 1;
-	while (v < h.size() && (h[v] == ' ' || h[v] == '\t')) ++v;
-	size_t e = h.size();
-	while (e > v && (h[e - 1] == '\r' || h[e - 1] == '\n')) --e;
-	return std::string(h.substr(v, e - v));
+	return siphdr::stripHeaderName(h);
 }
 
 // ── Mid-dialog re-INVITE (RFC 3261 §12.2 hold/resume) ────────────────────────
@@ -4446,449 +3817,11 @@ bool RequestsHandler::isDialogSourceAuthorized(const std::shared_ptr<Session>& s
 	       fromIp == dest->getAddress().sin_addr.s_addr;
 }
 
-// ── BLF presence (RFC 6665 SUBSCRIBE / RFC 4235 dialog-event NOTIFY) ─────────
-
-std::string RequestsHandler::parseEventPackage(const std::string& raw)
-{
-	size_t pos = 0;
-	while (pos < raw.size())
-	{
-		size_t nl = raw.find('\n', pos);
-		size_t lineEnd = (nl == std::string::npos) ? raw.size() : nl;
-		size_t next = (nl == std::string::npos) ? raw.size() : nl + 1;
-		if (raw[pos] == '\r' || raw[pos] == '\n') break;
-
-		size_t colon = raw.find(':', pos);
-		if (colon != std::string::npos && colon < lineEnd)
-		{
-			std::string name = raw.substr(pos, colon - pos);
-			std::transform(name.begin(), name.end(), name.begin(),
-				[](unsigned char c){ return static_cast<char>(std::tolower(c)); });
-			if (name == "event" || name == "o")
-			{
-				size_t vBegin = colon + 1;
-				size_t vEnd = lineEnd;
-				std::string val = raw.substr(vBegin, vEnd - vBegin);
-				size_t semi = val.find(';');
-				if (semi != std::string::npos) val.erase(semi);
-				size_t b = val.find_first_not_of(" \t\r");
-				size_t e = val.find_last_not_of(" \t\r");
-				if (b == std::string::npos) return "";
-				return val.substr(b, e - b + 1);
-			}
-		}
-		pos = next;
-	}
-	return "";
-}
-
-std::string RequestsHandler::buildDialogInfoXml(const std::string& entity, unsigned version,
-	const std::string& dialogId, const std::string& state, const std::string& direction)
-{
-	// Minimal RFC 4235 document, always state="full": each NOTIFY carries the
-	// complete (zero-or-one element) dialog set, so watchers never need to merge
-	// partials. An empty `state` omits the <dialog> element — the canonical
-	// "idle lamp" body that Yealink/Grandstream BLF keys expect.
-	std::ostringstream xml;
-	xml << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n"
-	    << "<dialog-info xmlns=\"urn:ietf:params:xml:ns:dialog-info\" version=\""
-	    << version << "\" state=\"full\" entity=\"" << entity << "\">\r\n";
-	if (!state.empty())
-	{
-		xml << "<dialog id=\"" << dialogId << "\"";
-		if (!direction.empty()) xml << " direction=\"" << direction << "\"";
-		xml << "><state>" << state << "</state></dialog>\r\n";
-	}
-	xml << "</dialog-info>\r\n";
-	return xml.str();
-}
-
-std::string RequestsHandler::computeDialogState(const std::string& targetAor,
-	std::string& outDirection, std::string& outDialogId) const
-{
-	std::string best;
-	auto rank = [](const std::string& s) -> int {
-		if (s == "confirmed") return 3;
-		if (s == "early")     return 2;
-		if (s == "trying")    return 1;
-		return 0;
-	};
-	for (const auto& [callID, session] : _sessions)
-	{
-		bool isSrc  = session->getSrc()  && session->getSrc()->getNumber()  == targetAor;
-		bool isDest = session->getDest() && session->getDest()->getNumber() == targetAor;
-		if (!isSrc && !isDest) continue;
-
-		std::string state, dir;
-		switch (session->getState())
-		{
-			case Session::State::Invited:
-				state = isDest ? "early" : "trying";
-				dir   = isDest ? "recipient" : "initiator";
-				break;
-			case Session::State::Connected:
-			case Session::State::Held:
-				// RFC 4235 §4: a held call is an established dialog; state stays
-				// "confirmed" so the watcher's BLF lamp remains lit (#53).
-				state = "confirmed";
-				dir   = isSrc ? "initiator" : "recipient";
-				break;
-			default:
-				continue;
-		}
-		if (rank(state) > rank(best))
-		{
-			best = state;
-			outDirection = dir;
-			outDialogId  = callID;
-		}
-	}
-	if (best.empty()) { outDirection.clear(); outDialogId.clear(); }
-	return best;
-}
-
-std::shared_ptr<SipMessage> RequestsHandler::buildDialogNotify(DialogSubscription& sub,
-	const std::string& state, const std::string& direction, const std::string& dialogId,
-	bool terminated, const char* termReason)
-{
-	std::string activeIp = _localIp;
-	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
-	char ipBuf[INET_ADDRSTRLEN]{};
-	inet_ntop(AF_INET, &sub.addr.sin_addr, ipBuf, sizeof(ipBuf));
-	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(sub.addr.sin_port));
-	std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
-
-	std::string entity = "sip:" + sub.targetAor + "@" + srcIpPort;
-	std::string body = buildDialogInfoXml(entity, sub.version, dialogId, state, direction);
-
-	int remaining = 0;
-	if (!terminated)
-	{
-		auto now = std::chrono::steady_clock::now();
-		remaining = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
-			sub.deadline - now).count());
-		if (remaining < 0) remaining = 0;
-	}
-	std::string subState = terminated
-		? ("terminated;reason=" + std::string(termReason))
-		: ("active;expires=" + std::to_string(remaining));
-
-	// NOTIFY runs inside the subscription dialog: our To-tag becomes the From,
-	// the watcher's From becomes the To (RFC 6665 §4.4.1 — roles swap).
-	std::string fromHdr = sub.subTo;
-	std::string toHdr   = sub.watcherFrom;
-	auto stripName = [](const std::string& h) {
-		size_t c = h.find(':');
-		return (c == std::string::npos) ? h : h.substr(c + 1);
-	};
-
-	std::ostringstream ss;
-	ss << "NOTIFY sip:" << destIpPort << " SIP/2.0\r\n"
-	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
-	   << "From:" << stripName(fromHdr) << "\r\n"
-	   << "To:" << stripName(toHdr) << "\r\n"
-	   << "Call-ID: " << sub.callId << "\r\n"
-	   << "CSeq: " << sub.cseq++ << " NOTIFY\r\n"
-	   << "Max-Forwards: 70\r\n"
-	   << "Event: dialog\r\n"
-	   << "Subscription-State: " << subState << "\r\n"
-	   << "Contact: <sip:" << sub.targetAor << "@" << srcIpPort << ">\r\n"
-	   << "User-Agent: pocket-dial\r\n"
-	   << "Content-Type: application/dialog-info+xml\r\n"
-	   << "Content-Length: " << body.size() << "\r\n\r\n"
-	   << body;
-
-	return getMessageFromPool(ss.str(), sub.addr);
-}
+// ── BLF presence: FSM lives in BlfSubscriptions.cpp ──────────────────────────
 
 void RequestsHandler::onSubscribe(std::shared_ptr<SipMessage> data)
 {
-	std::string activeIp = _localIp;
-
-	// 1. Event-package gate: only the RFC 4235 "dialog" package is implemented.
-	std::string pkg = parseEventPackage(data->toString());
-	if (pkg != "dialog")
-	{
-		auto resp = getMessageFromPool(data->toString(), data->getSource());
-		resp->setHeader(SipMessageTypes::BAD_EVENT);
-		resp->clearBody();
-		resp->setVia(std::string(data->getVia()) + ";received=" + activeIp);
-		resp->addHeader("Allow-Events", "dialog");
-		_outbox.emplace_back(data->getSource(), std::move(resp));
-		return;
-	}
-
-	// 2. Watched-target validation.
-	std::string target(data->getToNumber());
-	if (!isValidAor(target))
-	{
-		auto resp = getMessageFromPool(data->toString(), data->getSource());
-		resp->setHeader(SipMessageTypes::BAD_REQUEST);
-		resp->clearBody();
-		resp->setVia(std::string(data->getVia()) + ";received=" + activeIp);
-		_outbox.emplace_back(data->getSource(), std::move(resp));
-		return;
-	}
-
-	const int expires = parseRequestedExpires(data);
-	std::string callId(data->getCallID());
-	{
-		size_t c = callId.find(':');
-		if (c != std::string::npos) callId.erase(0, c + 1);
-		size_t b = callId.find_first_not_of(" \t");
-		size_t e = callId.find_last_not_of(" \t\r");
-		callId = (b == std::string::npos) ? "" : callId.substr(b, e - b + 1);
-	}
-
-	// 3. Refresh / unsubscribe: match existing subscription by Call-ID.
-	DialogSubscription* sub = nullptr;
-	for (auto& s : _subscriptions)
-	{
-		if (s.used && s.callId == callId) { sub = &s; break; }
-	}
-
-	if (sub == nullptr && expires > 0)
-	{
-		for (auto& s : _subscriptions)
-		{
-			if (!s.used) { sub = &s; break; }
-		}
-		if (sub == nullptr)
-		{
-			auto resp = getMessageFromPool(data->toString(), data->getSource());
-			resp->setHeader("SIP/2.0 503 Service Unavailable");
-			resp->clearBody();
-			resp->setVia(std::string(data->getVia()) + ";received=" + activeIp);
-			_outbox.emplace_back(data->getSource(), std::move(resp));
-			queueLog("BLF: subscription pool exhausted, 503 to watcher of " + target, true);
-			return;
-		}
-		*sub = DialogSubscription{};
-		sub->used        = true;
-		sub->callId      = callId;
-		sub->watcherFrom = std::string(data->getFrom());
-		sub->subTo       = std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9);
-		sub->targetAor   = target;
-		queueLog("BLF: new subscription, watcher " + std::string(data->getFromNumber())
-			+ " -> target " + target);
-	}
-
-	// 4. 202 Accepted (RFC 6665 §4.2.1).
-	{
-		auto resp = getMessageFromPool(data->toString(), data->getSource());
-		resp->setHeader(SipMessageTypes::ACCEPTED);
-		resp->clearBody();
-		resp->setVia(std::string(data->getVia()) + ";received=" + activeIp);
-		if (sub) resp->setTo(sub->subTo);
-		else     resp->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
-		resp->setContact(buildContact(target));
-		resp->addHeader("Expires", std::to_string(expires));
-		_outbox.emplace_back(data->getSource(), std::move(resp));
-	}
-
-	if (sub == nullptr) return;
-
-	sub->addr       = data->getSource();
-	sub->expiresSec = expires;
-	sub->deadline   = std::chrono::steady_clock::now() + std::chrono::seconds(expires);
-
-	// 5. Immediate NOTIFY (RFC 6665 §4.2.1.4).
-	std::string dir, dialogId;
-	std::string state = computeDialogState(target, dir, dialogId);
-	const bool terminating = (expires == 0);
-	auto notify = buildDialogNotify(*sub, state, dir, dialogId, terminating, "noresource");
-	_outbox.emplace_back(sub->addr, std::move(notify));
-	sub->lastState = state + "|" + dir + "|" + dialogId;
-	sub->version++;
-
-	if (terminating)
-	{
-		queueLog("BLF: unsubscribe, watcher of " + target + " released");
-		*sub = DialogSubscription{};
-	}
-}
-
-void RequestsHandler::refreshSubscriptions()
-{
-	for (auto& sub : _subscriptions)
-	{
-		if (!sub.used) continue;
-		std::string dir, dialogId;
-		std::string state = computeDialogState(sub.targetAor, dir, dialogId);
-		std::string token = state + "|" + dir + "|" + dialogId;
-		if (token == sub.lastState) continue;
-		auto notify = buildDialogNotify(sub, state, dir, dialogId, false, "");
-		_outbox.emplace_back(sub.addr, std::move(notify));
-		sub.lastState = token;
-		sub.version++;
-	}
-}
-
-void RequestsHandler::sweepSubscriptions()
-{
-	auto now = std::chrono::steady_clock::now();
-	for (auto& sub : _subscriptions)
-	{
-		if (!sub.used || now < sub.deadline) continue;
-		std::string dir, dialogId;
-		std::string state = computeDialogState(sub.targetAor, dir, dialogId);
-		auto notify = buildDialogNotify(sub, state, dir, dialogId, true, "timeout");
-		_outbox.emplace_back(sub.addr, std::move(notify));
-		queueLog("BLF: subscription to " + sub.targetAor + " expired");
-		sub = DialogSubscription{};
-	}
-}
-
-// ── RFC 3261 §17 INVITE-client transaction (Timer A retransmit / Timer B timeout)
-
-RequestsHandler::SipTransaction::Type
-RequestsHandler::classifyTxType(const std::shared_ptr<SipMessage>& msg)
-{
-	if (!msg || msg->getStatusInfo().has_value()) return SipTransaction::Type::None;
-	if (msg->getType() == "INVITE") return SipTransaction::Type::InviteClient;
-	return SipTransaction::Type::None;
-}
-
-void RequestsHandler::registerTx(SipTransaction::Type type,
-                                  const sockaddr_in& peer,
-                                  const std::shared_ptr<SipMessage>& msg)
-{
-	SipTransaction* slot = nullptr;
-	for (auto& tx : _txPool)
-	{
-		if (tx.type == SipTransaction::Type::None) { slot = &tx; break; }
-	}
-	if (!slot)
-	{
-		queueLog("[tx] pool exhausted — INVITE sent without retransmit tracking", true);
-		return;
-	}
-
-	auto raw = msg->toString();
-	auto now = std::chrono::steady_clock::now();
-	constexpr uint32_t kT1ms     = 500;
-	constexpr uint32_t kTimerBms = 64 * kT1ms; // 32 s
-
-	slot->type          = type;
-	slot->state         = SipTransaction::State::Calling;
-	slot->peer          = peer;
-	slot->msgTruncated  = (raw.size() >= sizeof(slot->msg));
-	slot->msgLen        = raw.size() < sizeof(slot->msg) ? raw.size() : sizeof(slot->msg) - 1;
-	std::memcpy(slot->msg, raw.data(), slot->msgLen);
-	slot->msg[slot->msgLen] = '\0';
-
-	auto branch = msg->getViaBranch();
-	auto bLen   = branch.size() < sizeof(slot->viaBranch) ? branch.size() : sizeof(slot->viaBranch) - 1;
-	std::memcpy(slot->viaBranch, branch.data(), bLen);
-	slot->viaBranch[bLen] = '\0';
-
-	auto method = msg->getCSeqMethod();
-	auto mLen   = method.size() < sizeof(slot->cseqMethod) ? method.size() : sizeof(slot->cseqMethod) - 1;
-	std::memcpy(slot->cseqMethod, method.data(), mLen);
-	slot->cseqMethod[mLen] = '\0';
-
-	auto callId = msg->getCallID();
-	auto cLen   = callId.size() < sizeof(slot->callId) ? callId.size() : sizeof(slot->callId) - 1;
-	std::memcpy(slot->callId, callId.data(), cLen);
-	slot->callId[cLen] = '\0';
-
-	slot->nextRetransmit     = now + std::chrono::milliseconds(kT1ms);
-	slot->transactionTimeout = now + std::chrono::milliseconds(kTimerBms);
-	slot->absorbDeadline     = {};
-	slot->retransmitCount    = 0;
-	slot->currentIntervalMs  = kT1ms;
-}
-
-bool RequestsHandler::matchAndAdvanceTx(const std::shared_ptr<SipMessage>& msg)
-{
-	if (!msg) return false;
-	auto viaBranch = msg->getViaBranch();
-	if (viaBranch.empty()) return false;
-	auto cseqMethod = msg->getCSeqMethod();
-
-	bool matched = false;
-	auto now = std::chrono::steady_clock::now();
-	constexpr uint32_t kTimerLms = 64 * 500; // RFC 6026: 32 s absorb after 2xx
-
-	for (auto& tx : _txPool)
-	{
-		if (tx.type == SipTransaction::Type::None) continue;
-		if (viaBranch != std::string_view(tx.viaBranch)) continue;
-		if (!cseqMethod.empty() && cseqMethod != std::string_view(tx.cseqMethod)) continue;
-
-		matched = true;
-		auto si = msg->getStatusInfo();
-		if (!si.has_value()) continue;
-
-		using Cls = PocketDial::SipStatusClass;
-		switch (si->klass)
-		{
-			case Cls::Provisional:
-				if (tx.state == SipTransaction::State::Calling)
-					tx.state = SipTransaction::State::Proceeding;
-				break;
-			case Cls::Success:
-				tx.state = SipTransaction::State::Accepted;
-				tx.absorbDeadline = now + std::chrono::milliseconds(kTimerLms);
-				break;
-			default:
-				tx.state = SipTransaction::State::Completed;
-				tx.absorbDeadline = now + std::chrono::milliseconds(kTimerLms);
-				break;
-		}
-	}
-	return matched;
-}
-
-void RequestsHandler::sweepTransactions(std::chrono::steady_clock::time_point now)
-{
-	for (auto& tx : _txPool)
-	{
-		if (tx.type == SipTransaction::Type::None) continue;
-
-		if (tx.state == SipTransaction::State::Completed ||
-		    tx.state == SipTransaction::State::Accepted)
-		{
-			if (now >= tx.absorbDeadline)
-				tx.type = SipTransaction::Type::None;
-			continue;
-		}
-
-		if (tx.state == SipTransaction::State::Calling &&
-		    now >= tx.transactionTimeout)
-		{
-			queueLog(std::string("[tx] Timer B expired — INVITE for ") + tx.callId
-				+ " timed out (no provisional response)", true);
-			tx.type = SipTransaction::Type::None;
-			continue;
-		}
-
-		if (tx.state == SipTransaction::State::Calling &&
-		    now >= tx.nextRetransmit)
-		{
-			if (tx.msgLen > 0 && !tx.msgTruncated)
-			{
-				std::string retxStr(tx.msg, tx.msgLen);
-				auto retx = getMessageFromPool(retxStr, tx.peer);
-				if (retx) _outbox.emplace_back(tx.peer, std::move(retx));
-			}
-			tx.currentIntervalMs *= 2;
-			tx.nextRetransmit     = now + std::chrono::milliseconds(tx.currentIntervalMs);
-			tx.retransmitCount++;
-		}
-	}
-}
-
-void RequestsHandler::freeTxsForCallId(std::string_view callId)
-{
-	for (auto& tx : _txPool)
-	{
-		if (tx.type != SipTransaction::Type::None &&
-		    std::string_view(tx.callId) == callId)
-		{
-			tx.type = SipTransaction::Type::None;
-		}
-	}
+	_blf.onSubscribe(data);
 }
 
 // ── RFC 4028 session timers ───────────────────────────────────────────────────
@@ -5028,293 +3961,7 @@ std::vector<std::pair<std::string, std::string>> RequestsHandler::getPageZones()
 	return _snapshot.pageZones;
 }
 
-// ── Call parking (orbits 700–709) ─────────────────────────────────────────────
-
-int RequestsHandler::parkOrbitIndex(std::string_view ext) const
-{
-	if (ext.size() != 3 || ext[0] != '7' || ext[1] != '0') return -1;
-	if (ext[2] < '0' || ext[2] > '9') return -1;
-	int idx = ext[2] - '0';
-	return (idx < static_cast<int>(_parkSlots.size())) ? idx : -1;
-}
-
-void RequestsHandler::onParkInvite(std::shared_ptr<SipMessage> data,
-	const std::shared_ptr<SipClient>& caller, int orbitIdx)
-{
-	if (orbitIdx < 0 || orbitIdx >= static_cast<int>(_parkSlots.size()) || !caller)
-	{
-		return;
-	}
-	ParkSlot& slot = _parkSlots[orbitIdx];
-	const std::string activeIp = _localIp;
-	const std::string orbit = "70" + std::to_string(orbitIdx);
-	const std::string toTag = IDGen::GenerateID(9);
-
-	if (slot.state == ParkState::Free)
-	{
-		// ── PARK ── answer with an a=inactive hold SDP so the parked party is held.
-		const std::string holdSdp =
-			"v=0\r\n"
-			"o=- 0 0 IN IP4 " + activeIp + "\r\n"
-			"s=pocket-dial\r\n"
-			"c=IN IP4 " + activeIp + "\r\n"
-			"t=0 0\r\n"
-			"m=audio 9 RTP/AVP 0\r\n"
-			"a=inactive\r\n";
-		auto ok = getMessageFromPool(data->toString(), data->getSource());
-		ok->setHeader(SipMessageTypes::OK);
-		ok->setVia(std::string(data->getVia()) + ";received=" + activeIp);
-		ok->setTo(std::string(data->getTo()) + ";tag=" + toTag);
-		ok->setContact(buildContact(orbit));
-		ok->setBody(holdSdp);
-		ok->syncContentLength();
-		_outbox.emplace_back(data->getSource(), ok);
-
-		slot = ParkSlot{};
-		slot.state      = ParkState::Parked;
-		slot.orbit      = orbit;
-		slot.callID     = std::string(data->getCallID());
-		slot.parkedExt  = caller->getNumber();
-		slot.parkedAddr = data->getSource();
-		slot.parked        = true;
-		slot.parkedSdp     = std::string(data->getBody());
-		slot.parkedFromTag = parkTagOf(data->getFrom());
-		slot.localTag   = toTag;
-		slot.parker     = caller->getNumber();
-		slot.parkedAt   = std::chrono::steady_clock::now();
-
-		auto virt = allocateVirtualPeer(orbit, data->getSource());
-		if (auto session = allocateSession(std::string(data->getCallID()), caller))
-		{
-			session->setDest(virt);
-			session->setLocalTag(toTag);
-			session->setInviteMessage(data);
-			_sessions.emplace(std::string(data->getCallID()), session);
-			session->setState(Session::State::Connected);
-		}
-		queueLog("Park: " + caller->getNumber() + " parked on " + orbit);
-		refreshParkSnapshot();
-		return;
-	}
-
-	// ── RETRIEVE ── the orbit is occupied: SDP-swap retrieve.
-	// Allocate the retriever session FIRST (#71): if the pool is exhausted we 503
-	// the retriever and leave the slot intact rather than sending a re-INVITE to
-	// the parked party and then having no session to track the bridge.
-	const std::string parkedSdp(slot.parkedSdp);
-	const std::string retrieverSdp(data->getBody());
-
-	auto virt = allocateVirtualPeer(slot.parkedExt, slot.parkedAddr);
-	auto rsession = allocateSession(std::string(data->getCallID()), caller);
-	if (!rsession)
-	{
-		auto resp = getMessageFromPool(data->toString(), data->getSource());
-		resp->setHeader("SIP/2.0 503 Service Unavailable");
-		resp->clearBody();
-		resp->syncContentLength();
-		_outbox.emplace_back(data->getSource(), std::move(resp));
-		queueLog("Park: retrieve rejected — session pool exhausted", true);
-		return;
-	}
-
-	auto ok = getMessageFromPool(data->toString(), data->getSource());
-	ok->setHeader(SipMessageTypes::OK);
-	ok->setVia(std::string(data->getVia()) + ";received=" + activeIp);
-	ok->setTo(std::string(data->getTo()) + ";tag=" + toTag);
-	ok->setContact(buildContact(orbit));
-	if (!parkedSdp.empty()) ok->setBody(parkedSdp);
-	ok->enforceG711();
-	ok->syncContentLength();
-	_outbox.emplace_back(data->getSource(), ok);
-
-	rsession->setDest(virt);
-	rsession->setPeerCallID(slot.callID);
-	rsession->setLocalTag(toTag);
-	rsession->setInviteMessage(data);
-	_sessions.emplace(std::string(data->getCallID()), rsession);
-	rsession->setState(Session::State::Connected);
-
-	if (auto parked = getSession(slot.callID); parked.has_value())
-	{
-		parked.value()->setPeerCallID(std::string(data->getCallID()));
-	}
-	sendParkReinvite(slot, retrieverSdp);
-	queueLog("Park: " + caller->getNumber() + " retrieved " + slot.parkedExt + " from " + orbit);
-
-	slot = ParkSlot{};
-	refreshParkSnapshot();
-}
-
-void RequestsHandler::sendParkReinvite(ParkSlot& slot, const std::string& sdp)
-{
-	if (slot.callID.empty() || !slot.parked) return;
-	const std::string activeIp = _localIp;
-	const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
-
-	char ipBuf[INET_ADDRSTRLEN]{};
-	inet_ntop(AF_INET, &slot.parkedAddr.sin_addr, ipBuf, sizeof(ipBuf));
-	const std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(slot.parkedAddr.sin_port));
-
-	const std::string theirTag = slot.parkedFromTag;
-	const std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
-	const std::string body = sdp;
-
-	std::ostringstream ss;
-	ss << "INVITE sip:" << slot.parkedExt << "@" << destIpPort << " SIP/2.0\r\n"
-	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
-	   << "From: <sip:" << slot.orbit << "@" << srcIpPort << ">;tag=" << slot.localTag << "\r\n"
-	   << "To: <sip:" << slot.parkedExt << "@" << activeIp << ">;tag=" << theirTag << "\r\n"
-	   << "Call-ID: " << slot.callID << "\r\n"
-	   << "CSeq: 2 INVITE\r\n"
-	   << "Max-Forwards: 70\r\n"
-	   << "Contact: <sip:" << slot.orbit << "@" << srcIpPort << ";transport=UDP>\r\n"
-	   << "User-Agent: pocket-dial\r\n"
-	   << "Content-Type: application/sdp\r\n"
-	   << "Content-Length: " << body.size() << "\r\n\r\n"
-	   << body;
-
-	auto inv = getMessageFromPool(ss.str(), slot.parkedAddr);
-	inv->enforceG711();
-	inv->syncContentLength();
-	_outbox.emplace_back(slot.parkedAddr, std::move(inv));
-	_parkPendingAcks.push_back(slot.callID);
-	queueLog("Park: re-INVITE -> parked party " + slot.parkedExt);
-}
-
-void RequestsHandler::byeParkedParty(const ParkSlot& slot)
-{
-	if (slot.callID.empty()) return;
-	const std::string activeIp = _localIp;
-	const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
-	const std::string fromHeader = "<sip:" + slot.orbit + "@" + srcIpPort + ">;tag=" + slot.localTag;
-	const std::string toHeader = "<sip:" + slot.parkedExt + "@" + activeIp + ">;tag=" + slot.parkedFromTag;
-	auto bye = buildServerBye(slot.parkedExt, slot.parkedAddr,
-		stripHeaderName(slot.callID), fromHeader, toHeader);
-	if (bye) _outbox.emplace_back(slot.parkedAddr, std::move(bye));
-}
-
-void RequestsHandler::startParkRingback(ParkSlot& slot, const std::shared_ptr<SipClient>& parker,
-	std::chrono::steady_clock::time_point now)
-{
-	if (!parker) { byeParkedParty(slot); freeParkSlot(slot.callID); return; }
-	const std::string activeIp = _localIp;
-	const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
-	const sockaddr_in& addr = parker->getAddress();
-
-	char ipBuf[INET_ADDRSTRLEN]{};
-	inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf));
-	const std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(addr.sin_port));
-
-	slot.rbCallID  = "Call-ID: " + IDGen::GenerateID(16) + "@" + activeIp;
-	slot.rbFromTag = IDGen::GenerateID(9);
-	slot.rbBranch  = "z9hG4bK" + IDGen::GenerateID(12);
-	slot.rbAddr    = addr;
-	slot.state     = ParkState::RingingBack;
-	slot.deadline  = now + std::chrono::seconds(30);
-
-	const std::string body = slot.parkedSdp;
-	std::ostringstream ss;
-	ss << "INVITE sip:" << parker->getNumber() << "@" << destIpPort << " SIP/2.0\r\n"
-	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << slot.rbBranch << "\r\n"
-	   << "From: \"PocketDial Park\" <sip:" << slot.orbit << "@" << srcIpPort << ">;tag=" << slot.rbFromTag << "\r\n"
-	   << "To: <sip:" << parker->getNumber() << "@" << activeIp << ">\r\n"
-	   << slot.rbCallID << "\r\n"
-	   << "CSeq: 1 INVITE\r\n"
-	   << "Max-Forwards: 70\r\n"
-	   << "Contact: <sip:" << slot.orbit << "@" << srcIpPort << ";transport=UDP>\r\n"
-	   << "User-Agent: pocket-dial\r\n"
-	   << "Content-Type: application/sdp\r\n"
-	   << "Content-Length: " << body.size() << "\r\n\r\n"
-	   << body;
-
-	auto inv = getMessageFromPool(ss.str(), addr);
-	inv->enforceG711();
-	inv->syncContentLength();
-	_outbox.emplace_back(addr, std::move(inv));
-	queueLog("Park: timeout on " + slot.orbit + " — ringing back parker " + parker->getNumber());
-}
-
-bool RequestsHandler::handleParkOk(const std::shared_ptr<SipMessage>& data)
-{
-	const std::string cseq(data->getCSeq());
-	const std::string callID(data->getCallID());
-	const bool isInviteOk = cseq.find(SipMessageTypes::INVITE) != std::string::npos;
-	if (!isInviteOk) return false;
-
-	// (a) 200 OK to a park re-INVITE sent to the parked party: ACK and free tracking entry.
-	if (auto it = std::find(_parkPendingAcks.begin(), _parkPendingAcks.end(), callID);
-		it != _parkPendingAcks.end())
-	{
-		const std::string activeIp = _localIp;
-		const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
-		const sockaddr_in srcAddr = data->getSource();
-		char ipBuf[INET_ADDRSTRLEN]{};
-		inet_ntop(AF_INET, &srcAddr.sin_addr, ipBuf, sizeof(ipBuf));
-		const std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(srcAddr.sin_port));
-		std::ostringstream ss;
-		ss << "ACK sip:" << data->getToNumber() << "@" << destIpPort << " SIP/2.0\r\n"
-		   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=z9hG4bK" << IDGen::GenerateID(12) << "\r\n"
-		   << "From: " << stripHeaderName(data->getFrom()) << "\r\n"
-		   << "To: " << stripHeaderName(data->getTo()) << "\r\n"
-		   << callID << "\r\n"
-		   << "CSeq: 2 ACK\r\n"
-		   << "Max-Forwards: 70\r\n"
-		   << "Content-Length: 0\r\n\r\n";
-		_outbox.emplace_back(data->getSource(), getMessageFromPool(ss.str(), data->getSource()));
-		_parkPendingAcks.erase(it);
-		return true;
-	}
-
-	// (b) 200 OK to a ring-back INVITE sent to the parker: ACK parker, bridge both legs.
-	for (auto& slot : _parkSlots)
-	{
-		if (slot.state == ParkState::RingingBack && slot.rbCallID == callID)
-		{
-			const std::string activeIp = _localIp;
-			const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
-			char ipBuf[INET_ADDRSTRLEN]{};
-			inet_ntop(AF_INET, &slot.rbAddr.sin_addr, ipBuf, sizeof(ipBuf));
-			const std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(slot.rbAddr.sin_port));
-			std::ostringstream ss;
-			ss << "ACK sip:" << data->getToNumber() << "@" << destIpPort << " SIP/2.0\r\n"
-			   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << slot.rbBranch << "\r\n"
-			   << "From: \"PocketDial Park\" <sip:" << slot.orbit << "@" << srcIpPort << ">;tag=" << slot.rbFromTag << "\r\n"
-			   << "To: " << stripHeaderName(data->getTo()) << "\r\n"
-			   << slot.rbCallID << "\r\n"
-			   << "CSeq: 1 ACK\r\n"
-			   << "Max-Forwards: 70\r\n"
-			   << "Content-Length: 0\r\n\r\n";
-			_outbox.emplace_back(slot.rbAddr, getMessageFromPool(ss.str(), slot.rbAddr));
-
-			sendParkReinvite(slot, std::string(data->getBody()));
-
-			if (auto parker = findClient(slot.parker); parker.has_value())
-			{
-				auto virt = allocateVirtualPeer(slot.parkedExt, slot.parkedAddr);
-				if (auto rb = allocateSession(slot.rbCallID, parker.value()))
-				{
-					rb->setDest(virt);
-					rb->setPeerCallID(slot.callID);
-					rb->setLocalTag(slot.rbFromTag);
-					rb->setParkUac(true);
-					rb->setInviteMessage(data);
-					_sessions.emplace(slot.rbCallID, rb);
-					rb->setState(Session::State::Connected);
-				}
-				if (auto parked = getSession(slot.callID); parked.has_value())
-				{
-					parked.value()->setPeerCallID(slot.rbCallID);
-				}
-			}
-
-			queueLog("Park: parker answered ring-back on " + slot.orbit + " — bridging");
-			slot = ParkSlot{};
-			refreshParkSnapshot();
-			return true;
-		}
-	}
-	return false;
-}
+// ── Call parking (orbits 700–709): FSM lives in ParkOrbit.cpp ────────────────
 
 bool RequestsHandler::handleTransferOk(const std::shared_ptr<SipMessage>& data)
 {
@@ -5346,62 +3993,11 @@ bool RequestsHandler::handleTransferOk(const std::shared_ptr<SipMessage>& data)
 	return true;
 }
 
-void RequestsHandler::parkSweep(std::chrono::steady_clock::time_point now)
-{
-	for (auto& slot : _parkSlots)
-	{
-		if (slot.state == ParkState::Parked &&
-			(now - slot.parkedAt) >= _parkTimeout)
-		{
-			auto parker = findClient(slot.parker);
-			if (parker.has_value())
-			{
-				startParkRingback(slot, parker.value(), now);
-			}
-			else
-			{
-				queueLog("Park: timeout on " + slot.orbit + " — parker " + slot.parker +
-					" gone, tearing down");
-				byeParkedParty(slot);
-				freeParkSlot(slot.callID);
-			}
-		}
-		else if (slot.state == ParkState::RingingBack && now >= slot.deadline)
-		{
-			queueLog("Park: ring-back on " + slot.orbit + " not answered — tearing down");
-			byeParkedParty(slot);
-			freeParkSlot(slot.callID);
-		}
-	}
-	refreshParkSnapshot();
-}
-
-void RequestsHandler::freeParkSlot(std::string_view callID)
-{
-	for (auto& slot : _parkSlots)
-	{
-		if (slot.state != ParkState::Free && slot.callID == callID)
-		{
-			slot = ParkSlot{};
-		}
-	}
-	_parkPendingAcks.erase(
-		std::remove(_parkPendingAcks.begin(), _parkPendingAcks.end(), std::string(callID)),
-		_parkPendingAcks.end());
-}
-
 void RequestsHandler::refreshParkSnapshot()
 {
-	const auto now = std::chrono::steady_clock::now();
+	auto rows = _park.snapshotRows(std::chrono::steady_clock::now(), /*onlyParked=*/false);
 	std::lock_guard<std::mutex> snapLock(_snapshotMutex);
-	_snapshot.parkedCalls.clear();
-	for (const auto& slot : _parkSlots)
-	{
-		if (slot.state == ParkState::Free) continue;
-		int secs = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
-			now - slot.parkedAt).count());
-		_snapshot.parkedCalls.emplace_back(slot.orbit, slot.parkedExt, slot.parker, secs);
-	}
+	_snapshot.parkedCalls = std::move(rows);
 }
 
 std::vector<std::tuple<std::string, std::string, std::string, int>> RequestsHandler::getParkedCalls()

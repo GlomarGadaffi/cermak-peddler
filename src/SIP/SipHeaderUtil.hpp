@@ -1,0 +1,48 @@
+#ifndef SIP_HEADER_UTIL_HPP
+#define SIP_HEADER_UTIL_HPP
+
+#include <cctype>
+#include <string>
+#include <string_view>
+
+namespace siphdr
+{
+	// Extract the ;tag= value from a From/To header line.
+	inline std::string tagOf(std::string_view header)
+	{
+		size_t p = header.find(";tag=");
+		if (p == std::string_view::npos) return {};
+		p += 5;
+		size_t e = p;
+		while (e < header.size() && header[e] != ';' && header[e] != '>' &&
+			header[e] != ' ' && header[e] != '\r' && header[e] != '\n')
+		{
+			++e;
+		}
+		return std::string(header.substr(p, e - p));
+	}
+
+	// Strip a leading "HeaderName:" prefix (e.g. "From:", "To:", "Call-ID:") so
+	// server-minted requests emit a clean value and never ship a doubled prefix.
+	// Safe on bare values (the check is that the text before ':' contains only
+	// letter/hyphen chars — so "<sip:...>" is left untouched). Idempotent.
+	inline std::string stripHeaderName(std::string_view h)
+	{
+		size_t colon = h.find(':');
+		if (colon == std::string_view::npos || colon == 0 || colon > 15)
+			return std::string(h);
+		for (size_t i = 0; i < colon; ++i)
+		{
+			char c = h[i];
+			if (!(std::isalpha(static_cast<unsigned char>(c)) || c == '-'))
+				return std::string(h);
+		}
+		size_t v = colon + 1;
+		while (v < h.size() && (h[v] == ' ' || h[v] == '\t')) ++v;
+		size_t e = h.size();
+		while (e > v && (h[e - 1] == '\r' || h[e - 1] == '\n')) --e;
+		return std::string(h.substr(v, e - v));
+	}
+}
+
+#endif
