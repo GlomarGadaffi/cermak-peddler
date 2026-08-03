@@ -39,6 +39,11 @@ add_executable(sip_parser_tests
     # Phase 0 of docs/PLAN_ADMIN_HTTP_ONLY.md: dark-by-default HTTP admin plane
     # test contract. Pulls in HttpServer.cpp for the first time in this target.
     AdminHttpGate_test.cpp
+    # Wire-level coverage for the decomposed SIP state machines, driven through a
+    # FakePbxEnv that records what each machine enqueues. The park/beep/BLF paths
+    # build their requests by hand, so only a byte-level assertion catches header
+    # defects like a doubled "Call-ID:" in the park retrieve re-INVITE.
+    ParkOrbit_test.cpp
     # SIP digest-auth primitives + per-extension HA1 secret store. Both are
     # host-compilable: SipDigest vendors a portable MD5 (no mbedTLS) and
     # SipSecretStore uses an in-memory map under !ESP_PLATFORM (no NVS).

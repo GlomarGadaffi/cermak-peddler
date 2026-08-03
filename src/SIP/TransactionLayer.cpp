@@ -132,8 +132,9 @@ void TransactionLayer::sweep(std::chrono::steady_clock::time_point now)
 		{
 			if (tx.msgLen > 0 && !tx.msgTruncated)
 			{
-				std::string retxStr(tx.msg, tx.msgLen);
-				auto retx = _env.messageFromPool(retxStr, tx.peer);
+				// messageFromPool takes its raw string by value — hand it the copy
+				// straight off the transaction buffer instead of copying twice.
+				auto retx = _env.messageFromPool(std::string(tx.msg, tx.msgLen), tx.peer);
 				if (retx) _env.enqueue(tx.peer, std::move(retx));
 			}
 			tx.currentIntervalMs *= 2;
