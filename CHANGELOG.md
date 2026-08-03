@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased (sip-engine-decomposition) - 2026-08-03
+
+Structural refactor, behavior-neutral by design. Host-verified (131/131 GoogleTest).
+
+### Changed — RequestsHandler decomposed into discrete state machines
+
+The ~6,200-line RequestsHandler monolith interleaved several independent state
+machines behind one mutex. Each now lives in its own class, wired to the shared
+engine infrastructure through the narrow `PbxEnv` interface (outbox enqueue,
+message pool, deferred log, server identity, registration/session tables). All
+of them keep the fixed-slot, no-heap-growth pools and the caller-holds-`_mutex`
+convention of the code they were extracted from.
+
+- **`TransactionLayer`** — RFC 3261 §17 INVITE client transactions
+  (Timer A retransmit, Timer B timeout, RFC 6026 Timer L absorb).
+- **`Registrar`** — REGISTER admission policy (Open/Learn/Secure), digest
+  challenge/verify, and the Learn-mode TOFU + MAC-lock adopted-device registry
+  (NVS-persisted). The device online flag now lives in the registry record;
+  the dashboard snapshot is a plain mirror refreshed via a dirty flag.
+- **`RegisterBeeper`** — the register-beep outbound UAC dialog machine
+  (auto-answer INVITE → ACK → BYE, CANCEL on timeout).
+- **`ParkOrbit`** — call parking: orbit slots 700..70N, park/retrieve SDP swap,
+  ring-back on timeout, park sweep.
+- **`BlfSubscriptions`** — RFC 6665/4235 BLF watcher dialogs: SUBSCRIBE gate,
+  202 + immediate NOTIFY, change-detection NOTIFYs, expiry sweep.
+
+`RequestsHandler` remains the call engine (INVITE routing, forks/groups/hunt,
+forwarding, transfer, session timers, CDR, DTMF admin menu) and the thin
+dispatcher that owns `_mutex`, the outbox flush and the dashboard snapshot.
+Shared helpers moved to `PbxPersist.hpp` (NVS blob format) and
+`SipHeaderUtil.hpp` (tag/header-name parsing). Public API unchanged
+(`RegistrarMode`/`AdoptedDevice` are now aliases into `Registrar`).
+
 ## Unreleased (admin-http-only) - 2026-07-16
 
 Admin-plane hardening: the HTTP dashboard becomes the only admin surface and goes

@@ -475,8 +475,8 @@ private:
 		std::vector<std::tuple<std::string, std::string, std::string, int>> parkedCalls;
 		// Paging zones: {zoneExt, "m1,m2,..."}.
 		std::vector<std::pair<std::string, std::string>> pageZones;
-		// Adopted devices (STAGE 2): {mac, ext, state, online}. Mirrored from _devices
-		// under _mutex; copied out for the TUI under _snapshotMutex.
+		// Adopted devices (STAGE 2): {mac, ext, state, online}. Mirrored from the
+		// Registrar's registry under _mutex; copied out under _snapshotMutex.
 		std::vector<AdoptedDevice> devices;
 		uint64_t packetsProcessed = 0;
 		uint64_t packetsDropped = 0;
