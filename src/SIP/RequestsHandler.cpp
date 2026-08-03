@@ -302,14 +302,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 		// NOTIFYs land in _outbox and ride out with this pass (after unlock).
 		_blf.refresh();
 
-		// RFC 3261 §17: register any new outgoing INVITE in _outbox for retransmit.
-		// Scan after BLF NOTIFYs are added so the full outbox is covered; maybeTrack
-		// filters to INVITE requests only so NOTIFYs and responses are ignored.
-		for (const auto& [addr, msg] : _outbox)
-			_txLayer.maybeTrack(addr, msg);
-
-		localOutbox = std::move(_outbox);
-		_outbox.clear();
+		localOutbox = drainOutbox();
 
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
@@ -1265,10 +1258,6 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 	{
 		return;
 	}
-	// Attended-transfer re-INVITE ACKs.
-	if (handleTransferOk(data))
-		return;
-
 	auto session = getSession(data->getCallID());
 	if (session.has_value())
 	{
@@ -2837,14 +2826,7 @@ void RequestsHandler::tick()
 			_snapshot = std::move(nextSnapshot);
 		}
 
-		// RFC 3261 §17: register any new outgoing INVITEs for retransmit (mirrors
-		// the same scan in handle()). tick()-originated INVITE forks (park ring-back,
-		// hunt-group next-ring, CFNA redirect) need Timer A/B coverage too. (#70)
-		for (const auto& [addr, msg] : _outbox)
-			_txLayer.maybeTrack(addr, msg);
-
-		localOutbox = std::move(_outbox);
-		_outbox.clear();
+		localOutbox = drainOutbox();
 
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
@@ -3978,34 +3960,25 @@ std::vector<std::pair<std::string, std::string>> RequestsHandler::getPageZones()
 
 // ── Call parking (orbits 700–709): FSM lives in ParkOrbit.cpp ────────────────
 
-bool RequestsHandler::handleTransferOk(const std::shared_ptr<SipMessage>& data)
+std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> RequestsHandler::drainOutbox()
 {
-	const std::string cseq(data->getCSeq());
-	const std::string callID(data->getCallID());
-	if (cseq.find(SipMessageTypes::INVITE) == std::string::npos) return false;
+	// The single exit every deferred message passes through. RFC 3261 §17:
+	// register outgoing INVITEs for retransmit here, so Timer A/B coverage is
+	// structural rather than something each flush site re-implements — a new
+	// flush path would otherwise send one-shot UDP INVITEs that are simply lost
+	// on a dropped packet. maybeTrack filters to INVITE requests, so responses
+	// and NOTIFYs are ignored.
+	//
+	// Ordering matters (#70): the scan must run after everything that appends to
+	// _outbox during this pass (BLF NOTIFYs, tick()-originated forks — park
+	// ring-back, hunt-group next-ring, CFNA redirect), which is exactly why it
+	// belongs at the drain rather than at any individual enqueue.
+	for (const auto& [addr, msg] : _outbox)
+		_txLayer.maybeTrack(addr, msg);
 
-	auto it = std::find(_transferPendingAcks.begin(), _transferPendingAcks.end(), callID);
-	if (it == _transferPendingAcks.end()) return false;
-
-	const std::string activeIp = _localIp;
-	const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
-	const sockaddr_in src = data->getSource();
-	char ipBuf[INET_ADDRSTRLEN]{};
-	inet_ntop(AF_INET, &src.sin_addr, ipBuf, sizeof(ipBuf));
-	const std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(src.sin_port));
-
-	std::ostringstream ss;
-	ss << "ACK sip:" << data->getToNumber() << "@" << destIpPort << " SIP/2.0\r\n"
-	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=z9hG4bK" << IDGen::GenerateID(12) << "\r\n"
-	   << "From: " << stripHeaderName(data->getFrom()) << "\r\n"
-	   << "To: " << stripHeaderName(data->getTo()) << "\r\n"
-	   << callID << "\r\n"
-	   << "CSeq: 100 ACK\r\n"
-	   << "Max-Forwards: 70\r\n"
-	   << "Content-Length: 0\r\n\r\n";
-	_outbox.emplace_back(data->getSource(), getMessageFromPool(ss.str(), data->getSource()));
-	_transferPendingAcks.erase(it);
-	return true;
+	auto drained = std::move(_outbox);
+	_outbox.clear();
+	return drained;
 }
 
 void RequestsHandler::refreshParkSnapshot()

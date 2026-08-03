@@ -316,9 +316,7 @@ private:
 	// Call parking / park-orbit: the orbit FSM lives in ParkOrbit (see
 	// ParkOrbit.hpp). Guarded by _mutex.
 	ParkOrbit _park{*this};
-	std::vector<std::string> _transferPendingAcks; // attended-transfer re-INVITE ACKs pending
 
-	bool handleTransferOk(const std::shared_ptr<SipMessage>& data);
 	// Mirror the park orbits into the dashboard snapshot. Caller holds _mutex;
 	// takes _snapshotMutex internally.
 	void refreshParkSnapshot();
@@ -460,6 +458,10 @@ private:
 	std::mutex _mutex;
 	OnHandledEvent _onHandled;
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> _outbox;
+	// Take everything queued this pass, registering outgoing INVITEs for
+	// retransmit on the way out. The one place messages leave _outbox — see the
+	// #70 ordering note on the definition. Caller holds _mutex.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> drainOutbox();
 
 	std::string _serverIp;
 	std::string _localIp;   // resolved once at construction; avoids getPrimaryLocalIP() under _mutex
