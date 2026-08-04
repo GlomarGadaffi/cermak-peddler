@@ -87,6 +87,11 @@ private:
 	void sendApiKill(int sock, const std::string& body);
 	// Phase 2: read-only Call Detail Records (newest first). Ungated like /api/status.
 	void sendApiCdr(int sock);
+	// Issue #33: downloads the last POCKETDIAL_PCAP_RING_SIZE SIP signaling
+	// packets as a .pcap. Session-gated by the caller in handleClient() (see the
+	// dispatch entry) — unlike /api/cdr, this carries full message bytes
+	// (Contact URIs, User-Agent, Authorization digests), not just call metadata.
+	void sendApiPcap(int sock);
 	// Phase 2: set per-extension Do Not Disturb. Mutating (same-origin + auth gated).
 	void sendApiDnd(int sock, const std::string& body);
 	// Class A sweep: set per-extension call forwarding (always/busy/noanswer) and

@@ -109,6 +109,7 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/status`](#get-apistatus) | `GET` | Low | None | Retrieves registrar uptime, packet statistics, active extensions, and ongoing sessions. |
 | [`/api/kill`](#post-apikill) | `POST` | High | Same-Origin (+session once provisioned) | Forcefully disconnects and de-registers an active SIP extension. |
 | [`/api/cdr`](#get-apicdr) | `GET` | Low | None | Returns the in-memory Call Detail Record ring (most recent calls, newest first). |
+| [`/api/pcap`](#get-apipcap) | `GET` | Medium | Session once provisioned | Downloads the last `POCKETDIAL_PCAP_RING_SIZE` SIP signaling packets as a `.pcap` (Wireshark-readable). |
 | [`/api/dnd`](#post-apidnd) | `POST` | High | Same-Origin (+session once provisioned) | Sets or clears Do-Not-Disturb on an extension. |
 | [`/api/forward`](#post-apiforward) | `POST` | High | Same-Origin (+session once provisioned) | Configures call forwarding (`always`/`busy`/`noanswer`) for an extension. |
 | [`/api/group`](#post-apigroup) | `POST` | High | Same-Origin (+session once provisioned) | Creates, updates, or deletes a ring/hunt group. |
@@ -356,6 +357,23 @@ Returns the in-memory Call Detail Record ring (most recent calls first). Read-on
 | `ageSec` | Integer | Seconds since the call started, derived from the same steady-clock basis as `startMs`. |
 | `duration` | Integer | Call length in seconds. |
 | `result` | String | Outcome of the call (e.g. `"completed"`). |
+
+---
+
+### `GET /api/pcap`
+Downloads a classic libpcap file of the most recent SIP signaling packets, ready to open directly in Wireshark. Both directions are captured (packets the server received and packets it sent); RTP/media is never included — pocket-dial brokers RTP peer-to-peer and never relays it, so there is nothing server-side to capture for a call's media.
+
+Captured packets are synthesized into a minimal Ethernet+IPv4+UDP frame around the exact SIP bytes (dummy MAC addresses — the server has no real link-layer information — but real source/destination IP:port), so Wireshark's SIP dissector decodes them exactly as it would a real capture. Timestamps are relative to the server's monotonic clock, not wall-clock (no RTC is guaranteed on the device — same basis as `/api/cdr`'s `startMs`).
+
+Only packets that pass structural validation and the per-source-IP rate limiter (Issue #38) are captured — this is a signaling-research aid, not a wire-level DoS forensics tool. The ring is bounded (`POCKETDIAL_PCAP_RING_SIZE`, default 64); older packets are dropped as new ones arrive.
+
+* **Requires `pd_session` cookie**: Once the device is provisioned (see §0). No same-origin check — this is a plain file download, not a state-mutating action, and `SameSite=Strict` on the session cookie already prevents a cross-site page from riding an admin's session to reach it.
+* **Request Headers**: None
+* **Response Content-Type**: `application/vnd.tcpdump.pcap`
+* **Response Headers**: `Content-Disposition: attachment; filename="pocket-dial.pcap"`
+* **Response Status Codes**:
+  * `200 OK`: Always — an empty/never-populated ring still returns a valid (headers-only) `.pcap`.
+  * `401 Unauthorized`: Device is provisioned and the request carries no valid session.
 
 ---
 

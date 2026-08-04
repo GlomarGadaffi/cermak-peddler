@@ -29,6 +29,7 @@
 #include "SipClient.hpp"
 #include "Session.hpp"
 #include "CallDetailRecord.hpp"
+#include "PcapCapture.hpp"
 #include "PbxConfig.hpp"
 #include "RtpSender.hpp"
 #include "PbxEnv.hpp"
@@ -78,6 +79,12 @@ public:
 	// Call Detail Records (CDR): a thread-safe snapshot of the recent-call ring,
 	// newest first. Copied out under _snapshotMutex like the client/session views.
 	std::vector<CallDetailRecord> getCallDetailRecords();
+
+	// Issue #33: a classic libpcap file of the last POCKETDIAL_PCAP_RING_SIZE SIP
+	// signaling packets (both directions), ready to write straight to a .pcap and
+	// open in Wireshark. Takes _mutex (the capture ring is populated from inside
+	// handle()/drainOutbox(), both already under it).
+	std::string getPcapCapture();
 
 	// Do Not Disturb (DND): set/query a per-extension flag. setDnd is the mutating
 	// path behind POST /api/dnd (thread-safe; takes _mutex). getDndExtensions
@@ -500,6 +507,10 @@ private:
 	std::array<CallDetailRecord, POCKETDIAL_CDR_RECORDS> _cdrRing;
 	size_t _cdrHead = 0;
 	size_t _cdrCount = 0;
+
+	// Issue #33: /api/pcap ring. Populated from handle() (inbound) and
+	// drainOutbox() (outbound), both already under _mutex.
+	PcapCapture _pcapCapture;
 
 	// DND state, keyed by extension. Bounded by the client-pool depth: an entry is
 	// only created when DND is turned ON, and turning it OFF erases the entry, so

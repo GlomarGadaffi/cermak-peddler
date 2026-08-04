@@ -180,6 +180,13 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 		_packetsProcessed.fetch_add(1, std::memory_order_relaxed);
 		_outbox.clear();
 
+		// Issue #33: /api/pcap capture. Only messages that clear the checks above
+		// (structurally valid, not rate-limited) are captured — this is a
+		// signaling-research aid, not a wire-level DoS forensics tool, and
+		// capturing before the rate limiter would mean pulling the ring buffer
+		// out from under _mutex for every flood packet too.
+		_pcapCapture.record(/*outbound=*/false, request->getSource(), request->toString());
+
 		auto client = findClientByAddress(request->getSource());
 		if (client.has_value())
 		{
@@ -2232,6 +2239,16 @@ std::vector<CallDetailRecord> RequestsHandler::getCallDetailRecords()
 	return _snapshot.cdr;
 }
 
+std::string RequestsHandler::getPcapCapture()
+{
+	// Unlike the dashboard snapshot fields, the pcap ring isn't mirrored out to
+	// _snapshot: it's populated directly under _mutex (handle()/drainOutbox()),
+	// and serializing up to POCKETDIAL_PCAP_RING_SIZE small entries is cheap
+	// enough to do inline rather than adding a second copy of the same data.
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _pcapCapture.toPcapFile(_localIp, static_cast<uint16_t>(_serverPort));
+}
+
 void RequestsHandler::setDnd(const std::string& extension, bool on)
 {
 	std::vector<std::pair<bool, std::string>> localLogs;
@@ -4030,7 +4047,14 @@ std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> RequestsHandler
 	// ring-back, hunt-group next-ring, CFNA redirect), which is exactly why it
 	// belongs at the drain rather than at any individual enqueue.
 	for (const auto& [addr, msg] : _outbox)
+	{
 		_txLayer.maybeTrack(addr, msg);
+		// Issue #33: /api/pcap capture, outbound side. Same single choke point as
+		// the retransmit registration above — every deferred message leaves
+		// through here regardless of which call site (handle(), tick(),
+		// sendMessageTo()) queued it.
+		_pcapCapture.record(/*outbound=*/true, addr, msg->toString());
+	}
 
 	auto drained = std::move(_outbox);
 	_outbox.clear();

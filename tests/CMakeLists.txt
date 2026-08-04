@@ -47,6 +47,9 @@ add_executable(sip_parser_tests
     RegisterBeeper_test.cpp
     BlfSubscriptions_test.cpp
     DashboardSnapshot_test.cpp
+    # /api/pcap ring buffer + libpcap serializer (Issue #33). Pure/host-testable —
+    # PcapCapture.hpp has no dependency beyond sockaddr_in.
+    PcapCapture_test.cpp
     # SIP digest-auth primitives + per-extension HA1 secret store. Both are
     # host-compilable: SipDigest vendors a portable MD5 (no mbedTLS) and
     # SipSecretStore uses an in-memory map under !ESP_PLATFORM (no NVS).

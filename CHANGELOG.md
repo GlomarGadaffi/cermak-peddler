@@ -35,6 +35,21 @@ catch-up, and a few feature requests, each on its own commit.
   PIN is salted+hashed, so this can only be inferred behaviorally, never
   confirmed. See `docs/THREAT_MODEL.md` §5.5 for the residual-risk writeup.
 
+### Added
+
+- `GET /api/pcap` (Issue #33): downloads the last `POCKETDIAL_PCAP_RING_SIZE`
+  (default 64) SIP signaling packets as a classic libpcap file, ready to open
+  in Wireshark. Both directions are captured through the two choke points
+  every packet already passes through — `handle()` for inbound,
+  `drainOutbox()` for outbound — so no call site needed to remember to
+  record anything. RTP/media is out of scope by construction: pocket-dial
+  brokers it peer-to-peer and never relays it, so there's nothing server-side
+  to capture. Each entry is synthesized into a minimal Ethernet+IPv4+UDP
+  frame (dummy MACs, real IP:port) around the exact captured bytes so
+  Wireshark's SIP dissector decodes it like a real capture. Session-gated
+  (no same-origin check — it's a download, not a mutation). New
+  `src/SIP/PcapCapture.hpp` (host-tested ring + serializer).
+
 ### Docs
 
 - `docs/API.md` §4 now specifies `/api/cdr`, `/api/dnd`, `/api/forward`,

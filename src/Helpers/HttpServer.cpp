@@ -457,6 +457,20 @@ void HttpServer::handleClient(int clientSock)
 		// Read-only Call Detail Records — ungated like /api/status.
 		sendApiCdr(clientSock);
 	}
+	else if (req.method == "GET" && req.path == "/api/pcap")
+	{
+		// Session-gated (see sendApiPcap): full message bytes are more sensitive
+		// than /api/cdr's call metadata.
+		if (AdminAuth::isProvisioned() && !isAuthed(req))
+		{
+			sendResponse(clientSock, 401, "Unauthorized", "application/json",
+			             "{\"error\":\"authentication required\"}");
+		}
+		else
+		{
+			sendApiPcap(clientSock);
+		}
+	}
 	else if (req.method == "POST" && req.path == "/api/dnd")
 	{
 		// Mutating: same gate as /api/kill (same-origin + auth once provisioned).
@@ -959,6 +973,24 @@ void HttpServer::sendApiCdr(int sock)
 	json << "]";
 
 	sendResponse(sock, 200, "OK", "application/json", json.str());
+}
+
+void HttpServer::sendApiPcap(int sock)
+{
+	std::string pcap;
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		pcap = handler->getPcapCapture();
+	}
+	// No same-origin check: this is a plain-download GET (an admin clicking a
+	// dashboard link, or curl/wget with the session cookie), not a
+	// state-mutating action — the same-origin gate on every other admin
+	// endpoint exists to stop a malicious page from silently POSTing through an
+	// admin's authenticated browser, which doesn't apply to fetching a file.
+	// SameSite=Strict on pd_session (see /api/admin/login) already keeps a
+	// cross-site page from riding the admin's session to reach this at all.
+	sendResponseWithHeader(sock, 200, "OK", "application/vnd.tcpdump.pcap", pcap,
+		"Content-Disposition: attachment; filename=\"pocket-dial.pcap\"");
 }
 
 void HttpServer::sendApiDnd(int sock, const std::string& body)
