@@ -64,6 +64,23 @@ catch-up, and a few feature requests, each on its own commit.
   end: built and ran the real server, drove real SIP traffic at it, and
   checked the rendered dashboard in a real (Playwright) browser.
 
+- `GET /config/<mac>.cfg` (Issue #35): zero-touch Yealink auto-provisioning
+  for already-adopted devices — point a phone's provisioning URL at
+  `/config/` and it gets its account/server/codec settings back with no
+  manual entry. Covers **re**-provisioning (factory reset, handset swap)
+  rather than a device's very first contact, since a MAC has to already be
+  in the Registrar's adopted-device registry (Learn/Secure mode) to be
+  served — the first-ever REGISTER is what gets it adopted, and still needs
+  the phone told its extension by some other means. Never carries a working
+  password: `SipSecretStore` only stores a one-way HA1 hash, so a
+  Secure-mode (or individually `secure()`'d) device's config flags that the
+  admin has to set the password by hand instead of silently omitting it.
+  Deliberately not session-gated (a booting phone has no session cookie) —
+  the MAC itself (2^48 space, only served if already adopted) plus the
+  existing dark-by-default transport gate are the protection. New
+  `src/SIP/ProvisioningConfig.hpp` (pure, host-tested config builder). Not
+  verified against physical Yealink hardware.
+
 ### Docs
 
 - `docs/API.md` §4 now specifies `/api/cdr`, `/api/dnd`, `/api/forward`,

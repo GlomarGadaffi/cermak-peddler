@@ -4,6 +4,7 @@
 #include "CallDetailRecord.hpp"
 #include "AdminAuth.hpp"
 #include "OtaUpdater.hpp"
+#include "ProvisioningConfig.hpp"
 #include "index_html.h"
 #include "IPHelper.hpp"
 #include <cstring>
@@ -430,6 +431,16 @@ void HttpServer::handleClient(int clientSock)
 	if (req.method == "GET" && (req.path == "/" || req.path == "/index.html"))
 	{
 		sendHtml(clientSock);
+	}
+	else if (req.method == "GET" && isProvisioningConfigPath(req.path))
+	{
+		// Issue #35: GET /config/<mac>.cfg, e.g. GET /config/805ec079c37f.cfg —
+		// a phone's own auto-provisioning fetch, so intentionally NOT
+		// session-gated (a booting phone has no session cookie to present).
+		// The MAC itself is the only credential: it's not guessable (2^48
+		// space) and only served for a MAC already in the adopted-device
+		// registry, so an unrelated prober learns nothing by guessing.
+		sendConfigCfg(clientSock, req.path.substr(8, 12));
 	}
 	else if (req.method == "GET" && req.path == "/api/status")
 	{
@@ -1034,6 +1045,41 @@ void HttpServer::sendApiTrace(int sock)
 	json << "]";
 
 	sendResponse(sock, 200, "OK", "application/json", json.str());
+}
+
+bool HttpServer::isProvisioningConfigPath(const std::string& path)
+{
+	static const std::string prefix = "/config/";
+	static const std::string suffix = ".cfg";
+	if (path.size() != prefix.size() + 12 + suffix.size()) return false;
+	if (path.compare(0, prefix.size(), prefix) != 0) return false;
+	if (path.compare(path.size() - suffix.size(), suffix.size(), suffix) != 0) return false;
+	for (std::size_t i = prefix.size(); i < prefix.size() + 12; ++i)
+	{
+		char c = path[i];
+		bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+		if (!hex) return false;
+	}
+	return true;
+}
+
+void HttpServer::sendConfigCfg(int sock, const std::string& mac)
+{
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	auto info = handler ? handler->findProvisioningInfo(mac) : std::nullopt;
+	if (!info)
+	{
+		send404(sock);
+		return;
+	}
+
+	// Same IP resolution as sendApiStatus; SIP port is hardcoded 5060 there
+	// too (this codebase doesn't support running the SIP listener on a
+	// non-default port).
+	std::string activeIp = (_ip == "0.0.0.0") ? getPrimaryLocalIP() : _ip;
+	std::string cfg = provisioning::yealinkConfigFor(info->extension, activeIp, 5060,
+		info->authRequired);
+	sendResponse(sock, 200, "OK", "text/plain", cfg);
 }
 
 void HttpServer::sendApiDnd(int sock, const std::string& body)

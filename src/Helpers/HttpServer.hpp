@@ -95,6 +95,17 @@ private:
 	// Issue #32: the same capture ring as JSON, for the dashboard's polling live
 	// tracer. Session-gated by the caller, same as sendApiPcap.
 	void sendApiTrace(int sock);
+
+	// Issue #35: true iff `path` has the shape "/config/<12 lowercase hex>.cfg"
+	// — a phone's zero-touch auto-provisioning fetch. Pure string-shape check;
+	// doesn't touch the registry (sendConfigCfg does that).
+	static bool isProvisioningConfigPath(const std::string& path);
+	// Serves the Yealink auto-provisioning config for an adopted device's MAC
+	// (already validated by isProvisioningConfigPath). 404 if the MAC isn't in
+	// the adopted-device registry — same response whether it's a genuinely
+	// unknown MAC or one that just isn't provisioned yet, so a prober can't
+	// tell the difference.
+	void sendConfigCfg(int sock, const std::string& mac);
 	// Phase 2: set per-extension Do Not Disturb. Mutating (same-origin + auth gated).
 	void sendApiDnd(int sock, const std::string& body);
 	// Class A sweep: set per-extension call forwarding (always/busy/noanswer) and

@@ -2255,6 +2255,22 @@ std::vector<PcapCapture::TraceRecord> RequestsHandler::getTraceRecords()
 	return _pcapCapture.traceRecords();
 }
 
+std::optional<RequestsHandler::ProvisioningInfo> RequestsHandler::findProvisioningInfo(
+	const std::string& mac)
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	for (const auto& d : _registrar.adoptedDevices())
+	{
+		if (d.mac == mac)
+		{
+			const bool authRequired = (d.state == Registrar::DeviceState::Secured) ||
+				(_registrar.getMode() == Registrar::Mode::Secure);
+			return ProvisioningInfo{d.extension, authRequired};
+		}
+	}
+	return std::nullopt;
+}
+
 void RequestsHandler::setDnd(const std::string& extension, bool on)
 {
 	std::vector<std::pair<bool, std::string>> localLogs;
