@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased (tracker-followups) - 2026-08-04
+
+A pass through the open issue tracker: small hardening/perf fixes, docs
+catch-up, and a few feature requests, each on its own commit.
+
+### Fixed
+
+- Raised `CONFIG_LWIP_UDP_RECVMBOX_SIZE` (6 → 32) and set
+  `CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=32` in `sdkconfig.defaults` to absorb
+  bursts of simultaneous SIP packets from one source, which previously
+  overran the lwIP receive mailbox and were dropped before the SIP task ever
+  saw them (Issue #78, `tests/load/STRESS_FINDINGS.md` finding #1). The
+  RAM-constrained profile keeps its own smaller value.
+
 ## Unreleased (sip-decomposition-followups) - 2026-08-03
 
 Review follow-ups on the SIP engine decomposition. Host-verified (145/145
