@@ -3,12 +3,9 @@
 This document provides the formal API specification for the HTTP control interface of the **pocket-dial** firmware. The API handles status reporting, client management, and Wi-Fi onboarding.
 
 > [!NOTE]
-> **Partial catalog.** The detailed endpoint specs below (§4–§5) cover the original
-> status/kill/Wi-Fi surface. Endpoints added since — `/api/cdr`, `/api/dnd`,
-> `/api/forward`, `/api/group`, `/api/factory-reset`, `/api/configuring`,
-> `/api/ota/status`, `/api/ota/reboot`, and the admin session endpoints summarized
-> in §0 below — are not yet fully specified here (tracked in ISSUES.md). Source of
-> truth: `src/Helpers/HttpServer.cpp` (`handleClient()` dispatch).
+> The admin session endpoints (`/api/admin/*`) are specified in §0 above, not
+> repeated in the §4 catalog below. Source of truth for every route:
+> `src/Helpers/HttpServer.cpp` (`handleClient()` dispatch).
 
 ---
 
@@ -110,10 +107,19 @@ When booting into onboarding mode, the device intercepts client browser check do
 | :--- | :---: | :---: | :---: | :--- |
 | [`/`](#get-) | `GET` | Low | None | Serves the web dashboard HTML interface. |
 | [`/api/status`](#get-apistatus) | `GET` | Low | None | Retrieves registrar uptime, packet statistics, active extensions, and ongoing sessions. |
-| [`/api/kill`](#post-apikill) | `POST` | High | Same-Origin | Forcefully disconnects and de-registers an active SIP extension. |
+| [`/api/kill`](#post-apikill) | `POST` | High | Same-Origin (+session once provisioned) | Forcefully disconnects and de-registers an active SIP extension. |
+| [`/api/cdr`](#get-apicdr) | `GET` | Low | None | Returns the in-memory Call Detail Record ring (most recent calls, newest first). |
+| [`/api/dnd`](#post-apidnd) | `POST` | High | Same-Origin (+session once provisioned) | Sets or clears Do-Not-Disturb on an extension. |
+| [`/api/forward`](#post-apiforward) | `POST` | High | Same-Origin (+session once provisioned) | Configures call forwarding (`always`/`busy`/`noanswer`) for an extension. |
+| [`/api/group`](#post-apigroup) | `POST` | High | Same-Origin (+session once provisioned) | Creates, updates, or deletes a ring/hunt group. |
 | [`/api/wifi/scan`](#get-apiwifiscan) | `GET` | Low | None | Triggers a scan of nearby Wi-Fi APs and returns their SSIDs and signal strengths. |
-| [`/api/wifi/connect`](#post-apiwificonnect) | `POST` | High | Same-Origin | Saves Wi-Fi credentials to NVS and schedules an ESP32 system reboot into Station Mode. |
-| [`/api/wifi/mode_ap`](#post-apiwifimode_ap) | `POST` | High | Same-Origin | Sets the device to Standalone Access Point Mode and schedules a system reboot. |
+| [`/api/wifi/connect`](#post-apiwificonnect) | `POST` | High | Same-Origin (+session once provisioned) | Saves Wi-Fi credentials to NVS and schedules an ESP32 system reboot into Station Mode. |
+| [`/api/wifi/mode_ap`](#post-apiwifimode_ap) | `POST` | High | Same-Origin (+session once provisioned) | Sets the device to Standalone Access Point Mode and schedules a system reboot. |
+| [`/api/configuring`](#post-apiconfiguring) | `POST` | Low | None | Pauses the captive-portal auto-switch-to-Standalone decay while a user is mid-setup. |
+| [`/api/factory-reset`](#post-apifactory-reset) | `POST` | High | Same-Origin (+session once provisioned) | Wipes the admin credential and Wi-Fi/mode NVS state, then reboots to captive-portal setup. ESP-only (`501` on desktop). |
+| [`/api/ota/status`](#get-apiotastatus) | `GET` | Low | None | Reports the running/boot/next OTA partition labels and pending-verify flag. |
+| [`/api/ota/upload`](#post-apiotaupload) | `POST` | High | Same-Origin (+session once provisioned) | Streams a firmware image into the inactive OTA slot. ESP-only (`501` on desktop). |
+| [`/api/ota/reboot`](#post-apiotareboot) | `POST` | High | Same-Origin (+session once provisioned) | Reboots into the freshly staged OTA image. Simulated (`200`, no-op) on desktop. |
 
 ---
 
@@ -189,6 +195,7 @@ Returns a detailed JSON object representing the active state of the SIP registra
 Disconnects a specified VoIP station, removing its registration and terminating any active calls involving its extension.
 
 * **Requires Same-Origin Check**: Yes
+* **Requires `pd_session` cookie**: Once the device is provisioned (see §0)
 * **Request Content-Type**: `application/x-www-form-urlencoded`
 * **Request Parameters**:
   * `extension` (Required): The registration extension number to disconnect.
@@ -196,6 +203,7 @@ Disconnects a specified VoIP station, removing its registration and terminating 
 * **Response Status Codes**:
   * `200 OK`: Target extension disconnected.
   * `400 Bad Request`: Parameter `extension` is missing or empty.
+  * `401 Unauthorized`: Device is provisioned and the request carries no valid session.
   * `403 Forbidden`: Same-Origin verification failed.
 
 #### Request Example (Form URL-Encoded)
@@ -262,6 +270,7 @@ Triggers an immediate background Wi-Fi network scan. On ESP32, this temporarily 
 Configures the device to operate in **Wi-Fi Station Mode**, saving the SSID and password to flash, and triggers a system reboot.
 
 * **Requires Same-Origin Check**: Yes
+* **Requires `pd_session` cookie**: Once the device is provisioned (see §0)
 * **Request Content-Type**: `application/x-www-form-urlencoded`
 * **Request Parameters**:
   * `ssid` (Required): SSID of the target network.
@@ -270,6 +279,7 @@ Configures the device to operate in **Wi-Fi Station Mode**, saving the SSID and 
 * **Response Status Codes**:
   * `200 OK`: Credentials stored, reboot scheduled.
   * `400 Bad Request`: Parameter `ssid` is missing.
+  * `401 Unauthorized`: Device is provisioned and the request carries no valid session.
   * `403 Forbidden`: Same-Origin verification failed.
 
 #### Request Example
@@ -297,10 +307,12 @@ ssid=My-Home-WiFi&password=secure123
 Sets the operational mode of the device back to **Standalone Access Point Mode** (`esp32-sipserver`), saving settings to NVS flash, and triggers a system reboot.
 
 * **Requires Same-Origin Check**: Yes
+* **Requires `pd_session` cookie**: Once the device is provisioned (see §0)
 * **Request Headers**: None
 * **Response Content-Type**: `application/json`
 * **Response Status Codes**:
   * `200 OK`: Storage committed, reboot scheduled.
+  * `401 Unauthorized`: Device is provisioned and the request carries no valid session.
   * `403 Forbidden`: Same-Origin verification failed.
 
 #### Response Example (200 OK)
@@ -308,5 +320,258 @@ Sets the operational mode of the device back to **Standalone Access Point Mode**
 {
   "status": "ok",
   "message": "Operational mode set to Standalone AP. Rebooting..."
+}
+```
+
+---
+
+### `GET /api/cdr`
+Returns the in-memory Call Detail Record ring (most recent calls first). Read-only, ungated — same reachability posture as `/api/status`.
+
+* **Request Headers**: None
+* **Response Content-Type**: `application/json`
+* **Response Status Codes**:
+  * `200 OK`
+* **Response Payload JSON Example**:
+```json
+[
+  {
+    "caller": "1001",
+    "callee": "1002",
+    "startMs": 1723180800000,
+    "ageSec": 42,
+    "duration": 37,
+    "result": "completed"
+  }
+]
+```
+
+#### Field Schema Definitions
+
+| Field Name | Type | Description |
+| :--- | :---: | :--- |
+| `caller` | String | Extension that initiated the call. |
+| `callee` | String | Target extension. |
+| `startMs` | Integer | Call start time on the server's steady-clock basis (not wall-clock; no RTC is guaranteed on-device). |
+| `ageSec` | Integer | Seconds since the call started, derived from the same steady-clock basis as `startMs`. |
+| `duration` | Integer | Call length in seconds. |
+| `result` | String | Outcome of the call (e.g. `"completed"`). |
+
+---
+
+### `POST /api/dnd`
+Sets or clears Do-Not-Disturb on a registered extension.
+
+* **Requires Same-Origin Check**: Yes
+* **Requires `pd_session` cookie**: Once the device is provisioned (see §0)
+* **Request Content-Type**: `application/x-www-form-urlencoded`
+* **Request Parameters**:
+  * `extension` (Required): The extension to set DND on. Must not be `777` (echo) or `999` (broadcast) — DND cannot be applied to the virtual extensions.
+  * `on` (Optional): `1`, `true`, or `on` enables DND; anything else (including omitted or `0`) disables it.
+* **Response Content-Type**: `application/json`
+* **Response Status Codes**:
+  * `200 OK`
+  * `400 Bad Request`: `extension` is missing, or is `777`/`999`.
+  * `401 Unauthorized` / `403 Forbidden`: as above.
+
+#### Response Example (200 OK)
+```json
+{
+  "status": "ok",
+  "extension": "1001",
+  "dnd": true
+}
+```
+
+---
+
+### `POST /api/forward`
+Configures call forwarding for an extension.
+
+* **Requires Same-Origin Check**: Yes
+* **Requires `pd_session` cookie**: Once the device is provisioned (see §0)
+* **Request Content-Type**: `application/x-www-form-urlencoded`
+* **Request Parameters**:
+  * `extension` (Required): The extension to configure. Must not be `777` or `999`.
+  * `trigger` (Required): One of `always`, `busy`, `noanswer`.
+  * `target` (Optional): The extension to forward to. Empty clears the rule for that trigger.
+* **Response Content-Type**: `application/json`
+* **Response Status Codes**:
+  * `200 OK`
+  * `400 Bad Request`: `extension` or `trigger` missing, `trigger` not one of the three values, or `extension` is `777`/`999`.
+  * `401 Unauthorized` / `403 Forbidden`: as above.
+
+#### Response Example (200 OK)
+```json
+{
+  "status": "ok",
+  "extension": "1001",
+  "trigger": "busy",
+  "target": "1002"
+}
+```
+
+---
+
+### `POST /api/group`
+Creates, updates, or deletes a ring/hunt group.
+
+* **Requires Same-Origin Check**: Yes
+* **Requires `pd_session` cookie**: Once the device is provisioned (see §0)
+* **Request Content-Type**: `application/x-www-form-urlencoded`
+* **Request Parameters**:
+  * `extension` (Required): The group's own extension number. Must not be `777` or `999`.
+  * `members` (Optional): Comma/space-separated member extensions. An empty list deletes the group.
+  * `mode` (Optional): `ringall` (default) or `hunt`.
+* **Response Content-Type**: `application/json`
+* **Response Status Codes**:
+  * `200 OK`
+  * `400 Bad Request`: `extension` missing, `extension` is `777`/`999`, or `mode` is not `ringall`/`hunt`.
+  * `401 Unauthorized` / `403 Forbidden`: as above.
+
+#### Response Example (200 OK)
+```json
+{
+  "status": "ok",
+  "extension": "700",
+  "mode": "ringall",
+  "members": "1001,1002,1003"
+}
+```
+
+---
+
+### `POST /api/configuring`
+Tells the device a user is actively working through setup, pausing the captive-portal watchdog that would otherwise auto-switch the device back to Standalone AP mode. No same-origin gate — the action is harmless (it only extends a grace window, and cannot mutate credentials or network state).
+
+* **Request Headers**: None
+* **Response Content-Type**: `application/json`
+* **Response Status Codes**:
+  * `200 OK`
+
+#### Response Example (200 OK)
+```json
+{
+  "status": "ok",
+  "message": "Setup mode held — auto-switch to Standalone paused."
+}
+```
+
+---
+
+### `POST /api/factory-reset`
+Clears the admin PIN/session store and Wi-Fi/mode NVS state, returning the device to its unprovisioned captive-portal state, then reboots. **ESP-only** — returns `501` on the desktop build (no NVS to erase, and the process must keep running for the test harness).
+
+* **Requires Same-Origin Check**: Yes
+* **Requires `pd_session` cookie**: Once the device is provisioned (see §0)
+* **Request Content-Type**: `application/x-www-form-urlencoded`
+* **Request Parameters**:
+  * `confirm` (Required): Must be the literal string `ERASE`. Guards against an accidental/stray POST wiping the device.
+* **Response Content-Type**: `application/json`
+* **Response Status Codes**:
+  * `200 OK` (ESP32): Credential and NVS state cleared, reboot scheduled.
+  * `400 Bad Request`: `confirm` is missing or not `ERASE`.
+  * `401 Unauthorized` / `403 Forbidden`: as above.
+  * `501 Not Implemented` (desktop): Factory reset is not available off-device.
+
+#### Response Example (200 OK, ESP32)
+```json
+{
+  "status": "ok",
+  "message": "Factory reset. Rebooting to captive-portal setup..."
+}
+```
+
+---
+
+### `GET /api/ota/status`
+Read-only OTA introspection — which partition is running/booting/staged next, and whether the currently running image is still pending its post-update validation. No secrets, so it is reachable pre-auth like `/api/status`.
+
+* **Request Headers**: None
+* **Response Content-Type**: `application/json`
+* **Response Status Codes**:
+  * `200 OK`
+* **Response Payload JSON Example**:
+```json
+{
+  "running": "ota_0",
+  "boot": "ota_0",
+  "next": "ota_1",
+  "pendingVerify": false,
+  "otaSupported": true,
+  "error": ""
+}
+```
+
+#### Field Schema Definitions
+
+| Field Name | Type | Description |
+| :--- | :---: | :--- |
+| `running` | String | Partition label of the image currently executing. |
+| `boot` | String | Partition label the bootloader will boot next. |
+| `next` | String | Partition label a new OTA upload would target. |
+| `pendingVerify` | Boolean | `true` if the running image has not yet called `markValid()` (anti-rollback window; see `docs/OTA.md`). |
+| `otaSupported` | Boolean | `false` on the desktop build (no ESP32 partition table). |
+| `error` | String | Reserved for a future error surface; currently always `""`. |
+
+---
+
+### `POST /api/ota/upload`
+Streams a firmware image body directly into the inactive OTA slot. **Not routed through the normal 16 KB-buffered body path** — a firmware image is multi-megabyte, so `handleClient()` detects this path on the request line and hands off to a streaming reader before the usual `Content-Length` cap is applied. **ESP-only.**
+
+* **Requires Same-Origin Check**: Yes
+* **Requires `pd_session` cookie**: Once the device is provisioned (see §0)
+* **Request Content-Type**: raw firmware binary (no particular `Content-Type` is enforced)
+* **Request Headers**:
+  * `Content-Length` (Required): Non-zero. Parsed without the normal 16 KB cap, clamped to a 32 MB ceiling (larger than any 16 MB flash layout the firmware supports) to bound the work the server will do for a malformed value.
+* **Response Content-Type**: `application/json`
+* **Response Status Codes**:
+  * `200 OK` (ESP32): Image staged into the inactive slot; reboot required to run it.
+  * `400 Bad Request`: Body was incomplete or a flash write failed mid-stream.
+  * `401 Unauthorized` / `403 Forbidden`: as above.
+  * `411 Length Required`: `Content-Length` missing or `0`.
+  * `422 Unprocessable Entity`: The image was fully received but failed validation (e.g. bad magic byte / signature).
+  * `500 Internal Server Error`: OTA slot could not be opened, or activation failed after a valid image was written.
+  * `501 Not Implemented` (desktop): OTA is not available off-device. The body is still drained so the client's upload completes cleanly rather than being reset mid-stream.
+
+#### Response Example (200 OK, ESP32)
+```json
+{
+  "status": "ok",
+  "bytes": 1548032,
+  "rebootRequired": true,
+  "nextPartition": "ota_1",
+  "message": "image staged; POST /api/ota/reboot to boot it"
+}
+```
+
+---
+
+### `POST /api/ota/reboot`
+Reboots into the image staged by a prior `/api/ota/upload`. **ESP32**: refuses if there is no pending image (the boot and running partitions already match). **Desktop**: always returns a simulated success without exiting the process, so the smoke-test harness keeps running.
+
+* **Requires Same-Origin Check**: Yes
+* **Requires `pd_session` cookie**: Once the device is provisioned (see §0)
+* **Request Headers**: None
+* **Response Content-Type**: `application/json`
+* **Response Status Codes**:
+  * `200 OK`: Reboot scheduled (ESP32) or simulated (desktop).
+  * `401 Unauthorized` / `403 Forbidden`: as above.
+  * `409 Conflict` (ESP32): No pending OTA image to boot into.
+
+#### Response Example (200 OK, ESP32)
+```json
+{
+  "status": "ok",
+  "message": "rebooting into the new image..."
+}
+```
+
+#### Response Example (200 OK, desktop)
+```json
+{
+  "status": "ok",
+  "simulated": true,
+  "message": "reboot is a no-op on the desktop build"
 }
 ```

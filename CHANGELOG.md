@@ -14,6 +14,16 @@ catch-up, and a few feature requests, each on its own commit.
   saw them (Issue #78, `tests/load/STRESS_FINDINGS.md` finding #1). The
   RAM-constrained profile keeps its own smaller value.
 
+### Docs
+
+- `docs/API.md` §4 now specifies `/api/cdr`, `/api/dnd`, `/api/forward`,
+  `/api/group`, `/api/configuring`, `/api/factory-reset`, `/api/ota/status`,
+  `/api/ota/upload`, and `/api/ota/reboot` — request/response schemas, status
+  codes, and auth requirements, sourced from `HttpServer::handleClient()`'s
+  dispatch table. Also added the missing `401`/session notes to `/api/kill`
+  and the two Wi-Fi mutation endpoints, which gained the session gate after
+  their original specs were written (Issue #94).
+
 ## Unreleased (sip-decomposition-followups) - 2026-08-03
 
 Review follow-ups on the SIP engine decomposition. Host-verified (145/145
