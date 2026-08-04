@@ -14,6 +14,16 @@ catch-up, and a few feature requests, each on its own commit.
   saw them (Issue #78, `tests/load/STRESS_FINDINGS.md` finding #1). The
   RAM-constrained profile keeps its own smaller value.
 
+- `RegisterBeeper`: `sweep()` no longer frees a beep dialog's slot in the same
+  pass it sends the CANCEL. RFC 3261 §9.1 lets the phone's 200 OK race an
+  in-flight CANCEL past the point the CANCEL had any effect; freeing
+  immediately meant that raced answer was unrecognized (a beep dialog has no
+  `Session`) and never got ACKed or BYEd. The dialog now moves to
+  `AwaitingCancelDone` — a state the enum already declared but nothing ever
+  entered — for a bounded 5 s window in which `handleOk()` still matches it,
+  then frees on either a raced answer being handled or the window elapsing
+  with nothing further (Issue #98).
+
 ### Docs
 
 - `docs/API.md` §4 now specifies `/api/cdr`, `/api/dnd`, `/api/forward`,

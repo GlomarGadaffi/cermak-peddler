@@ -113,9 +113,16 @@ bool RegisterBeeper::handleOk(const std::shared_ptr<SipMessage>& data)
 	}
 
 	std::string cseq(data->getCSeq());
-	if (bd->state == BeepState::AwaitingInviteOk &&
+	// AwaitingCancelDone included: RFC 3261 §9.1 lets the phone's 200 OK race an
+	// in-flight CANCEL past the point the CANCEL had any effect. When that
+	// happens the call was genuinely answered, so ACK+BYE it exactly as the
+	// no-race path does — matching only AwaitingInviteOk here would let this OK
+	// fall through unrecognized (a beep dialog has no Session) and leave it
+	// neither ACKed nor BYEd.
+	if ((bd->state == BeepState::AwaitingInviteOk || bd->state == BeepState::AwaitingCancelDone) &&
 		cseq.find(SipMessageTypes::INVITE) != std::string::npos)
 	{
+		const bool racedCancel = (bd->state == BeepState::AwaitingCancelDone);
 		auto ack = buildAck(*bd, data);
 		if (ack) _env.enqueue(bd->addr, std::move(ack));
 		auto bye = buildBye(*bd, data);
@@ -124,21 +131,26 @@ bool RegisterBeeper::handleOk(const std::shared_ptr<SipMessage>& data)
 		// Re-arm the deadline so a phone that never 200s our BYE still frees its
 		// slot from sweep() rather than lingering until the original INVITE timeout.
 		bd->deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-		_env.log("Register beep: answered by " + bd->ext + ", ACK+BYE sent");
+		_env.log("Register beep: " + bd->ext + (racedCancel
+			? " answered after our CANCEL had already gone out — ACK+BYE sent"
+			: ", ACK+BYE sent"));
 	}
 	else if (cseq.find(SipMessageTypes::BYE) != std::string::npos)
 	{
 		*bd = BeepDialog{};   // BYE acknowledged: dialog fully torn down, free slot
 	}
+	// Anything else with a matching Call-ID (e.g. the 200 OK to our own CANCEL)
+	// is absorbed here without action — still "ours", just nothing to do — so it
+	// falls through neither ACKed/BYEd nor to a session lookup that would never
+	// find one.
 	return true;
 }
 
 void RegisterBeeper::sweep(std::chrono::steady_clock::time_point now)
 {
 	// Any beep dialog whose deadline has passed without the phone answering
-	// (AwaitingInviteOk) is CANCELled and freed — no retransmit storm, no leak. A
-	// dialog still awaiting the 200-to-BYE just frees its slot (the BYE was
-	// already sent best-effort).
+	// (AwaitingInviteOk) gets a CANCEL. A dialog still awaiting the 200-to-BYE, or
+	// one whose CANCEL fallback window (below) has expired, just frees its slot.
 	for (std::size_t i = 0; i < _dialogs.size(); ++i)
 	{
 		auto& bd = _dialogs[i];
@@ -148,11 +160,25 @@ void RegisterBeeper::sweep(std::chrono::steady_clock::time_point now)
 		}
 		if (bd.state == BeepState::AwaitingInviteOk)
 		{
+			// Send the CANCEL, but do NOT free the slot yet. RFC 3261 §9.1: the UAS
+			// may have already sent its 200 OK before processing this CANCEL, in
+			// which case the CANCEL has no effect and the call was genuinely
+			// answered. Keep matching this Call-ID for a bounded window so
+			// handleOk() can still catch that race (see AwaitingCancelDone there);
+			// freeing immediately is what let a raced 200 OK go unACKed/unBYEd,
+			// with sweep() then CANCELling an INVITE that already had a final
+			// response five seconds later. The dialog's own 487 (if the CANCEL
+			// really did land in time) is routed to onReqTerminated, not here — it
+			// has no Session to key off, so we just fall through to the same
+			// bounded fallback below rather than acting on it there too.
 			auto cancel = buildCancel(i);
 			if (cancel) _env.enqueue(bd.addr, std::move(cancel));
 			_env.log("Register beep: no answer from " + bd.ext + ", cancelled");
+			bd.state    = BeepState::AwaitingCancelDone;
+			bd.deadline = now + std::chrono::seconds(5);
+			continue;
 		}
-		bd = BeepDialog{};   // free the slot
+		bd = BeepDialog{};   // AwaitingByeOk / AwaitingCancelDone fallback: free the slot
 	}
 }
 

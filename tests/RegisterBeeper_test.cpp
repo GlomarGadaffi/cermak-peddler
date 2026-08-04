@@ -86,3 +86,60 @@ TEST(RegisterBeeper, ForeignOkIsNotConsumed)
 	EXPECT_FALSE(beeper.handleOk(okFor("not-a-beep-dialog@192.168.1.50", phoneAddr)));
 	EXPECT_TRUE(env.sent.empty());
 }
+
+// Issue #98: RFC 3261 §9.1 lets a phone's 200 OK race an in-flight CANCEL past
+// the point the CANCEL had any effect. sweep() must not free the slot the
+// instant it sends the CANCEL, or that raced OK is unrecognized (a beep dialog
+// has no Session) and never gets ACKed/BYEd.
+TEST(RegisterBeeper, LateOkAfterSweepCancelStillGetsAckedAndByed)
+{
+	FakePbxEnv env;
+	RegisterBeeper beeper(env);
+
+	const sockaddr_in phoneAddr = FakePbxEnv::addr("192.168.1.50", 5060);
+	const auto t0 = std::chrono::steady_clock::now();
+	beeper.sendBeep(std::make_shared<SipClient>("101", phoneAddr));
+	ASSERT_EQ(env.sent.size(), 1u);
+	const std::string callId = callIdOf(env.sentRaw(0));
+	ASSERT_FALSE(callId.empty());
+
+	// No answer within the beep deadline: sweep() sends CANCEL.
+	beeper.sweep(t0 + std::chrono::seconds(6));
+	ASSERT_EQ(env.sent.size(), 2u);
+	EXPECT_EQ(env.sentRaw(1).rfind("CANCEL sip:", 0), 0u) << env.sentRaw(1);
+
+	// The phone's 200 OK to the original INVITE was already in flight and lands
+	// right after — the race the CANCEL cannot prevent. It must still be ACKed
+	// and BYEd, not silently dropped.
+	EXPECT_TRUE(beeper.handleOk(okFor(callId, phoneAddr)));
+	ASSERT_EQ(env.sent.size(), 4u);   // + ACK, + (BYE delegated to serverBye)
+
+	const std::string ack = env.sentRaw(2);
+	EXPECT_EQ(ack.rfind("ACK sip:101@", 0), 0u) << ack;
+	EXPECT_NE(ack.find("tag=phonetag"), std::string::npos) << ack;
+	EXPECT_NE(ack.find("Call-ID: " + callId + "\r\n"), std::string::npos) << ack;
+
+	ASSERT_EQ(env.byeCalls.size(), 1u);
+	EXPECT_EQ(env.byeCalls[0].callId, callId);
+}
+
+// If nothing further ever arrives after the CANCEL (the CANCEL landed cleanly,
+// or the response was simply lost), the slot must still be freed by the bounded
+// fallback rather than lingering forever.
+TEST(RegisterBeeper, SlotFreedByFallbackWhenNoResponseFollowsTheCancel)
+{
+	FakePbxEnv env;
+	RegisterBeeper beeper(env);
+
+	const sockaddr_in phoneAddr = FakePbxEnv::addr("192.168.1.50", 5060);
+	const auto t0 = std::chrono::steady_clock::now();
+	beeper.sendBeep(std::make_shared<SipClient>("101", phoneAddr));
+	const std::string callId = callIdOf(env.sentRaw(0));
+
+	beeper.sweep(t0 + std::chrono::seconds(6));    // sends CANCEL, arms the fallback
+	beeper.sweep(t0 + std::chrono::seconds(12));   // fallback window elapses: slot freed
+
+	// The slot is free again: a late/foreign OK for this now-stale Call-ID is no
+	// longer recognized as ours.
+	EXPECT_FALSE(beeper.handleOk(okFor(callId, phoneAddr)));
+}
