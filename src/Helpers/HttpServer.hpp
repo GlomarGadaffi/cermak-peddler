@@ -92,6 +92,9 @@ private:
 	// dispatch entry) — unlike /api/cdr, this carries full message bytes
 	// (Contact URIs, User-Agent, Authorization digests), not just call metadata.
 	void sendApiPcap(int sock);
+	// Issue #32: the same capture ring as JSON, for the dashboard's polling live
+	// tracer. Session-gated by the caller, same as sendApiPcap.
+	void sendApiTrace(int sock);
 	// Phase 2: set per-extension Do Not Disturb. Mutating (same-origin + auth gated).
 	void sendApiDnd(int sock, const std::string& body);
 	// Class A sweep: set per-extension call forwarding (always/busy/noanswer) and

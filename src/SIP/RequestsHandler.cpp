@@ -2249,6 +2249,12 @@ std::string RequestsHandler::getPcapCapture()
 	return _pcapCapture.toPcapFile(_localIp, static_cast<uint16_t>(_serverPort));
 }
 
+std::vector<PcapCapture::TraceRecord> RequestsHandler::getTraceRecords()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _pcapCapture.traceRecords();
+}
+
 void RequestsHandler::setDnd(const std::string& extension, bool on)
 {
 	std::vector<std::pair<bool, std::string>> localLogs;

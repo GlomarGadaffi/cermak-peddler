@@ -110,6 +110,7 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/kill`](#post-apikill) | `POST` | High | Same-Origin (+session once provisioned) | Forcefully disconnects and de-registers an active SIP extension. |
 | [`/api/cdr`](#get-apicdr) | `GET` | Low | None | Returns the in-memory Call Detail Record ring (most recent calls, newest first). |
 | [`/api/pcap`](#get-apipcap) | `GET` | Medium | Session once provisioned | Downloads the last `POCKETDIAL_PCAP_RING_SIZE` SIP signaling packets as a `.pcap` (Wireshark-readable). |
+| [`/api/trace`](#get-apitrace) | `GET` | Medium | Session once provisioned | The same capture ring as JSON, for the dashboard's polling live SIP tracer. |
 | [`/api/dnd`](#post-apidnd) | `POST` | High | Same-Origin (+session once provisioned) | Sets or clears Do-Not-Disturb on an extension. |
 | [`/api/forward`](#post-apiforward) | `POST` | High | Same-Origin (+session once provisioned) | Configures call forwarding (`always`/`busy`/`noanswer`) for an extension. |
 | [`/api/group`](#post-apigroup) | `POST` | High | Same-Origin (+session once provisioned) | Creates, updates, or deletes a ring/hunt group. |
@@ -374,6 +375,40 @@ Only packets that pass structural validation and the per-source-IP rate limiter 
 * **Response Status Codes**:
   * `200 OK`: Always — an empty/never-populated ring still returns a valid (headers-only) `.pcap`.
   * `401 Unauthorized`: Device is provisioned and the request carries no valid session.
+
+---
+
+### `GET /api/trace`
+Returns the same capture ring as `/api/pcap`, as JSON, for the dashboard's live SIP tracer panel. Returns the **whole current ring on every call** rather than an incremental "since" delta — the ring is small (`POCKETDIAL_PCAP_RING_SIZE`, default 64) and this is meant to be polled every second or two on a LAN, so re-sending it is cheap and the server doesn't need to track any per-client polling state. The client filters to `seq` values it hasn't already rendered.
+
+* **Requires `pd_session` cookie**: Once the device is provisioned (see §0). Same sensitivity/gate as `/api/pcap` — it's the same underlying data.
+* **Request Headers**: None
+* **Response Content-Type**: `application/json`
+* **Response Status Codes**:
+  * `200 OK`
+  * `401 Unauthorized`: Device is provisioned and the request carries no valid session.
+* **Response Payload JSON Example**:
+```json
+[
+  {
+    "seq": 42,
+    "tsUs": 1723180800123456,
+    "dir": "in",
+    "peer": "192.168.1.50:5060",
+    "text": "INVITE sip:101@192.168.4.1 SIP/2.0\r\n..."
+  }
+]
+```
+
+#### Field Schema Definitions
+
+| Field Name | Type | Description |
+| :--- | :---: | :--- |
+| `seq` | Integer | Monotonic capture sequence number, never reused (even across ring eviction) — use it as a client-side high-water mark. |
+| `tsUs` | Integer | Capture time in microseconds on the server's monotonic clock (not wall-clock; no RTC is guaranteed on the device). |
+| `dir` | String | `"in"` for a packet the server received, `"out"` for one it sent. |
+| `peer` | String | The other party's `"ip:port"`. |
+| `text` | String | The raw SIP message bytes, exactly as captured. |
 
 ---
 

@@ -35,6 +35,9 @@
 #include <deque>
 #include <string>
 #include <string_view>
+#include <vector>
+
+#include "SipWireUtil.hpp"
 
 // Number of recent SIP packets retained for /api/pcap. Each entry costs
 // roughly the size of the SIP message it captured (a few hundred bytes to
@@ -60,11 +63,35 @@ public:
 		{
 			_entries.pop_front();
 		}
-		_entries.push_back(Entry{outbound, peer, std::string(bytes), monotonicUs()});
+		_entries.push_back(Entry{_nextSeq++, outbound, peer, std::string(bytes), monotonicUs()});
 	}
 
 	std::size_t size() const { return _entries.size(); }
 	void clear() { _entries.clear(); }
+
+	// Issue #32: current ring contents formatted for the dashboard's live SIP
+	// tracer, which polls GET /api/trace and appends whatever it hasn't already
+	// shown (`seq` is monotonic and never reused, so the client can track a
+	// high-water mark instead of the server tracking per-client state).
+	struct TraceRecord
+	{
+		uint64_t    seq;
+		uint64_t    tsUs;
+		bool        outbound;
+		std::string peer;   // "ip:port", via sipwire::addrToIpPort
+		std::string text;
+	};
+	std::vector<TraceRecord> traceRecords() const
+	{
+		std::vector<TraceRecord> out;
+		out.reserve(_entries.size());
+		for (const auto& e : _entries)
+		{
+			out.push_back(TraceRecord{e.seq, e.tsUs, e.outbound,
+				sipwire::addrToIpPort(e.peer), e.bytes});
+		}
+		return out;
+	}
 
 	// Serialize the ring into a classic libpcap file (24-byte global header +
 	// one 16-byte record header + synthesized frame per captured packet).
@@ -104,12 +131,16 @@ public:
 private:
 	struct Entry
 	{
+		uint64_t    seq;
 		bool        outbound;
 		sockaddr_in peer;
 		std::string bytes;
 		uint64_t    tsUs;
 	};
 	std::deque<Entry> _entries;
+	// Monotonic, never reused (even across evictions) so a client's high-water
+	// mark from traceRecords() stays meaningful after older entries roll off.
+	uint64_t _nextSeq = 0;
 
 	static uint64_t monotonicUs()
 	{

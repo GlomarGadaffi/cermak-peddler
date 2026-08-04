@@ -86,6 +86,10 @@ public:
 	// handle()/drainOutbox(), both already under it).
 	std::string getPcapCapture();
 
+	// Issue #32: the same capture ring, structured for the dashboard's polling
+	// live tracer (GET /api/trace) instead of serialized to a .pcap file.
+	std::vector<PcapCapture::TraceRecord> getTraceRecords();
+
 	// Do Not Disturb (DND): set/query a per-extension flag. setDnd is the mutating
 	// path behind POST /api/dnd (thread-safe; takes _mutex). getDndExtensions
 	// returns the set of extensions currently in DND from the dashboard snapshot

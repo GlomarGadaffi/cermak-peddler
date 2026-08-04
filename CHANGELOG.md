@@ -50,6 +50,20 @@ catch-up, and a few feature requests, each on its own commit.
   (no same-origin check — it's a download, not a mutation). New
   `src/SIP/PcapCapture.hpp` (host-tested ring + serializer).
 
+- `GET /api/trace` + a "SIP Trace" dashboard panel (Issue #32): a live-ish SIP
+  signaling tracer for the web dashboard, reusing `#33`'s capture ring rather
+  than adding a second one. The tracker/roadmap framed this as a WebSocket
+  push stream, but the HTTP server has no WebSocket support today (RFC 6455
+  framing, the Sec-WebSocket-Accept handshake, frame masking — none of it
+  exists), so building that from scratch felt like too large and too
+  security-adjacent an addition for a tracker sweep. Implemented as polling
+  instead: the dashboard's toggle starts a 1.5 s poll of `/api/trace` (JSON,
+  the same ring as `/api/pcap`, monotonic `seq` per entry) and appends
+  whatever it hasn't already rendered, capped client-side at 200 blocks so a
+  long-running session doesn't grow the DOM without bound. Verified end to
+  end: built and ran the real server, drove real SIP traffic at it, and
+  checked the rendered dashboard in a real (Playwright) browser.
+
 ### Docs
 
 - `docs/API.md` §4 now specifies `/api/cdr`, `/api/dnd`, `/api/forward`,

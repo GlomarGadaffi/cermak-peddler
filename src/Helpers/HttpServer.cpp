@@ -471,6 +471,19 @@ void HttpServer::handleClient(int clientSock)
 			sendApiPcap(clientSock);
 		}
 	}
+	else if (req.method == "GET" && req.path == "/api/trace")
+	{
+		// Same sensitivity/gate as /api/pcap — this is the same capture ring.
+		if (AdminAuth::isProvisioned() && !isAuthed(req))
+		{
+			sendResponse(clientSock, 401, "Unauthorized", "application/json",
+			             "{\"error\":\"authentication required\"}");
+		}
+		else
+		{
+			sendApiTrace(clientSock);
+		}
+	}
 	else if (req.method == "POST" && req.path == "/api/dnd")
 	{
 		// Mutating: same gate as /api/kill (same-origin + auth once provisioned).
@@ -991,6 +1004,36 @@ void HttpServer::sendApiPcap(int sock)
 	// cross-site page from riding the admin's session to reach this at all.
 	sendResponseWithHeader(sock, 200, "OK", "application/vnd.tcpdump.pcap", pcap,
 		"Content-Disposition: attachment; filename=\"pocket-dial.pcap\"");
+}
+
+void HttpServer::sendApiTrace(int sock)
+{
+	std::vector<PcapCapture::TraceRecord> records;
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		records = handler->getTraceRecords();
+	}
+
+	// Whole current ring every poll, not "since N": the ring is small
+	// (POCKETDIAL_PCAP_RING_SIZE, default 64) and this is a LAN debugging
+	// aid polled every second or two, so re-sending it is cheap — and it
+	// avoids the server needing to track any per-client polling state. The
+	// dashboard filters to unseen `seq` values client-side.
+	std::ostringstream json;
+	json << "[";
+	for (std::size_t i = 0; i < records.size(); ++i)
+	{
+		if (i > 0) json << ",";
+		const auto& r = records[i];
+		json << "{\"seq\":" << r.seq << ","
+		     << "\"tsUs\":" << r.tsUs << ","
+		     << "\"dir\":\"" << (r.outbound ? "out" : "in") << "\","
+		     << "\"peer\":\"" << jsonEscape(r.peer) << "\","
+		     << "\"text\":\"" << jsonEscape(r.text) << "\"}";
+	}
+	json << "]";
+
+	sendResponse(sock, 200, "OK", "application/json", json.str());
 }
 
 void HttpServer::sendApiDnd(int sock, const std::string& body)

@@ -111,6 +111,50 @@ TEST(PcapCapture, ClearEmptiesTheRing)
 	EXPECT_EQ(cap.toPcapFile("192.168.1.10", 5060).size(), 24u);
 }
 
+// ── traceRecords() (GET /api/trace's data source, Issue #32) ───────────────────
+
+TEST(PcapCapture, TraceRecordsReflectSeqDirectionPeerAndText)
+{
+	PcapCapture cap;
+	const sockaddr_in inPeer  = addr("192.168.1.50", 5060);
+	const sockaddr_in outPeer = addr("192.168.1.51", 5061);
+
+	cap.record(false, inPeer,  "REGISTER sip:server SIP/2.0");
+	cap.record(true,  outPeer, "SIP/2.0 200 OK");
+
+	auto recs = cap.traceRecords();
+	ASSERT_EQ(recs.size(), 2u);
+
+	EXPECT_EQ(recs[0].seq, 0u);
+	EXPECT_FALSE(recs[0].outbound);
+	EXPECT_EQ(recs[0].peer, "192.168.1.50:5060");
+	EXPECT_EQ(recs[0].text, "REGISTER sip:server SIP/2.0");
+
+	EXPECT_EQ(recs[1].seq, 1u);
+	EXPECT_TRUE(recs[1].outbound);
+	EXPECT_EQ(recs[1].peer, "192.168.1.51:5061");
+	EXPECT_EQ(recs[1].text, "SIP/2.0 200 OK");
+}
+
+TEST(PcapCapture, TraceRecordSeqStaysMonotonicAcrossEviction)
+{
+	PcapCapture cap;
+	const sockaddr_in peer = addr("192.168.1.50", 5060);
+	const unsigned total = static_cast<unsigned>(POCKETDIAL_PCAP_RING_SIZE) + 3;
+	for (unsigned i = 0; i < total; ++i)
+	{
+		cap.record(false, peer, "pkt");
+	}
+	auto recs = cap.traceRecords();
+	ASSERT_EQ(recs.size(), static_cast<std::size_t>(POCKETDIAL_PCAP_RING_SIZE));
+	// The oldest surviving entry is the 4th packet sent (index 3, 0-based) —
+	// its seq must reflect that it's the 4th ever recorded, not the 1st of
+	// what's currently in the ring, so a client's high-water mark stays valid
+	// after entries roll off rather than seeing seq "restart".
+	EXPECT_EQ(recs.front().seq, 3u);
+	EXPECT_EQ(recs.back().seq, total - 1);
+}
+
 // ── RequestsHandler wiring (GET /api/pcap's actual data source) ────────────────
 
 TEST(PcapCapture, RequestsHandlerCapturesBothDirectionsOfARealPacket)
@@ -142,4 +186,29 @@ TEST(PcapCapture, RequestsHandlerCapturesBothDirectionsOfARealPacket)
 	// of which. This deliberately doesn't assert which status: that's the
 	// registrar's admission policy, not this ring buffer's concern.
 	EXPECT_NE(file.find("SIP/2.0 "), std::string::npos) << "outbound response must be captured";
+}
+
+TEST(PcapCapture, RequestsHandlerGetTraceRecordsMirrorsGetPcapCapture)
+{
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	EXPECT_TRUE(handler.getTraceRecords().empty());
+
+	const sockaddr_in src = addr("192.168.4.50", 5060);
+	const std::string raw =
+		"REGISTER sip:server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.4.50:5060;branch=z9hG4bKr2\r\n"
+		"From: <sip:102@server>;tag=rt2\r\n"
+		"To: <sip:102@server>\r\n"
+		"Call-ID: pcap-test-2\r\n"
+		"CSeq: 1 REGISTER\r\n"
+		"Contact: <sip:102@192.168.4.50:5060>;expires=3600\r\n"
+		"Content-Length: 0\r\n\r\n";
+	handler.handle(RequestsHandler::getMessageFromPool(raw, src));
+
+	auto recs = handler.getTraceRecords();
+	ASSERT_GE(recs.size(), 1u);
+	EXPECT_FALSE(recs[0].outbound);
+	EXPECT_EQ(recs[0].peer, "192.168.4.50:5060");
+	EXPECT_NE(recs[0].text.find("REGISTER sip:server"), std::string::npos);
 }
