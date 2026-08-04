@@ -2,7 +2,7 @@
 
 ## Unreleased (sip-decomposition-followups) - 2026-08-03
 
-Review follow-ups on the SIP engine decomposition. Host-verified (142/142
+Review follow-ups on the SIP engine decomposition. Host-verified (145/145
 GoogleTest, up from 131 — the park, register-beep and BLF machines had no host
 coverage at all, which is how the wire defects below survived a green suite).
 
