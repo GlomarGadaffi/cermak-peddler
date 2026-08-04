@@ -41,6 +41,12 @@ public:
 		_handler.store(h, std::memory_order_release);
 	}
 
+	// Issue #35: true iff `path` has the shape "/config/<12 lowercase hex>.cfg"
+	// — a phone's zero-touch auto-provisioning fetch. Pure string-shape check;
+	// doesn't touch the registry (sendConfigCfg does that). Public/static so
+	// it's host-testable on its own (see tests/ProvisioningConfig_test.cpp).
+	static bool isProvisioningConfigPath(const std::string& path);
+
 private:
 	// PLAN_ADMIN_HTTP_ONLY.md Phase 2: idempotent socket lifecycle, called only
 	// from this class's own thread (the constructor, before acceptLoop starts;
@@ -96,10 +102,6 @@ private:
 	// tracer. Session-gated by the caller, same as sendApiPcap.
 	void sendApiTrace(int sock);
 
-	// Issue #35: true iff `path` has the shape "/config/<12 lowercase hex>.cfg"
-	// — a phone's zero-touch auto-provisioning fetch. Pure string-shape check;
-	// doesn't touch the registry (sendConfigCfg does that).
-	static bool isProvisioningConfigPath(const std::string& path);
 	// Serves the Yealink auto-provisioning config for an adopted device's MAC
 	// (already validated by isProvisioningConfigPath). 404 if the MAC isn't in
 	// the adopted-device registry — same response whether it's a genuinely
