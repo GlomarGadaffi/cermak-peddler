@@ -29,6 +29,7 @@
 #include "SipClient.hpp"
 #include "Session.hpp"
 #include "CallDetailRecord.hpp"
+#include "PcapCapture.hpp"
 #include "PbxConfig.hpp"
 #include "RtpSender.hpp"
 #include "PbxEnv.hpp"
@@ -78,6 +79,28 @@ public:
 	// Call Detail Records (CDR): a thread-safe snapshot of the recent-call ring,
 	// newest first. Copied out under _snapshotMutex like the client/session views.
 	std::vector<CallDetailRecord> getCallDetailRecords();
+
+	// Issue #33: a classic libpcap file of the last POCKETDIAL_PCAP_RING_SIZE SIP
+	// signaling packets (both directions), ready to write straight to a .pcap and
+	// open in Wireshark. Takes _mutex (the capture ring is populated from inside
+	// handle()/drainOutbox(), both already under it).
+	std::string getPcapCapture();
+
+	// Issue #32: the same capture ring, structured for the dashboard's polling
+	// live tracer (GET /api/trace) instead of serialized to a .pcap file.
+	std::vector<PcapCapture::TraceRecord> getTraceRecords();
+
+	// Issue #35: zero-touch phone provisioning. Looks `mac` up in the adopted-
+	// device registry; `authRequired` tells the caller whether this device
+	// needs a SIP password on the wire (Secure mode, or an individually
+	// Registrar::secure()'d device) — see ProvisioningConfig.hpp for why the
+	// server can never supply that password itself.
+	struct ProvisioningInfo
+	{
+		std::string extension;
+		bool authRequired;
+	};
+	std::optional<ProvisioningInfo> findProvisioningInfo(const std::string& mac);
 
 	// Do Not Disturb (DND): set/query a per-extension flag. setDnd is the mutating
 	// path behind POST /api/dnd (thread-safe; takes _mutex). getDndExtensions
@@ -501,6 +524,10 @@ private:
 	size_t _cdrHead = 0;
 	size_t _cdrCount = 0;
 
+	// Issue #33: /api/pcap ring. Populated from handle() (inbound) and
+	// drainOutbox() (outbound), both already under _mutex.
+	PcapCapture _pcapCapture;
+
 	// DND state, keyed by extension. Bounded by the client-pool depth: an entry is
 	// only created when DND is turned ON, and turning it OFF erases the entry, so
 	// the map can never hold more than POCKETDIAL_MAX_CLIENTS live extensions.
@@ -605,9 +632,17 @@ private:
 		std::string digits;          // accumulated digit string
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 		TickType_t  lastTick{0};     // xTaskGetTickCount() of last digit
+		TickType_t  starCodeFiredAtTick{0};
 #else
 		uint32_t    lastTick{0};     // monotonic ms counter on host
+		uint32_t    starCodeFiredAtTick{0};
 #endif
+		// Set when the *4887 HTTP-open star-code just matched for this dialog
+		// (0 = not pending). The star-code clears `digits` the instant the
+		// sequence equals "*4887", which can land before the admin finishes
+		// dialing *PIN#code if their PIN happens to begin with those four
+		// digits — see the Issue #93 detection in onDtmfInfo(). Cleared on the
+		// next digit (one warning per incident) or on the normal DTMF timeout.
 		static constexpr uint32_t TIMEOUT_MS = 5000;
 	};
 	std::unordered_map<std::string, DtmfAccum> _dtmfState;

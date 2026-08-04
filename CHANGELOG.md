@@ -1,5 +1,116 @@
 # Changelog
 
+## Unreleased (tracker-followups) - 2026-08-04
+
+A pass through the open issue tracker: small hardening/perf fixes, docs
+catch-up, and a few feature requests, each on its own commit.
+
+### Fixed
+
+- Raised `CONFIG_LWIP_UDP_RECVMBOX_SIZE` (6 → 32) and set
+  `CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=32` in `sdkconfig.defaults` to absorb
+  bursts of simultaneous SIP packets from one source, which previously
+  overran the lwIP receive mailbox and were dropped before the SIP task ever
+  saw them (Issue #78, `tests/load/STRESS_FINDINGS.md` finding #1). The
+  RAM-constrained profile keeps its own smaller value.
+
+- `RegisterBeeper`: `sweep()` no longer frees a beep dialog's slot in the same
+  pass it sends the CANCEL. RFC 3261 §9.1 lets the phone's 200 OK race an
+  in-flight CANCEL past the point the CANCEL had any effect; freeing
+  immediately meant that raced answer was unrecognized (a beep dialog has no
+  `Session`) and never got ACKed or BYEd. The dialog now moves to
+  `AwaitingCancelDone` — a state the enum already declared but nothing ever
+  entered — for a bounded 5 s window in which `handleOk()` still matches it,
+  then frees on either a raced answer being handled or the window elapsing
+  with nothing further (Issue #98).
+
+- `onDtmfInfo`: best-effort behavioral detection for a `4887`-prefixed admin
+  PIN provisioned before `POST /api/admin/set-pin` started rejecting that
+  prefix (Issue #93). The `*4887` HTTP-open star-code matches the instant the
+  accumulated sequence equals it — before the `*PIN#code` parser runs — so a
+  PIN beginning `4887` is shadowed and can never complete over DTMF. If the
+  star-code fires and the admin's next digits then shape up as an interrupted
+  `*PIN#code` continuation (`#` + 3+ digits, no leading `*`), a targeted
+  warning is logged suggesting a PIN rotation. Imperfect by construction — the
+  PIN is salted+hashed, so this can only be inferred behaviorally, never
+  confirmed. See `docs/THREAT_MODEL.md` §5.5 for the residual-risk writeup.
+
+### Added
+
+- `GET /api/pcap` (Issue #33): downloads the last `POCKETDIAL_PCAP_RING_SIZE`
+  (default 64) SIP signaling packets as a classic libpcap file, ready to open
+  in Wireshark. Both directions are captured through the two choke points
+  every packet already passes through — `handle()` for inbound,
+  `drainOutbox()` for outbound — so no call site needed to remember to
+  record anything. RTP/media is out of scope by construction: pocket-dial
+  brokers it peer-to-peer and never relays it, so there's nothing server-side
+  to capture. Each entry is synthesized into a minimal Ethernet+IPv4+UDP
+  frame (dummy MACs, real IP:port) around the exact captured bytes so
+  Wireshark's SIP dissector decodes it like a real capture. Session-gated
+  (no same-origin check — it's a download, not a mutation). New
+  `src/SIP/PcapCapture.hpp` (host-tested ring + serializer).
+
+- `GET /api/trace` + a "SIP Trace" dashboard panel (Issue #32): a live-ish SIP
+  signaling tracer for the web dashboard, reusing `#33`'s capture ring rather
+  than adding a second one. The tracker/roadmap framed this as a WebSocket
+  push stream, but the HTTP server has no WebSocket support today (RFC 6455
+  framing, the Sec-WebSocket-Accept handshake, frame masking — none of it
+  exists), so building that from scratch felt like too large and too
+  security-adjacent an addition for a tracker sweep. Implemented as polling
+  instead: the dashboard's toggle starts a 1.5 s poll of `/api/trace` (JSON,
+  the same ring as `/api/pcap`, monotonic `seq` per entry) and appends
+  whatever it hasn't already rendered, capped client-side at 200 blocks so a
+  long-running session doesn't grow the DOM without bound. Verified end to
+  end: built and ran the real server, drove real SIP traffic at it, and
+  checked the rendered dashboard in a real (Playwright) browser.
+
+- `GET /config/<mac>.cfg` (Issue #35): zero-touch Yealink auto-provisioning
+  for already-adopted devices — point a phone's provisioning URL at
+  `/config/` and it gets its account/server/codec settings back with no
+  manual entry. Covers **re**-provisioning (factory reset, handset swap)
+  rather than a device's very first contact, since a MAC has to already be
+  in the Registrar's adopted-device registry (Learn/Secure mode) to be
+  served — the first-ever REGISTER is what gets it adopted, and still needs
+  the phone told its extension by some other means. Never carries a working
+  password: `SipSecretStore` only stores a one-way HA1 hash, so a
+  Secure-mode (or individually `secure()`'d) device's config flags that the
+  admin has to set the password by hand instead of silently omitting it.
+  Deliberately not session-gated (a booting phone has no session cookie) —
+  the MAC itself (2^48 space, only served if already adopted) plus the
+  existing dark-by-default transport gate are the protection. New
+  `src/SIP/ProvisioningConfig.hpp` (pure, host-tested config builder). Not
+  verified against physical Yealink hardware.
+
+- Linux desktop build now sources real RTP media for extension 440 (Issue
+  #82's concrete named gap: `RtpSender`'s `#else` branch was a no-op stub on
+  every non-ESP platform, so 440 connected but produced no audio on Linux).
+  New `#elif defined(__linux__)` path mirrors the ESP implementation
+  one-for-one (`std::thread` + `sleep_until` pacing in place of the FreeRTOS
+  task + `vTaskDelayUntil`), with one deliberate divergence: `stop()` joins
+  the sender thread synchronously rather than the ESP path's fire-and-forget
+  poll, since the existing host test suite (`Rtp_test.cpp`) requires
+  `isActive()` to be false the instant `stop()` returns, and `std::thread`
+  has no equivalent to poll instead. Bounded to one 20ms pacing tick, and
+  only on the 440 diagnostic-tone teardown path — real calls' RTP is
+  peer-to-peer and never touches `RtpSender`. Verified against the actual
+  built binary: real RTP packets at the correct cadence, clean teardown with
+  zero packets after BYE, no deadlock between `stop()`'s join and the
+  sender thread's own cleanup lock. The ARMv7 musl cross-compile toolchain
+  file this issue also asked for already landed in a prior commit
+  (`cmake/armv7-linux-musleabihf.cmake`); the rayhunter Orbic installer
+  integration and actual ARM hardware verification remain out of scope
+  here (different repo / no hardware in this session).
+
+### Docs
+
+- `docs/API.md` §4 now specifies `/api/cdr`, `/api/dnd`, `/api/forward`,
+  `/api/group`, `/api/configuring`, `/api/factory-reset`, `/api/ota/status`,
+  `/api/ota/upload`, and `/api/ota/reboot` — request/response schemas, status
+  codes, and auth requirements, sourced from `HttpServer::handleClient()`'s
+  dispatch table. Also added the missing `401`/session notes to `/api/kill`
+  and the two Wi-Fi mutation endpoints, which gained the session gate after
+  their original specs were written (Issue #94).
+
 ## Unreleased (sip-decomposition-followups) - 2026-08-03
 
 Review follow-ups on the SIP engine decomposition. Host-verified (145/145

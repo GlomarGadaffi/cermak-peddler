@@ -95,6 +95,12 @@ Both STA-mode issues are resolved (commit `b04ecac`):
 | Echo call (777) | 5/5 (100%) | 13.3 ms | 19.9 ms | 21 ms |
 
 `/api/status`: 150 ms; `/api/cdr`: 17 ms; full dashboard `/`: ~6 s (84 KB, one-time).
-Server counters: 21 clients registered, packetsDropped ~2. Still recommend raising
-`CONFIG_LWIP_UDP_RECVMBOX_SIZE` for higher single-source burst tolerance, and testing
-from multiple IPs to find the true concurrency ceiling.
+Server counters: 21 clients registered, packetsDropped ~2. Still recommend testing
+from multiple IPs to find the true concurrency ceiling (Issue #79).
+
+### Update — finding #1 FIXED (Issue #78)
+
+`CONFIG_LWIP_UDP_RECVMBOX_SIZE` raised 6 → 32 in `sdkconfig.defaults`
+(`CONFIG_LWIP_TCPIP_RECVMBOX_SIZE` also set to 32). Not yet re-verified against
+a live burst re-run on hardware — that re-run (`sip_stress.py --clients 30`
+unpaced, confirming a materially higher success rate) is still open.

@@ -226,6 +226,18 @@ input:focus,select:focus{border-color:var(--brass);box-shadow:0 0 0 2px rgba(198
 .recon{display:none;color:var(--amber);font-size:11px;font-family:var(--mono)}
 .recon.show{display:inline}
 
+/* live SIP tracer (Issue #32) */
+.trace-screen{
+  height:260px;overflow-y:auto;background:#08070a;border:1px solid var(--line-hi);border-radius:4px;
+  padding:8px 10px;font-family:var(--mono);font-size:11px;line-height:1.5;color:var(--green);
+  white-space:pre-wrap;word-break:break-all;
+}
+.trace-screen .trc-hdr{color:var(--brass);}
+.trace-screen .trc-hdr.out{color:var(--amber);}
+.trace-screen .trc-empty{color:var(--ink-dim);font-family:var(--sans)}
+.trace-screen .trc-pkt{margin-bottom:8px;padding-bottom:8px;border-bottom:1px dashed var(--line)}
+.trace-screen .trc-pkt:last-child{border-bottom:none;margin-bottom:0}
+
 @media (max-width:720px){
   .grid2{grid-template-columns:1fr}
   #jacks{grid-template-columns:repeat(auto-fill,minmax(70px,1fr));gap:8px}
@@ -321,6 +333,18 @@ R"html1(    <div class="stat"><span class="k">Jacks</span><span class="v" id="s-
         <thead><tr><th>Caller</th><th></th><th>Callee</th><th>Result</th><th>Duration</th><th>Age</th></tr></thead>
         <tbody id="cdr-tbody"><tr class="empty-row"><td colspan="6">No calls recorded yet</td></tr></tbody>
       </table>
+    </div>
+  </section>
+
+  <!-- ══ LIVE SIP TRACE ══ -->
+  <section class="card">
+    <h2>&#9737; SIP Trace <span class="badge" id="trace-count">off</span></h2>
+    <div class="body">
+      <div class="row" style="justify-content:space-between;margin-bottom:8px">
+        <label class="toggle"><input type="checkbox" id="trace-toggle" onchange="toggleTrace()"><span class="track"><span class="knob"></span></span></label>
+        <span class="note" style="margin:0">Polls the recent-signaling ring while on. Downloadable as a full .pcap via <a href="/api/pcap">/api/pcap</a>.</span>
+      </div>
+      <div class="trace-screen" id="trace-screen"><div class="trc-empty">Trace is off.</div></div>
     </div>
   </section>
 
@@ -662,6 +686,50 @@ function renderCdr(records){
 }
 function fmtDur(s){s=Math.floor(s||0);var m=Math.floor(s/60),sec=s%60;return m+":"+(sec<10?"0":"")+sec;}
 function fmtAge(s){s=Math.floor(s||0);if(s<60)return s+"s ago";if(s<3600)return Math.floor(s/60)+"m ago";return Math.floor(s/3600)+"h ago";}
+
+/* ── live SIP trace (Issue #32): polls /api/trace while the toggle is on ── */
+var traceOn=false,traceTimer=null,traceSeen={};
+function toggleTrace(){
+  if($("trace-toggle").checked&&!gateCheck()){$("trace-toggle").checked=false;return;}
+  traceOn=$("trace-toggle").checked;
+  if(traceOn){
+    traceSeen={};$("trace-screen").innerHTML="";$("trace-count").textContent="0 shown";
+    pollTrace();traceTimer=setInterval(pollTrace,1500);
+  }else{
+    stopTrace();
+  }
+}
+function stopTrace(){
+  traceOn=false;$("trace-toggle").checked=false;
+  if(traceTimer){clearInterval(traceTimer);traceTimer=null;}
+  $("trace-count").textContent="off";
+  $("trace-screen").innerHTML='<div class="trc-empty">Trace is off.</div>';
+}
+function pollTrace(){
+  fetch("/api/trace",{credentials:"same-origin"}).then(function(r){
+    if(r.status===401){handleAuthExpired();stopTrace();throw new Error("session expired");}
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    return r.json();
+  }).then(renderTraceAppend).catch(function(){});
+}
+function renderTraceAppend(records){
+  var screen=$("trace-screen");var added=0;
+  (records||[]).forEach(function(r){
+    if(traceSeen[r.seq])return;
+    traceSeen[r.seq]=true;added++;
+    var div=document.createElement("div");div.className="trc-pkt";
+    var out=r.dir==="out";
+    div.innerHTML='<div class="trc-hdr'+(out?" out":"")+'">'+(out?"&#8594; OUT &rarr; ":"&#8592; IN &larr; ")
+      +esc(r.peer)+' &middot; #'+r.seq+'</div>'+esc(r.text);
+    screen.appendChild(div);
+  });
+  // Cap rendered blocks client-side (independent of the server's ring cap) so a
+  // long-running trace session doesn't grow the DOM without bound.
+  while(screen.children.length>200){screen.removeChild(screen.children[0]);}
+  if(added>0)screen.scrollTop=screen.scrollHeight;
+  var shown=screen.querySelectorAll(".trc-pkt").length;
+  $("trace-count").textContent=shown+" shown";
+}
 
 /* ── networking ── */
 function post(url,body){

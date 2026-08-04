@@ -8,6 +8,13 @@
 #include <sys/socket.h>
 #include "esp_log.h"
 #include "esp_random.h"
+#elif defined(__linux__)
+#include <unistd.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <chrono>
+#include <cstdlib>
+#include <iostream>
 #else
 #include <cstdlib>   // std::rand on host (only for SSRC/seq seeding in stubbed start)
 #endif
@@ -376,6 +383,189 @@ void RtpSender::runLoop()
 		_active.store(false, std::memory_order_release);
 	}
 	ESP_LOGI("RtpSender", "Media stream stopped");
+}
+
+#elif defined(__linux__)
+// ─────────────────────────────────────────────────────────────────────────────
+//  Linux desktop: real UDP socket + 20 ms std::thread pacing (Issue #82)
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool RtpSender::start(const std::string& destIp, uint16_t destPort, const std::string& callID, FrameProvider provider)
+{
+	std::lock_guard<std::mutex> lock(_slotMutex);
+
+	if (_active.load(std::memory_order_acquire))
+	{
+		return false;
+	}
+
+	sockaddr_in dest{};
+	dest.sin_family = AF_INET;
+	dest.sin_port   = htons(destPort);
+	if (inet_pton(AF_INET, destIp.c_str(), &dest.sin_addr) != 1)
+	{
+		std::cerr << "[RtpSender] Bad destination IP '" << destIp << "'" << std::endl;
+		return false;
+	}
+
+	int sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sock < 0)
+	{
+		std::cerr << "[RtpSender] socket() failed" << std::endl;
+		return false;
+	}
+
+	// Bind the dedicated server media port so the source port is deterministic
+	// and matches the SDP we advertised (mirrors the ESP path).
+	sockaddr_in local{};
+	local.sin_family      = AF_INET;
+	local.sin_addr.s_addr = htonl(INADDR_ANY);
+	local.sin_port        = htons(static_cast<uint16_t>(_serverRtpPort));
+	if (bind(sock, reinterpret_cast<sockaddr*>(&local), sizeof(local)) < 0)
+	{
+		// Non-fatal: an ephemeral source port still delivers media to the caller.
+		std::cerr << "[RtpSender] bind(" << _serverRtpPort
+			<< ") failed; using ephemeral source port" << std::endl;
+	}
+
+	_sock     = sock;
+	_dest     = dest;
+	_callID   = callID;
+	_provider = provider;
+	_stopRequested.store(false, std::memory_order_release);
+	_active.store(true, std::memory_order_release);
+
+	_senderThread = std::thread(&RtpSender::runLoop, this);
+	return true;
+}
+
+bool RtpSender::stop(const std::string& callID)
+{
+	{
+		std::lock_guard<std::mutex> lock(_slotMutex);
+		if (!_active.load(std::memory_order_acquire))
+		{
+			return false;
+		}
+		if (!callID.empty() && callID != _callID)
+		{
+			return false;
+		}
+		_stopRequested.store(true, std::memory_order_release);
+	}
+	// Joined OUTSIDE _slotMutex, unlike the ESP path (which deliberately never
+	// blocks, so the SIP _mutex is never held for a task's cadence — see that
+	// branch's own comment). std::thread has no equivalent to ESP's external
+	// _taskRunning poll to fire-and-forget against, and the desktop build's
+	// existing host tests require isActive() to already be false the instant
+	// stop() returns (Rtp_test.cpp: SingleStreamCap, and the BYE-then-redial
+	// case in EndToEnd440InviteEmitsServerSdpAnswer) — so this joins
+	// synchronously instead. That does mean a caller holding RequestsHandler's
+	// _mutex across a 440 teardown blocks for up to one pacing tick (20 ms)
+	// while runLoop() notices _stopRequested and exits — bounded, and only on
+	// the 440 diagnostic-tone path (real calls' RTP is peer-to-peer and never
+	// touches RtpSender), not the old ESP bug's unbounded-up-to-500ms stall on
+	// the mainline signaling path this was originally fixed for.
+	//
+	// Cleanup (closing the socket, clearing _sock/_callID/_active) happens at
+	// the bottom of runLoop(), under _slotMutex — NOT here, and NOT while this
+	// function still holds it, or runLoop()'s own lock_guard there would
+	// deadlock against this join().
+	if (_senderThread.joinable())
+	{
+		_senderThread.join();
+	}
+	return true;
+}
+
+void RtpSender::runLoop()
+{
+	// Snapshot the immutable per-stream socket + destination ONCE under the
+	// lock, same reasoning as the ESP path: they're written only in start()
+	// before this thread exists and never mutated for the stream's life.
+	int           sock;
+	sockaddr_in   dest;
+	FrameProvider provider;
+	{
+		std::lock_guard<std::mutex> lock(_slotMutex);
+		sock     = _sock;
+		dest     = _dest;
+		provider = _provider;
+	}
+
+	uint16_t seq        = static_cast<uint16_t>(rand32());
+	uint32_t timestamp  = rand32();
+	const uint32_t ssrc = rand32();
+	double   phase      = 0.0;
+	bool     firstPkt   = true;
+
+	// One fixed packet buffer reused every 20 ms — no per-packet heap.
+	uint8_t packet[RtpSender::PACKET_BYTES];
+
+	const auto period = std::chrono::milliseconds(RtpSender::PTIME_MS);
+	auto nextWake = std::chrono::steady_clock::now() + period;
+
+	while (!_stopRequested.load(std::memory_order_acquire))
+	{
+		buildRtpHeader(packet, /*marker=*/firstPkt, RtpSender::PAYLOAD_TYPE_PCMU,
+			seq, timestamp, ssrc);
+
+		bool hasAudio = false;
+		if (provider)
+		{
+			hasAudio = provider(packet + RtpSender::RTP_HEADER_BYTES, RtpSender::SAMPLES_PER_PKT);
+		}
+
+		if (!hasAudio)
+		{
+			if (provider)
+			{
+				// A provider is attached but had nothing this frame — silence,
+				// not the test tone (mirrors the ESP path).
+				std::memset(packet + RtpSender::RTP_HEADER_BYTES, 0xFF, RtpSender::SAMPLES_PER_PKT);
+			}
+			else
+			{
+				synthTone(packet + RtpSender::RTP_HEADER_BYTES, RtpSender::SAMPLES_PER_PKT,
+					static_cast<double>(RtpSender::DEFAULT_TONE_HZ), phase);
+			}
+		}
+
+		if (sock >= 0)
+		{
+			sendto(sock, packet, sizeof(packet), 0,
+				reinterpret_cast<sockaddr*>(&dest), sizeof(dest));
+		}
+
+		firstPkt   = false;
+		++seq;
+		timestamp += RtpSender::SAMPLES_PER_PKT;
+
+		// Pace at exactly 20 ms; sleep_until (not sleep_for) compensates for
+		// send jitter so the stream does not drift relative to the receiver's
+		// playout clock — same intent as the ESP path's vTaskDelayUntil.
+		std::this_thread::sleep_until(nextWake);
+		nextWake += period;
+	}
+
+	// This thread owns its socket: close the local fd and clear the shared
+	// slot so a new stream can start. stop() has already returned by the time
+	// any caller could observe this (it joins before returning), so there is
+	// no concurrent start() to race here.
+	{
+		std::lock_guard<std::mutex> lock(_slotMutex);
+		if (sock >= 0)
+		{
+			close(sock);
+		}
+		if (_sock == sock)
+		{
+			_sock = -1;
+		}
+		_callID.clear();
+		_provider = nullptr;
+		_active.store(false, std::memory_order_release);
+	}
 }
 
 #else   // ── Host stubs: keep the SDP-answer / cap logic testable, no real I/O ──

@@ -41,6 +41,12 @@ public:
 		_handler.store(h, std::memory_order_release);
 	}
 
+	// Issue #35: true iff `path` has the shape "/config/<12 lowercase hex>.cfg"
+	// — a phone's zero-touch auto-provisioning fetch. Pure string-shape check;
+	// doesn't touch the registry (sendConfigCfg does that). Public/static so
+	// it's host-testable on its own (see tests/ProvisioningConfig_test.cpp).
+	static bool isProvisioningConfigPath(const std::string& path);
+
 private:
 	// PLAN_ADMIN_HTTP_ONLY.md Phase 2: idempotent socket lifecycle, called only
 	// from this class's own thread (the constructor, before acceptLoop starts;
@@ -87,6 +93,21 @@ private:
 	void sendApiKill(int sock, const std::string& body);
 	// Phase 2: read-only Call Detail Records (newest first). Ungated like /api/status.
 	void sendApiCdr(int sock);
+	// Issue #33: downloads the last POCKETDIAL_PCAP_RING_SIZE SIP signaling
+	// packets as a .pcap. Session-gated by the caller in handleClient() (see the
+	// dispatch entry) — unlike /api/cdr, this carries full message bytes
+	// (Contact URIs, User-Agent, Authorization digests), not just call metadata.
+	void sendApiPcap(int sock);
+	// Issue #32: the same capture ring as JSON, for the dashboard's polling live
+	// tracer. Session-gated by the caller, same as sendApiPcap.
+	void sendApiTrace(int sock);
+
+	// Serves the Yealink auto-provisioning config for an adopted device's MAC
+	// (already validated by isProvisioningConfigPath). 404 if the MAC isn't in
+	// the adopted-device registry — same response whether it's a genuinely
+	// unknown MAC or one that just isn't provisioned yet, so a prober can't
+	// tell the difference.
+	void sendConfigCfg(int sock, const std::string& mac);
 	// Phase 2: set per-extension Do Not Disturb. Mutating (same-origin + auth gated).
 	void sendApiDnd(int sock, const std::string& body);
 	// Class A sweep: set per-extension call forwarding (always/busy/noanswer) and

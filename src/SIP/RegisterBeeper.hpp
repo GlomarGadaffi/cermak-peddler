@@ -21,12 +21,24 @@
 // it.
 //
 // State machine (per beep dialog):
-//   sendBeep()          : allocate a slot, send INVITE (auto-answer headers), arm
-//                         a deadline; if no slot free, skip the beep (it's cosmetic).
-//   handleOk() INVITE 200 : send ACK, then BYE, advance to AwaitingByeOk.
-//   handleOk() BYE 200    : free the slot.
-//   sweep() deadline    : if still AwaitingInviteOk, CANCEL and free; if
-//                         AwaitingByeOk, just free (best-effort BYE already sent).
+//   sendBeep()             : allocate a slot, send INVITE (auto-answer headers),
+//                            arm a deadline; if no slot free, skip the beep (it's
+//                            cosmetic).
+//   handleOk() INVITE 200  : send ACK, then BYE, advance to AwaitingByeOk. Matches
+//                            from AwaitingInviteOk OR AwaitingCancelDone — RFC 3261
+//                            §9.1 lets this 200 race an in-flight CANCEL, and a
+//                            raced answer still needs ACK+BYE.
+//   handleOk() BYE 200     : free the slot.
+//   sweep() deadline       : if AwaitingInviteOk, CANCEL and move to
+//                            AwaitingCancelDone (NOT freed yet — see above) with a
+//                            fresh bounded deadline. If AwaitingByeOk or
+//                            AwaitingCancelDone, just free (best-effort BYE already
+//                            sent, or the fallback window on a raced CANCEL expired
+//                            with no further response — the dialog's own 487, if
+//                            the CANCEL landed in time, is routed to
+//                            RequestsHandler::onReqTerminated, which has no
+//                            Session to key a beep dialog off; this fallback is
+//                            what actually frees the slot in that case).
 //
 // Locking: every method assumes the caller holds the engine's _mutex
 // (non-recursive), matching the RequestsHandler code this was extracted from.
@@ -43,12 +55,15 @@ public:
 	// true if the response was consumed (the caller must not process it further).
 	bool handleOk(const std::shared_ptr<SipMessage>& data);
 
-	// Time out overdue dialogs: CANCEL an unanswered INVITE, free the slot.
+	// Time out overdue dialogs: CANCEL an unanswered INVITE (see sweep()'s own
+	// comment for why the slot isn't freed immediately), free a slot whose
+	// bounded fallback window has expired either way.
 	void sweep(std::chrono::steady_clock::time_point now);
 
 private:
-	// AwaitingCancelDone: CANCEL sent, lingering until the 487 final response is
-	// ACKed (or a bounded deadline frees the slot). Added for #90.
+	// AwaitingCancelDone: CANCEL sent for an unanswered INVITE, lingering for a
+	// bounded window in case the phone's 200 OK raced the CANCEL (RFC 3261 §9.1) —
+	// handleOk() still matches this state so a raced answer gets ACKed+BYEd.
 	enum class BeepState { Free, AwaitingInviteOk, AwaitingByeOk, AwaitingCancelDone };
 	struct BeepDialog
 	{
