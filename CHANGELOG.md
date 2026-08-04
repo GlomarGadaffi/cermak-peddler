@@ -81,6 +81,26 @@ catch-up, and a few feature requests, each on its own commit.
   `src/SIP/ProvisioningConfig.hpp` (pure, host-tested config builder). Not
   verified against physical Yealink hardware.
 
+- Linux desktop build now sources real RTP media for extension 440 (Issue
+  #82's concrete named gap: `RtpSender`'s `#else` branch was a no-op stub on
+  every non-ESP platform, so 440 connected but produced no audio on Linux).
+  New `#elif defined(__linux__)` path mirrors the ESP implementation
+  one-for-one (`std::thread` + `sleep_until` pacing in place of the FreeRTOS
+  task + `vTaskDelayUntil`), with one deliberate divergence: `stop()` joins
+  the sender thread synchronously rather than the ESP path's fire-and-forget
+  poll, since the existing host test suite (`Rtp_test.cpp`) requires
+  `isActive()` to be false the instant `stop()` returns, and `std::thread`
+  has no equivalent to poll instead. Bounded to one 20ms pacing tick, and
+  only on the 440 diagnostic-tone teardown path — real calls' RTP is
+  peer-to-peer and never touches `RtpSender`. Verified against the actual
+  built binary: real RTP packets at the correct cadence, clean teardown with
+  zero packets after BYE, no deadlock between `stop()`'s join and the
+  sender thread's own cleanup lock. The ARMv7 musl cross-compile toolchain
+  file this issue also asked for already landed in a prior commit
+  (`cmake/armv7-linux-musleabihf.cmake`); the rayhunter Orbic installer
+  integration and actual ARM hardware verification remain out of scope
+  here (different repo / no hardware in this session).
+
 ### Docs
 
 - `docs/API.md` §4 now specifies `/api/cdr`, `/api/dnd`, `/api/forward`,

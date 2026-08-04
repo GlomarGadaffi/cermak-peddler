@@ -31,6 +31,7 @@
 #include "freertos/semphr.h"
 #elif defined(__linux__)
 #include <netinet/in.h>
+#include <thread>
 #elif defined _WIN32 || defined _WIN64
 #include <WinSock2.h>
 #endif
@@ -131,6 +132,19 @@ private:
 	std::atomic<bool> _stopRequested{false};
 	std::atomic<bool> _taskRunning{false};
 	sockaddr_in       _dest{};
+#elif defined(__linux__)
+	// Issue #82: real Linux media path (the ESP-only block above was the sole
+	// gap keeping pocket-dial's Linux desktop build signaling-only, per
+	// RtpSender's own class comment). Mirrors the ESP shape one-for-one:
+	// FreeRTOS task -> std::thread, vTaskDelayUntil -> sleep_until pacing. The
+	// one deliberate divergence is stop() joining synchronously instead of the
+	// ESP path's fire-and-forget _taskRunning poll — see stop()'s own comment
+	// in RtpSender.cpp for why, and the bounded cost of that choice.
+	void runLoop();
+	int          _sock = -1;
+	sockaddr_in  _dest{};
+	std::thread  _senderThread;
+	std::atomic<bool> _stopRequested{false};
 #endif
 
 	std::atomic<bool> _active{false};
