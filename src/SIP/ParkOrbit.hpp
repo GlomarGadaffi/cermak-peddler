@@ -53,6 +53,13 @@ public:
 	std::vector<std::tuple<std::string, std::string, std::string, int>>
 	snapshotRows(std::chrono::steady_clock::time_point now, bool onlyParked) const;
 
+	// True (and resets the flag) if an orbit slot changed since the last call —
+	// the cue to re-mirror snapshotRows() into the dashboard snapshot. Same
+	// contract as Registrar::consumeDevicesChange(), and polled from the same
+	// once-per-packet spot, so mirroring is no longer a duty each mutating call
+	// site has to remember: sweep() and freeForCallId() self-signal too.
+	bool consumeParkChanged();
+
 private:
 	enum class ParkState : uint8_t { Free, Parked, RingingBack, Retrieving };
 	struct ParkSlot
@@ -81,9 +88,14 @@ private:
 	void startRingback(ParkSlot& slot, const std::shared_ptr<SipClient>& parker,
 		std::chrono::steady_clock::time_point now);
 
+	// Release a slot back to Free and flag the dashboard mirror as stale. Every
+	// path that clears a slot goes through here so none can forget to signal.
+	void releaseSlot(ParkSlot& slot);
+
 	std::array<ParkSlot, POCKETDIAL_PARK_SLOTS> _slots;
 	std::chrono::seconds _timeout{POCKETDIAL_PARK_TIMEOUT_SEC};
 	std::vector<std::string> _pendingAcks;   // park re-INVITE ACKs pending
+	bool _parkChanged = false;               // slot state moved since the last mirror
 	PbxEnv& _env;
 };
 

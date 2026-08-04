@@ -53,7 +53,7 @@ private:
 
 	// Event-package parsing helper (pure / static / host-testable). Returns the
 	// canonical package name (e.g. "dialog") or "".
-	static std::string parseEventPackage(const std::string& raw);
+	static std::string parseEventPackage(std::string_view eventHeader);
 
 	// RFC 4235 dialog-info XML builder (pure).
 	static std::string buildDialogInfoXml(const std::string& entity, unsigned version,

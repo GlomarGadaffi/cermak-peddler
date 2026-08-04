@@ -461,6 +461,12 @@ std::string_view SipMessage::getAuthorization() const
 	return idx == std::string::npos ? std::string_view{} : std::string_view(_headerLines[idx]);
 }
 
+std::string_view SipMessage::getEvent() const
+{
+	size_t idx = findHeaderIndex("event", "o");
+	return idx == std::string::npos ? std::string_view{} : std::string_view(_headerLines[idx]);
+}
+
 std::string_view SipMessage::extractNumber(std::string_view header) const
 {
 	auto sipPos = header.find("sip:");

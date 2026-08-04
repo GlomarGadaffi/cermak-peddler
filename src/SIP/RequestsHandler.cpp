@@ -15,6 +15,7 @@
 #include "PbxConfig.hpp"
 #include "PbxPersist.hpp"
 #include "SipHeaderUtil.hpp"
+#include "SipWireUtil.hpp"
 #include "AdminAuth.hpp"
 #include "SipDigest.hpp"
 #include "SipSecretStore.hpp"
@@ -284,9 +285,14 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 		// Device-registry change detection: a REGISTER may have adopted a device,
 		// re-synced its extension, or flipped its online flag inside the Registrar
 		// machine — mirror the registry into the dashboard snapshot once per packet.
-		if (_registrar.consumeDevicesChanged())
+		applyDeviceChange(_registrar.consumeDevicesChange());
+
+		// Park-orbit change detection, same contract. Polling here (rather than
+		// making every mutating call site remember refreshParkSnapshot()) means a
+		// new park path cannot silently leave a stale row on the dashboard.
+		if (_park.consumeParkChanged())
 		{
-			refreshDeviceSnapshot();
+			refreshParkSnapshot();
 		}
 
 		// BLF change detection: one pass after every handled packet covers
@@ -294,14 +300,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 		// NOTIFYs land in _outbox and ride out with this pass (after unlock).
 		_blf.refresh();
 
-		// RFC 3261 §17: register any new outgoing INVITE in _outbox for retransmit.
-		// Scan after BLF NOTIFYs are added so the full outbox is covered; maybeTrack
-		// filters to INVITE requests only so NOTIFYs and responses are ignored.
-		for (const auto& [addr, msg] : _outbox)
-			_txLayer.maybeTrack(addr, msg);
-
-		localOutbox = std::move(_outbox);
-		_outbox.clear();
+		localOutbox = drainOutbox();
 
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
@@ -483,7 +482,6 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 	if (_park.orbitIndex(destNumber) >= 0)
 	{
 		endCall(data->getCallID(), data->getFromNumber(), destNumber);
-		refreshParkSnapshot();
 		return;
 	}
 
@@ -695,7 +693,6 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		if (orbitIdx >= 0)
 		{
 			_park.onInvite(data, caller.value(), orbitIdx);
-			refreshParkSnapshot();
 			return;
 		}
 	}
@@ -1252,16 +1249,13 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	// Park dialogs (server-originated re-INVITE ACKs + ring-back answers).
+	// Park dialogs (server-originated re-INVITE ACKs + ring-back answers). The
+	// snapshot mirror is driven by _park.consumeParkChanged() in handle(), so a
+	// state-neutral ACK confirmation no longer pays a rebuild.
 	if (_park.handleOk(data))
 	{
-		refreshParkSnapshot();
 		return;
 	}
-	// Attended-transfer re-INVITE ACKs.
-	if (handleTransferOk(data))
-		return;
-
 	auto session = getSession(data->getCallID());
 	if (session.has_value())
 	{
@@ -1774,9 +1768,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildReferNotify(const std::shared_
 	// RFC 3515 §2.4.5 NOTIFY: Event: refer + message/sipfrag body reporting the
 	// transfer result. Sent within the REFER's dialog back to the transferor.
 	std::string activeIp = _localIp;
-	char ipBuf[INET_ADDRSTRLEN]{};
-	inet_ntop(AF_INET, &transferor->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
-	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(transferor->getAddress().sin_port));
+	std::string destIpPort = sipwire::addrToIpPort(transferor->getAddress());
 	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
 	std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
 
@@ -1786,9 +1778,13 @@ std::shared_ptr<SipMessage> RequestsHandler::buildReferNotify(const std::shared_
 	std::ostringstream ss;
 	ss << "NOTIFY sip:" << transferor->getNumber() << "@" << destIpPort << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
-	   << "From: " << refer->getTo() << "\r\n"
-	   << "To: " << refer->getFrom() << "\r\n"
-	   << "Call-ID: " << refer->getCallID() << "\r\n"
+	   // getTo()/getFrom()/getCallID() hand back the FULL header line, so the value
+	   // has to be unwrapped before it is re-stamped under a new name — otherwise
+	   // this NOTIFY goes out as "From: To: <sip:...>" and the transferor cannot
+	   // match it to the REFER dialog. Roles swap (RFC 3515 §2.4.5).
+	   << "From: " << stripHeaderName(refer->getTo()) << "\r\n"
+	   << "To: " << stripHeaderName(refer->getFrom()) << "\r\n"
+	   << "Call-ID: " << stripHeaderName(refer->getCallID()) << "\r\n"
 	   << "CSeq: 2 NOTIFY\r\n"
 	   << "Max-Forwards: 70\r\n"
 	   << "Event: refer\r\n"
@@ -2500,6 +2496,31 @@ void RequestsHandler::refreshDeviceSnapshot()
 	_snapshot.devices = std::move(devices);
 }
 
+void RequestsHandler::applyDeviceChange(Registrar::Change change)
+{
+	// Caller holds _mutex; takes _snapshotMutex internally.
+	//
+	// An online flip leaves the row set identical, so patching the flags in place
+	// avoids rebuilding the vector and its two strings per device. That is the
+	// common case by a wide margin — every registration and every lease expiry
+	// flips a flag, and a post-reboot storm flips one per phone, which would
+	// otherwise make the mirror cost O(devices) allocations per REGISTER.
+	switch (change)
+	{
+		case Registrar::Change::None:
+			return;
+		case Registrar::Change::OnlineOnly:
+		{
+			std::lock_guard<std::mutex> snapLock(_snapshotMutex);
+			_registrar.copyOnlineFlagsInto(_snapshot.devices);
+			return;
+		}
+		case Registrar::Change::Structural:
+			refreshDeviceSnapshot();
+			return;
+	}
+}
+
 std::vector<RequestsHandler::AdoptedDevice> RequestsHandler::getAdoptedDevices()
 {
 	std::lock_guard<std::mutex> lock(_snapshotMutex);
@@ -2513,7 +2534,7 @@ bool RequestsHandler::secureDevice(const std::string& macOrExt)
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		changed = _registrar.secure(macOrExt);
-		if (_registrar.consumeDevicesChanged()) refreshDeviceSnapshot();
+		applyDeviceChange(_registrar.consumeDevicesChange());
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
@@ -2532,7 +2553,7 @@ bool RequestsHandler::forgetDevice(const std::string& macOrExt)
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 		removed = _registrar.forget(macOrExt);
-		if (_registrar.consumeDevicesChanged()) refreshDeviceSnapshot();
+		applyDeviceChange(_registrar.consumeDevicesChange());
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
@@ -2595,8 +2616,7 @@ bool RequestsHandler::sendMessageTo(const std::string& ext, const std::string& t
 		sent = true;
 
 		// Drain into a local vector and dispatch outside the lock (no IO under lock).
-		localOutbox = std::move(_outbox);
-		_outbox.clear();
+		localOutbox = drainOutbox();
 	}
 
 	for (auto& [addr, msg] : localOutbox)
@@ -2814,22 +2834,28 @@ void RequestsHandler::tick()
 				pbx::joinMembers(g.members));
 		}
 
-		// Parked calls view: {orbit, parkedExt, parker, secondsParked}.
+		// Parked calls view: {orbit, parkedExt, parker, secondsParked}. This full
+		// rebuild already reflects anything _park.sweep() just did above, so clear
+		// the dirty flag here rather than leaving it to trigger a redundant mirror
+		// on the next packet.
 		nextSnapshot.parkedCalls = _park.snapshotRows(now, /*onlyParked=*/true);
+		_park.consumeParkChanged();
 
 		{
 			std::lock_guard<std::mutex> snapLock(_snapshotMutex);
+			// `devices` and `pageZones` are NOT rebuilt above: they are mirrored out
+			// of band (applyDeviceChange on a registry change, and the page-zone
+			// config path) because their sources only move on an admin action or a
+			// REGISTER. Carry them across the swap — assigning a fresh snapshot over
+			// the old one would blank both every tick, so the dashboard's adopted
+			// devices and paging zones would flash empty a second after any update
+			// and stay empty until the next change.
+			nextSnapshot.devices   = std::move(_snapshot.devices);
+			nextSnapshot.pageZones = std::move(_snapshot.pageZones);
 			_snapshot = std::move(nextSnapshot);
 		}
 
-		// RFC 3261 §17: register any new outgoing INVITEs for retransmit (mirrors
-		// the same scan in handle()). tick()-originated INVITE forks (park ring-back,
-		// hunt-group next-ring, CFNA redirect) need Timer A/B coverage too. (#70)
-		for (const auto& [addr, msg] : _outbox)
-			_txLayer.maybeTrack(addr, msg);
-
-		localOutbox = std::move(_outbox);
-		_outbox.clear();
+		localOutbox = drainOutbox();
 
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
@@ -3963,34 +3989,25 @@ std::vector<std::pair<std::string, std::string>> RequestsHandler::getPageZones()
 
 // ── Call parking (orbits 700–709): FSM lives in ParkOrbit.cpp ────────────────
 
-bool RequestsHandler::handleTransferOk(const std::shared_ptr<SipMessage>& data)
+std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> RequestsHandler::drainOutbox()
 {
-	const std::string cseq(data->getCSeq());
-	const std::string callID(data->getCallID());
-	if (cseq.find(SipMessageTypes::INVITE) == std::string::npos) return false;
+	// The single exit every deferred message passes through. RFC 3261 §17:
+	// register outgoing INVITEs for retransmit here, so Timer A/B coverage is
+	// structural rather than something each flush site re-implements — a new
+	// flush path would otherwise send one-shot UDP INVITEs that are simply lost
+	// on a dropped packet. maybeTrack filters to INVITE requests, so responses
+	// and NOTIFYs are ignored.
+	//
+	// Ordering matters (#70): the scan must run after everything that appends to
+	// _outbox during this pass (BLF NOTIFYs, tick()-originated forks — park
+	// ring-back, hunt-group next-ring, CFNA redirect), which is exactly why it
+	// belongs at the drain rather than at any individual enqueue.
+	for (const auto& [addr, msg] : _outbox)
+		_txLayer.maybeTrack(addr, msg);
 
-	auto it = std::find(_transferPendingAcks.begin(), _transferPendingAcks.end(), callID);
-	if (it == _transferPendingAcks.end()) return false;
-
-	const std::string activeIp = _localIp;
-	const std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
-	const sockaddr_in src = data->getSource();
-	char ipBuf[INET_ADDRSTRLEN]{};
-	inet_ntop(AF_INET, &src.sin_addr, ipBuf, sizeof(ipBuf));
-	const std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(src.sin_port));
-
-	std::ostringstream ss;
-	ss << "ACK sip:" << data->getToNumber() << "@" << destIpPort << " SIP/2.0\r\n"
-	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=z9hG4bK" << IDGen::GenerateID(12) << "\r\n"
-	   << "From: " << stripHeaderName(data->getFrom()) << "\r\n"
-	   << "To: " << stripHeaderName(data->getTo()) << "\r\n"
-	   << callID << "\r\n"
-	   << "CSeq: 100 ACK\r\n"
-	   << "Max-Forwards: 70\r\n"
-	   << "Content-Length: 0\r\n\r\n";
-	_outbox.emplace_back(data->getSource(), getMessageFromPool(ss.str(), data->getSource()));
-	_transferPendingAcks.erase(it);
-	return true;
+	auto drained = std::move(_outbox);
+	_outbox.clear();
+	return drained;
 }
 
 void RequestsHandler::refreshParkSnapshot()

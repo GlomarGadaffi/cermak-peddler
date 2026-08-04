@@ -9,10 +9,10 @@
 #include <WinSock2.h>
 #endif
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 
 class SipMessage;
 class SipClient;
@@ -63,8 +63,17 @@ struct PbxEnv
 	virtual std::shared_ptr<SipMessage> serverBye(const std::string& destExt,
 		const sockaddr_in& destAddr, const std::string& callId,
 		const std::string& fromHeader, const std::string& toHeader) = 0;
-	// Read-only view of the live-session table (BLF dialog-state computation).
-	virtual const std::unordered_map<std::string, std::shared_ptr<Session>>& sessionsView() const = 0;
+	// Which end of a dialog an extension sits on.
+	enum class DialogRole { Caller, Callee };
+	// Visit every live session `aor` is a party to, as {Call-ID, session, role}.
+	// Used by the BLF machine to compute an RFC 4235 dialog state. A query rather
+	// than a reference to the session table: every other method here is a
+	// behavioural question, and handing out the container would let the engine's
+	// storage choice (map type, key, per-session locking) leak into the machines.
+	// The role is passed through because matching already determined it — the
+	// visitor would otherwise recompute the same comparison it was selected by.
+	virtual void forEachSessionInvolving(std::string_view aor,
+		const std::function<void(const std::string&, const Session&, DialogRole)>& fn) const = 0;
 	// AOR charset validation (the engine's isValidAor policy).
 	virtual bool validAor(std::string_view s) const = 0;
 	// Parse the requested registration/subscription lease from Expires/Contact

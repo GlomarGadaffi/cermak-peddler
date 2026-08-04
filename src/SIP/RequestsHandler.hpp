@@ -276,9 +276,17 @@ private:
 	{
 		return buildServerBye(destExt, destAddr, callId, fromHeader, toHeader);
 	}
-	const std::unordered_map<std::string, std::shared_ptr<Session>>& sessionsView() const override
+	void forEachSessionInvolving(std::string_view aor,
+		const std::function<void(const std::string&, const Session&, DialogRole)>& fn) const override
 	{
-		return _sessions;
+		for (const auto& [callID, session] : _sessions)
+		{
+			if (!session) continue;
+			if (session->getSrc() && session->getSrc()->getNumber() == aor)
+				fn(callID, *session, DialogRole::Caller);
+			else if (session->getDest() && session->getDest()->getNumber() == aor)
+				fn(callID, *session, DialogRole::Callee);
+		}
 	}
 	bool validAor(std::string_view s) const override
 	{
@@ -309,9 +317,7 @@ private:
 	// Call parking / park-orbit: the orbit FSM lives in ParkOrbit (see
 	// ParkOrbit.hpp). Guarded by _mutex.
 	ParkOrbit _park{*this};
-	std::vector<std::string> _transferPendingAcks; // attended-transfer re-INVITE ACKs pending
 
-	bool handleTransferOk(const std::shared_ptr<SipMessage>& data);
 	// Mirror the park orbits into the dashboard snapshot. Caller holds _mutex;
 	// takes _snapshotMutex internally.
 	void refreshParkSnapshot();
@@ -453,6 +459,10 @@ private:
 	std::mutex _mutex;
 	OnHandledEvent _onHandled;
 	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> _outbox;
+	// Take everything queued this pass, registering outgoing INVITEs for
+	// retransmit on the way out. The one place messages leave _outbox — see the
+	// #70 ordering note on the definition. Caller holds _mutex.
+	std::vector<std::pair<sockaddr_in, std::shared_ptr<SipMessage>>> drainOutbox();
 
 	std::string _serverIp;
 	std::string _localIp;   // resolved once at construction; avoids getPrimaryLocalIP() under _mutex
@@ -531,6 +541,9 @@ private:
 	// Mirror the Registrar's adopted-device registry into the dashboard snapshot.
 	// Caller holds _mutex; takes _snapshotMutex internally.
 	void refreshDeviceSnapshot();
+	// Mirror a Registrar registry change into the dashboard snapshot, taking the
+	// cheap in-place path for an online-flag-only change. Caller holds _mutex.
+	void applyDeviceChange(Registrar::Change change);
 
 	// NVS persistence for _forwards / _ringGroups / _pageZones. No-ops on host (the
 	// maps are the store); on ESP they read/write the "pbxcfg" NVS namespace.

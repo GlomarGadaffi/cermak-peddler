@@ -7,46 +7,23 @@
 #include "IDGen.hpp"
 #include "Session.hpp"
 #include "SipClient.hpp"
+#include "SipHeaderUtil.hpp"
 #include "SipMessageTypes.h"
+#include "SipWireUtil.hpp"
 
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-#include <lwip/sockets.h>
-#elif defined(__linux__)
-#include <arpa/inet.h>
-#endif
-
-std::string BlfSubscriptions::parseEventPackage(const std::string& raw)
+std::string BlfSubscriptions::parseEventPackage(std::string_view eventHeader)
 {
-	size_t pos = 0;
-	while (pos < raw.size())
-	{
-		size_t nl = raw.find('\n', pos);
-		size_t lineEnd = (nl == std::string::npos) ? raw.size() : nl;
-		size_t next = (nl == std::string::npos) ? raw.size() : nl + 1;
-		if (raw[pos] == '\r' || raw[pos] == '\n') break;
-
-		size_t colon = raw.find(':', pos);
-		if (colon != std::string::npos && colon < lineEnd)
-		{
-			std::string name = raw.substr(pos, colon - pos);
-			std::transform(name.begin(), name.end(), name.begin(),
-				[](unsigned char c){ return static_cast<char>(std::tolower(c)); });
-			if (name == "event" || name == "o")
-			{
-				size_t vBegin = colon + 1;
-				size_t vEnd = lineEnd;
-				std::string val = raw.substr(vBegin, vEnd - vBegin);
-				size_t semi = val.find(';');
-				if (semi != std::string::npos) val.erase(semi);
-				size_t b = val.find_first_not_of(" \t\r");
-				size_t e = val.find_last_not_of(" \t\r");
-				if (b == std::string::npos) return "";
-				return val.substr(b, e - b + 1);
-			}
-		}
-		pos = next;
-	}
-	return "";
+	// Takes the already-parsed Event header line (SipMessage::getEvent), rather
+	// than re-serialising the whole message and running a second, weaker header
+	// scan over it — the old scanner also matched any line named "o", which is
+	// the SDP origin line's name too.
+	std::string pkg = siphdr::stripHeaderName(eventHeader);
+	size_t semi = pkg.find(';');            // drop ;id=... and friends
+	if (semi != std::string::npos) pkg.erase(semi);
+	size_t e = pkg.find_last_not_of(" \t\r\n");
+	if (e == std::string::npos) return "";
+	pkg.erase(e + 1);
+	return pkg;
 }
 
 std::string BlfSubscriptions::buildDialogInfoXml(const std::string& entity, unsigned version,
@@ -80,14 +57,14 @@ std::string BlfSubscriptions::computeDialogState(const std::string& targetAor,
 		if (s == "trying")    return 1;
 		return 0;
 	};
-	for (const auto& [callID, session] : _env.sessionsView())
+	_env.forEachSessionInvolving(targetAor,
+		[&](const std::string& callID, const Session& session, PbxEnv::DialogRole role)
 	{
-		bool isSrc  = session->getSrc()  && session->getSrc()->getNumber()  == targetAor;
-		bool isDest = session->getDest() && session->getDest()->getNumber() == targetAor;
-		if (!isSrc && !isDest) continue;
+		const bool isSrc  = (role == PbxEnv::DialogRole::Caller);
+		const bool isDest = !isSrc;
 
 		std::string state, dir;
-		switch (session->getState())
+		switch (session.getState())
 		{
 			case Session::State::Invited:
 				state = isDest ? "early" : "trying";
@@ -101,7 +78,7 @@ std::string BlfSubscriptions::computeDialogState(const std::string& targetAor,
 				dir   = isSrc ? "initiator" : "recipient";
 				break;
 			default:
-				continue;
+				return;
 		}
 		if (rank(state) > rank(best))
 		{
@@ -109,7 +86,7 @@ std::string BlfSubscriptions::computeDialogState(const std::string& targetAor,
 			outDirection = dir;
 			outDialogId  = callID;
 		}
-	}
+	});
 	if (best.empty()) { outDirection.clear(); outDialogId.clear(); }
 	return best;
 }
@@ -118,12 +95,10 @@ std::shared_ptr<SipMessage> BlfSubscriptions::buildDialogNotify(DialogSubscripti
 	const std::string& state, const std::string& direction, const std::string& dialogId,
 	bool terminated, const char* termReason)
 {
-	std::string activeIp = _env.localIp();
-	std::string srcIpPort = activeIp + ":" + std::to_string(_env.serverPort());
-	char ipBuf[INET_ADDRSTRLEN]{};
-	inet_ntop(AF_INET, &sub.addr.sin_addr, ipBuf, sizeof(ipBuf));
-	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(sub.addr.sin_port));
-	std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
+	const std::string& activeIp = _env.localIp();
+	const std::string srcIpPort = activeIp + ":" + std::to_string(_env.serverPort());
+	const std::string destIpPort = sipwire::addrToIpPort(sub.addr);
+	const std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
 
 	std::string entity = "sip:" + sub.targetAor + "@" + srcIpPort;
 	std::string body = buildDialogInfoXml(entity, sub.version, dialogId, state, direction);
@@ -142,18 +117,15 @@ std::shared_ptr<SipMessage> BlfSubscriptions::buildDialogNotify(DialogSubscripti
 
 	// NOTIFY runs inside the subscription dialog: our To-tag becomes the From,
 	// the watcher's From becomes the To (RFC 6665 §4.4.1 — roles swap).
-	std::string fromHdr = sub.subTo;
-	std::string toHdr   = sub.watcherFrom;
-	auto stripName = [](const std::string& h) {
-		size_t c = h.find(':');
-		return (c == std::string::npos) ? h : h.substr(c + 1);
-	};
-
+	// subTo / watcherFrom hold FULL header lines ("To: <sip:...>;tag=x"), so the
+	// value has to be unwrapped before it is re-stamped under the swapped name.
+	// Uses the shared, guarded helper rather than a local "cut at the first colon"
+	// lambda, which would mangle any value that is not prefixed with its name.
 	std::ostringstream ss;
 	ss << "NOTIFY sip:" << destIpPort << " SIP/2.0\r\n"
 	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=" << branch << "\r\n"
-	   << "From:" << stripName(fromHdr) << "\r\n"
-	   << "To:" << stripName(toHdr) << "\r\n"
+	   << "From: " << siphdr::stripHeaderName(sub.subTo) << "\r\n"
+	   << "To: " << siphdr::stripHeaderName(sub.watcherFrom) << "\r\n"
 	   << "Call-ID: " << sub.callId << "\r\n"
 	   << "CSeq: " << sub.cseq++ << " NOTIFY\r\n"
 	   << "Max-Forwards: 70\r\n"
@@ -173,7 +145,7 @@ void BlfSubscriptions::onSubscribe(const std::shared_ptr<SipMessage>& data)
 	const std::string& activeIp = _env.localIp();
 
 	// 1. Event-package gate: only the RFC 4235 "dialog" package is implemented.
-	std::string pkg = parseEventPackage(data->toString());
+	std::string pkg = parseEventPackage(data->getEvent());
 	if (pkg != "dialog")
 	{
 		auto resp = _env.messageFromPool(data->toString(), data->getSource());
@@ -198,14 +170,9 @@ void BlfSubscriptions::onSubscribe(const std::shared_ptr<SipMessage>& data)
 	}
 
 	const int expires = _env.requestedExpires(data);
-	std::string callId(data->getCallID());
-	{
-		size_t c = callId.find(':');
-		if (c != std::string::npos) callId.erase(0, c + 1);
-		size_t b = callId.find_first_not_of(" \t");
-		size_t e = callId.find_last_not_of(" \t\r");
-		callId = (b == std::string::npos) ? "" : callId.substr(b, e - b + 1);
-	}
+	// Subscriptions are keyed by the bare Call-ID value (getCallID() hands back
+	// the whole header line). Same guarded helper as everywhere else.
+	const std::string callId = siphdr::stripHeaderName(data->getCallID());
 
 	// 3. Refresh / unsubscribe: match existing subscription by Call-ID.
 	DialogSubscription* sub = nullptr;
