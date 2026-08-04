@@ -220,6 +220,25 @@ Summary of what changed and what it does and does not buy:
   The 250ms accept-loop poll interval means the open/close transition is not instantaneous;
   this is a scheduling latency, not a security gap (invariant: fails closed on ambiguity).
 
+- **Residual: PINs provisioned before the `4887`-prefix guard existed (Issue #93)**. The
+  DTMF trigger `*4887` is matched the instant the accumulated digit sequence equals that
+  string — before the `*PIN#code` admin-menu parser runs. An admin PIN beginning `4887`
+  is therefore shadowed: the star-code fires mid-entry, clears the DTMF accumulator, and
+  the `*PIN#code` command the admin was actually dialing never completes. `POST
+  /api/admin/set-pin` rejects new/changed PINs with that prefix, but a device provisioned
+  **before** that guard shipped can still be carrying one, and the guard cannot retroactively
+  detect it — the PIN is stored salted+hashed, so there is no way to recover it and check.
+  `onDtmfInfo` makes a best-effort, imperfect behavioral detection: if `*4887` just fired for
+  the admin extension's dialog and the following digits then shape up as an interrupted
+  `*PIN#code` continuation (a `#` followed by 3+ digits, no leading `*` — consistent with the
+  admin having kept dialing into the accumulator the star-code just cleared), it logs a
+  targeted warning suggesting a PIN rotation. This is a heuristic, not a diagnosis — it can
+  both false-negative (an admin who gives up after the first `*4887` fire never triggers it)
+  and, in principle, false-positive on an unrelated sequence that happens to fit the same
+  shape. **Operators upgrading a device provisioned before this guard existed should rotate
+  any admin PIN beginning `4887` via the dashboard (`POST /api/admin/set-pin`) regardless of
+  whether the warning ever fires.**
+
 ### 5.6 Cleartext SIP + RTP on the open AP
 This is the largest *confidentiality* gap and is **independent of the dashboard auth fix**.
 The admin PIN protects *control*, not *media*. SIP signaling and G.711 RTP traverse the open

@@ -3350,6 +3350,7 @@ void RequestsHandler::onDtmfInfo(std::shared_ptr<SipMessage> data)
 	if (accum.lastTick != 0 && elapsedMs > DtmfAccum::TIMEOUT_MS)
 	{
 		accum.digits.clear();
+		accum.starCodeFiredAtTick = 0;
 	}
 	accum.lastTick = now;
 
@@ -3393,6 +3394,13 @@ void RequestsHandler::onDtmfInfo(std::shared_ptr<SipMessage> data)
 				queueLog("[admin] HTTP admin plane opened via DTMF *4887, ext " + _adminExt +
 					", ttl=" + std::to_string(_adminHttpTtlSec.load()) + "s");
 			}
+			// Issue #93: this fires (accept or reject, above) the instant the
+			// accumulated sequence equals "*4887" — which can be mid-entry if the
+			// admin's actual PIN happens to begin with those four digits. Remember
+			// it so the next digits, landing in the fresh accumulator this clear()
+			// creates, can be checked for a pattern consistent with a continued
+			// *PIN#code the admin never got to finish.
+			accum.starCodeFiredAtTick = now;
 			accum.digits.clear();
 			return;
 		}
@@ -3503,6 +3511,25 @@ void RequestsHandler::onDtmfInfo(std::shared_ptr<SipMessage> data)
 
 		// If the sequence starts with *NNNN (4+ digits) but no code matched yet,
 		// and the wrong caller is trying, send 403.
+	}
+	else if (callerExt == _adminExt && accum.starCodeFiredAtTick != 0 &&
+	         seq.find('#') != std::string::npos && (seq.size() - seq.find('#') - 1) >= 3)
+	{
+		// Issue #93: the *4887 star-code just fired for this dialog (above), and
+		// the admin kept dialing into something shaped like the tail of an
+		// interrupted *PIN#code (no leading '*' — the accumulator that produced
+		// this `seq` started fresh when the star-code cleared it). This is only
+		// ever a symptom of a PIN that begins "4887": that prefix is reserved
+		// (POST /api/admin/set-pin rejects it going forward), but a device
+		// provisioned before that guard existed can still be carrying one, and
+		// the hash can't be reversed to confirm it — so this is a best-effort,
+		// imperfect nudge rather than a definite diagnosis.
+		queueLog("[admin] DTMF entry right after *4887 fired looks like an "
+			"interrupted *PIN#code from ext " + _adminExt + " — if the admin PIN "
+			"begins with 4887 it is shadowed by the HTTP-open star-code and DTMF "
+			"admin commands can never complete; rotate it via the dashboard "
+			"(POST /api/admin/set-pin) — see docs/THREAT_MODEL.md", true);
+		accum.starCodeFiredAtTick = 0;   // one warning per incident
 	}
 	else if (callerExt != _adminExt && !seq.empty() && seq[0] == '*' &&
 	         seq.find('#') != std::string::npos)

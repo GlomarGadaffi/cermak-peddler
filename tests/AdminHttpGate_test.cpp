@@ -429,6 +429,51 @@ TEST(AdminHttpGate, KeepAlive_Unauthenticated_Rejected401)
 	AdminAuth::clearCredential();
 }
 
+TEST(AdminHttpGate, Trigger_ContinuedEntryAfterStarCodeLogsShadowedPinWarning)
+{
+	// Issue #93: a PIN beginning "4887" (only possible on a device provisioned
+	// before SetPin_RejectsReservedStarCodePrefix's guard existed) is shadowed —
+	// "*4887" matches and clears the accumulator before the admin finishes
+	// dialing *PIN#code. Simulate PIN "48871234" + code "001": the first four
+	// PIN digits complete "*4887" (fires, accumulator resets with no leading
+	// '*'), then the admin keeps dialing the rest ("8871234#001") into the same
+	// dialog. That must produce a targeted warning rather than silently eating
+	// the rest of the entry.
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	handler.handle(makeRegisterFor(handler.getAdminExt(), "192.168.4.50", "reg-1"));
+
+	testing::internal::CaptureStderr();
+	sendDtmfSequence(handler, handler.getAdminExt(), "192.168.4.50", "dtmf-race", "*4887");
+	sendDtmfSequence(handler, handler.getAdminExt(), "192.168.4.50", "dtmf-race", "8871234#001");
+	std::string err = testing::internal::GetCapturedStderr();
+
+	EXPECT_NE(err.find("interrupted"), std::string::npos) << err;
+	EXPECT_NE(err.find("4887"), std::string::npos) << err;
+
+	// One-shot: a second, unrelated '#'-shaped continuation on the SAME dialog
+	// must not warn again (starCodeFiredAtTick was consumed by the first).
+	testing::internal::CaptureStderr();
+	sendDtmfSequence(handler, handler.getAdminExt(), "192.168.4.50", "dtmf-race", "5678#002");
+	std::string err2 = testing::internal::GetCapturedStderr();
+	EXPECT_EQ(err2.find("interrupted"), std::string::npos) << err2;
+}
+
+// A star-code trigger with no PIN-shaped continuation afterward (the normal
+// *4887-only case, already covered above) must never warn.
+TEST(AdminHttpGate, Trigger_PlainStarCodeWithNoContinuationDoesNotWarn)
+{
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	handler.handle(makeRegisterFor(handler.getAdminExt(), "192.168.4.50", "reg-1"));
+
+	testing::internal::CaptureStderr();
+	sendDtmfSequence(handler, handler.getAdminExt(), "192.168.4.50", "dtmf-plain", "*4887");
+	std::string err = testing::internal::GetCapturedStderr();
+
+	EXPECT_EQ(err.find("interrupted"), std::string::npos) << err;
+}
+
 TEST(AdminHttpGate, SetPin_RejectsReservedStarCodePrefix)
 {
 	// The DTMF HTTP-open trigger is the star-code *4887 (no '#'), matched by

@@ -605,9 +605,17 @@ private:
 		std::string digits;          // accumulated digit string
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 		TickType_t  lastTick{0};     // xTaskGetTickCount() of last digit
+		TickType_t  starCodeFiredAtTick{0};
 #else
 		uint32_t    lastTick{0};     // monotonic ms counter on host
+		uint32_t    starCodeFiredAtTick{0};
 #endif
+		// Set when the *4887 HTTP-open star-code just matched for this dialog
+		// (0 = not pending). The star-code clears `digits` the instant the
+		// sequence equals "*4887", which can land before the admin finishes
+		// dialing *PIN#code if their PIN happens to begin with those four
+		// digits — see the Issue #93 detection in onDtmfInfo(). Cleared on the
+		// next digit (one warning per incident) or on the normal DTMF timeout.
 		static constexpr uint32_t TIMEOUT_MS = 5000;
 	};
 	std::unordered_map<std::string, DtmfAccum> _dtmfState;

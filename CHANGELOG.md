@@ -24,6 +24,17 @@ catch-up, and a few feature requests, each on its own commit.
   then frees on either a raced answer being handled or the window elapsing
   with nothing further (Issue #98).
 
+- `onDtmfInfo`: best-effort behavioral detection for a `4887`-prefixed admin
+  PIN provisioned before `POST /api/admin/set-pin` started rejecting that
+  prefix (Issue #93). The `*4887` HTTP-open star-code matches the instant the
+  accumulated sequence equals it — before the `*PIN#code` parser runs — so a
+  PIN beginning `4887` is shadowed and can never complete over DTMF. If the
+  star-code fires and the admin's next digits then shape up as an interrupted
+  `*PIN#code` continuation (`#` + 3+ digits, no leading `*`), a targeted
+  warning is logged suggesting a PIN rotation. Imperfect by construction — the
+  PIN is salted+hashed, so this can only be inferred behaviorally, never
+  confirmed. See `docs/THREAT_MODEL.md` §5.5 for the residual-risk writeup.
+
 ### Docs
 
 - `docs/API.md` §4 now specifies `/api/cdr`, `/api/dnd`, `/api/forward`,
