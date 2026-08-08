@@ -26,18 +26,6 @@ API.md's detailed specs (§4–§5) cover only the original five endpoints. `/ap
 
 ---
 
-### 🟡 Issue #77: DTMF CLASS codes bypass `setDnd()`/`setForward()`, dashboard goes stale
-* **Status**: ⏳ Open / Planned
-* **Labels**: `concurrency`, `dashboard`, `tech-debt`
-* **Severity**: Medium
-
-#### Description
-`onDtmfInfo` runs inside `handle()`'s `_mutex` lock (`RequestsHandler.cpp:175`, non-recursive). `setDnd()`/`setForward()` (`RequestsHandler.cpp:2249`/`2330`) each independently take that same `_mutex`, so `onDtmfInfo` cannot call them without deadlocking — and doesn't. Instead, `*60`/`*80` (`RequestsHandler.cpp:4056`/`4066`) write `_dnd` directly, and `*73`/`*72NNNN` (`RequestsHandler.cpp:4078`/`4160`) write `_forwards` directly, bypassing the setters entirely (comment at `:4048` acknowledges this: "We're already inside `_mutex`"). Consequence: `_snapshot.dnd`/`_snapshot.forwards`, which the HTTP dashboard's status endpoint reads, are refreshed *only* inside those setters — a DTMF-triggered DND/forward change never appears on the dashboard until an unrelated HTTP-side call happens to touch the same extension. `*72NNNN`'s inline path also skips a guard `setForward()` has (rejecting virtual extensions as forward targets).
-
-Found during a mutation-path audit of the admin plane (2026-07-15); a real fix needs either a recursive mutex or lock-already-held internal setter variants, not a one-line patch. Related check while here: `*PIN#999`'s DTMF factory-reset (`RequestsHandler.cpp:3987`) does a full `nvs_flash_erase()` where the HTTP factory-reset path only erases a scoped set of keys — worth confirming that divergence is intentional before closing this out.
-
----
-
 ### 🟡 Issue #74: Hold/resume on broadcast (ring-group) calls is not yet supported
 * **Status**: ⏳ Open / Planned
 * **Labels**: `bug`, `hold-resume`, `broadcast`
@@ -196,6 +184,23 @@ until a fork (or a future pass here) adds the routing policy.
 ---
 
 ## Resolved Issues
+
+### 🟢 Issue #77: DTMF CLASS codes bypass `setDnd()`/`setForward()`, dashboard goes stale
+* **Status**: ✅ Resolved
+* **Labels**: `concurrency`, `dashboard`, `tech-debt`
+
+#### Resolution
+`onDtmfInfo` runs inside `handle()`'s `_mutex` lock (non-recursive). `setDnd()`/`setForward()` each independently took that same `_mutex`, so `onDtmfInfo` couldn't call them without deadlocking — and didn't. `*60`/`*80` wrote `_dnd` directly, and `*73`/`*72NNNN` wrote `_forwards` directly, bypassing the setters' dashboard-snapshot refresh entirely: `_snapshot.dnd`/`_snapshot.forwards` (what the HTTP dashboard's status endpoint actually reads) were only ever refreshed inside `setDnd()`/`setForward()`, so a DTMF-triggered DND/forward change never appeared on the dashboard until an unrelated HTTP-side call happened to touch the same extension.
+
+Fixed with the lock-already-held internal setter variants the issue called for, not a recursive mutex: `setDndLocked()`/`setForwardLocked()` now hold the mutation + snapshot-refresh body that used to live directly inside `setDnd()`/`setForward()`. The public setters take `_mutex` and call the `*Locked` core; `onDtmfInfo`'s `*60`/`*80`/`*73`/`*72NNNN` call the same `*Locked` core directly, since they're already inside `handle()`'s `_mutex`. One code path, one snapshot refresh, for both the HTTP and DTMF trigger.
+
+This also closed the `*72NNNN` gap noted in the issue: `setForward()`'s guard rejecting `777`/`999` as the extension being configured now applies to the DTMF path too, since `*72NNNN`/`*73` route through `setForwardLocked()` instead of touching `_forwards` inline — a crafted mid-dialog INFO with `From: 777` can no longer set up a forward entry on the virtual echo extension (regression test: `DtmfClassCodes.Star72NNNN_RejectsVirtualExtensionAsTheConfiguredExtension`).
+
+New regression coverage (`tests/DtmfClassCodes_test.cpp`, 5 tests) drives real DTMF INFO packets through `handle()` and asserts against `getDndExtensions()`/`getForwards()` — the same snapshot-reading getters the dashboard uses — not the internal maps, so the tests fail the way the original bug actually manifested (stale dashboard) rather than passing against the live-map state that was never the problem. Full host suite: 168/168 passing.
+
+**Not changed, flagged for a deliberate decision:** the issue also asked to confirm whether `*PIN#999`'s DTMF factory-reset diverging from the HTTP factory-reset is intentional. Confirmed it's a real, non-trivial divergence, not a documentation gap: the DTMF path calls `nvs_flash_erase()` — a full NVS partition wipe (PBX config, CDR history, adopted-device registry, per-extension SIP secrets, everything) — while `HttpServer::sendApiFactoryReset` only erases `wifi_mode`/`wifi_ssid`/`wifi_pass`/`decayed` plus the admin credential via `AdminAuth::clearCredential()` (also scoped — salt/hash + session state only). One is a hard wipe, the other a soft network/credential reset, under the same "factory reset" name reached by two different triggers. Left unchanged here since picking a behavior is a product/security decision (how much a physical-access DTMF factory-reset should destroy) rather than a bug fix; the two paths' actual scope is now documented precisely enough for that decision to be made deliberately rather than by omission.
+
+---
 
 ### 🟢 Issue #76: `SipMessage` representation — parse-mutate-reparse on every setter
 * **Status**: ✅ Resolved

@@ -367,6 +367,19 @@ private:
 	// (std::mutex is non-recursive); does a bounded map lookup, no locking.
 	bool isDndEnabled(const std::string& extension);
 
+	// Lock-already-held mutation cores for setDnd()/setForward() (Issue #77).
+	// _mutex is non-recursive, and onDtmfInfo() runs inside handle()'s _mutex
+	// lock, so it cannot call the public setDnd()/setForward() without
+	// deadlocking. These do the actual map mutation + dashboard-snapshot
+	// refresh (queueLog only — no _mutex/_logQueue handling of their own) so
+	// both the public setters (after taking _mutex) and onDtmfInfo's CLASS
+	// code handling (already inside it) share one code path and one snapshot
+	// refresh, instead of onDtmfInfo writing _dnd/_forwards directly and
+	// leaving the dashboard snapshot stale until an unrelated HTTP-side call
+	// happens to touch the same extension.
+	void setDndLocked(const std::string& extension, bool on);
+	void setForwardLocked(const std::string& extension, const std::string& trigger, const std::string& target);
+
 	// Internal forward/group/zone lookups used by onInvite()/onBusy()/tick(). Caller
 	// MUST already hold _mutex (non-recursive) — bounded map lookups, no locking.
 	// getForwardTarget returns "" when no forward of that trigger is configured.

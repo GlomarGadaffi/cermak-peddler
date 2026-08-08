@@ -2287,45 +2287,51 @@ std::optional<RequestsHandler::ProvisioningInfo> RequestsHandler::findProvisioni
 	return std::nullopt;
 }
 
+void RequestsHandler::setDndLocked(const std::string& extension, bool on)
+{
+	if (on)
+	{
+		// Bound the map so a flood of distinct extensions can't grow the heap
+		// without limit. Mirror the client-pool cap; reject new keys past it.
+		if (_dnd.find(extension) == _dnd.end() &&
+			_dnd.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS))
+		{
+			queueLog("DND set ignored (table full) for extension " + extension, true);
+		}
+		else
+		{
+			_dnd[extension] = true;
+		}
+	}
+	else
+	{
+		// Turning DND off frees the slot, so the map only ever holds the
+		// extensions that are actively in DND (bounded by registrations).
+		_dnd.erase(extension);
+	}
+	queueLog("DND " + std::string(on ? "enabled" : "disabled") + " for extension " + extension);
+
+	// Refresh the DND view in the dashboard snapshot immediately so the UI
+	// reflects the change without waiting for the next tick(). Same refresh
+	// regardless of whether the mutation came from the HTTP setter or a DTMF
+	// CLASS code (Issue #77) — both funnel through here.
+	{
+		std::lock_guard<std::mutex> snapLock(_snapshotMutex);
+		_snapshot.dnd.clear();
+		_snapshot.dnd.reserve(_dnd.size());
+		for (const auto& [ext, enabled] : _dnd)
+		{
+			if (enabled) _snapshot.dnd.push_back(ext);
+		}
+	}
+}
+
 void RequestsHandler::setDnd(const std::string& extension, bool on)
 {
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-		if (on)
-		{
-			// Bound the map so a flood of distinct extensions can't grow the heap
-			// without limit. Mirror the client-pool cap; reject new keys past it.
-			if (_dnd.find(extension) == _dnd.end() &&
-				_dnd.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS))
-			{
-				queueLog("DND set ignored (table full) for extension " + extension, true);
-			}
-			else
-			{
-				_dnd[extension] = true;
-			}
-		}
-		else
-		{
-			// Turning DND off frees the slot, so the map only ever holds the
-			// extensions that are actively in DND (bounded by registrations).
-			_dnd.erase(extension);
-		}
-		queueLog("DND " + std::string(on ? "enabled" : "disabled") + " for extension " + extension);
-
-		// Refresh the DND view in the dashboard snapshot immediately so the UI
-		// reflects the change without waiting for the next tick().
-		{
-			std::lock_guard<std::mutex> snapLock(_snapshotMutex);
-			_snapshot.dnd.clear();
-			_snapshot.dnd.reserve(_dnd.size());
-			for (const auto& [ext, enabled] : _dnd)
-			{
-				if (enabled) _snapshot.dnd.push_back(ext);
-			}
-		}
-
+		setDndLocked(extension, on);
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
@@ -2368,57 +2374,66 @@ std::string RequestsHandler::getForwardTarget(const std::string& extension, cons
 	return {};
 }
 
+void RequestsHandler::setForwardLocked(const std::string& extension, const std::string& trigger, const std::string& target)
+{
+	// Reject the virtual extensions outright; they are not real endpoints.
+	// Previously only the HTTP-facing setForward() applied this guard — the
+	// DTMF *73/*72NNNN inline path skipped it entirely (Issue #77), so a
+	// crafted mid-dialog INFO with From: 777/999 could set up a "forward" on
+	// a virtual extension. Routing both callers through here closes that gap.
+	if (extension == "777" || extension == "999")
+	{
+		queueLog("Forward set ignored for virtual extension " + extension, true);
+	}
+	else
+	{
+		auto it = _forwards.find(extension);
+		bool isNew = (it == _forwards.end());
+
+		// Bound the table like _dnd: refuse a brand-new extension past the cap.
+		if (isNew && _forwards.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS))
+		{
+			queueLog("Forward set ignored (table full) for extension " + extension, true);
+		}
+		else
+		{
+			pbx::ForwardConfig& cfg = _forwards[extension];
+			if (trigger == "always")        cfg.always   = target;
+			else if (trigger == "busy")     cfg.busy     = target;
+			else if (trigger == "noanswer") cfg.noAnswer = target;
+
+			// Drop the entry entirely once no trigger remains set, so the map only
+			// holds actively-forwarded extensions (bounded by registrations).
+			if (cfg.empty())
+			{
+				_forwards.erase(extension);
+			}
+			queueLog("Forward " + trigger + " for " + extension +
+				(target.empty() ? " cleared" : (" -> " + target)));
+			persistForwards();
+		}
+	}
+
+	// Refresh the dashboard snapshot immediately (mirror setDnd). Same refresh
+	// regardless of whether the mutation came from the HTTP setter or a DTMF
+	// CLASS code (Issue #77) — both funnel through here.
+	{
+		std::lock_guard<std::mutex> snapLock(_snapshotMutex);
+		_snapshot.forwards.clear();
+		_snapshot.forwards.reserve(_forwards.size());
+		for (const auto& [ext, cfg] : _forwards)
+		{
+			_snapshot.forwards.emplace_back(ext, cfg.always, cfg.busy, cfg.noAnswer);
+		}
+	}
+}
+
 void RequestsHandler::setForward(const std::string& extension, const std::string& trigger, const std::string& target)
 {
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-
-		// Reject the virtual extensions outright; they are not real endpoints.
-		if (extension == "777" || extension == "999")
-		{
-			queueLog("Forward set ignored for virtual extension " + extension, true);
-		}
-		else
-		{
-			auto it = _forwards.find(extension);
-			bool isNew = (it == _forwards.end());
-
-			// Bound the table like _dnd: refuse a brand-new extension past the cap.
-			if (isNew && _forwards.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS))
-			{
-				queueLog("Forward set ignored (table full) for extension " + extension, true);
-			}
-			else
-			{
-				pbx::ForwardConfig& cfg = _forwards[extension];
-				if (trigger == "always")        cfg.always   = target;
-				else if (trigger == "busy")     cfg.busy     = target;
-				else if (trigger == "noanswer") cfg.noAnswer = target;
-
-				// Drop the entry entirely once no trigger remains set, so the map only
-				// holds actively-forwarded extensions (bounded by registrations).
-				if (cfg.empty())
-				{
-					_forwards.erase(extension);
-				}
-				queueLog("Forward " + trigger + " for " + extension +
-					(target.empty() ? " cleared" : (" -> " + target)));
-				persistForwards();
-			}
-		}
-
-		// Refresh the dashboard snapshot immediately (mirror setDnd).
-		{
-			std::lock_guard<std::mutex> snapLock(_snapshotMutex);
-			_snapshot.forwards.clear();
-			_snapshot.forwards.reserve(_forwards.size());
-			for (const auto& [ext, cfg] : _forwards)
-			{
-				_snapshot.forwards.emplace_back(ext, cfg.always, cfg.busy, cfg.noAnswer);
-			}
-		}
-
+		setForwardLocked(extension, trigger, target);
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
@@ -3607,17 +3622,11 @@ void RequestsHandler::onDtmfInfo(std::shared_ptr<SipMessage> data)
 	// *60 — Enable Selective Call Rejection (DND=true) for caller's extension.
 	if (seq == "*60")
 	{
-		// isDndEnabled / setDnd operate on the _dnd map. We're already inside _mutex.
-		if (_dnd.find(callerExt) == _dnd.end() &&
-			_dnd.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS))
-		{
-			queueLog("*60 SCR: DND table full for " + callerExt, true);
-		}
-		else
-		{
-			_dnd[callerExt] = true;
-			queueLog("*60 SCR enabled for " + callerExt);
-		}
+		// Issue #77: route through the same lock-already-held core setDnd()
+		// uses (we're already inside _mutex here, via handle()) so the
+		// dashboard snapshot refreshes immediately instead of only on the
+		// next unrelated HTTP-side setDnd() call.
+		setDndLocked(callerExt, true);
 		accum.digits.clear();
 		return;
 	}
@@ -3625,8 +3634,7 @@ void RequestsHandler::onDtmfInfo(std::shared_ptr<SipMessage> data)
 	// *80 — Disable SCR/DND for caller's extension.
 	if (seq == "*80")
 	{
-		_dnd.erase(callerExt);
-		queueLog("*80 SCR disabled for " + callerExt);
+		setDndLocked(callerExt, false);
 		accum.digits.clear();
 		return;
 	}
@@ -3634,14 +3642,11 @@ void RequestsHandler::onDtmfInfo(std::shared_ptr<SipMessage> data)
 	// *73 — Disable CFU for caller's extension.
 	if (seq == "*73")
 	{
-		auto it = _forwards.find(callerExt);
-		if (it != _forwards.end())
-		{
-			it->second.always.clear();
-			if (it->second.empty()) _forwards.erase(it);
-			persistForwards();
-		}
-		queueLog("*73 CFU disabled for " + callerExt);
+		// Issue #77: setForwardLocked with an empty target clears the
+		// "always" trigger exactly like the old inline erase did, but also
+		// refreshes the dashboard snapshot and applies the virtual-extension
+		// guard that the old inline path skipped.
+		setForwardLocked(callerExt, "always", "");
 		accum.digits.clear();
 		return;
 	}
@@ -3712,17 +3717,11 @@ void RequestsHandler::onDtmfInfo(std::shared_ptr<SipMessage> data)
 		std::string target = seq.substr(3);
 		if (target.size() >= 4 && isValidAor(target))
 		{
-			bool isNew = (_forwards.find(callerExt) == _forwards.end());
-			if (isNew && _forwards.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS))
-			{
-				queueLog("*72 CFU: forward table full for " + callerExt, true);
-			}
-			else
-			{
-				_forwards[callerExt].always = target;
-				persistForwards();
-				queueLog("*72 CFU enabled: " + callerExt + " -> " + target);
-			}
+			// Issue #77: setForwardLocked applies the same table-full guard and
+			// the virtual-extension guard setForward() has always had (which
+			// this inline path used to skip), and refreshes the dashboard
+			// snapshot immediately instead of leaving it stale.
+			setForwardLocked(callerExt, "always", target);
 			accum.digits.clear();
 			return;
 		}
