@@ -39,6 +39,10 @@ add_executable(sip_parser_tests
     # Phase 0 of docs/PLAN_ADMIN_HTTP_ONLY.md: dark-by-default HTTP admin plane
     # test contract. Pulls in HttpServer.cpp for the first time in this target.
     AdminHttpGate_test.cpp
+    # Issue #77: DTMF CLASS codes (*60/*80/*73/*72NNNN) must update the same
+    # dashboard snapshot the HTTP setters do, not bypass it by writing
+    # _dnd/_forwards directly from inside onDtmfInfo's _mutex lock.
+    DtmfClassCodes_test.cpp
     # Wire-level coverage for the decomposed SIP state machines, driven through a
     # FakePbxEnv that records what each machine enqueues. The park/beep/BLF paths
     # build their requests by hand, so only a byte-level assertion catches header

@@ -6,53 +6,6 @@ This document serves as the active issue tracker and architectural roadmap for *
 
 ## Active Issues & Backlog Roadmap
 
-### 🟡 Issue #93: Already-provisioned admin PINs beginning `4887` are shadowed by the `*4887` HTTP-open star-code
-* **Status**: ⏳ Open / Documented residual
-* **Labels**: `security`, `dtmf`
-* **Severity**: Low
-
-#### Description
-`*4887` is matched incrementally in `onDtmfInfo` before the `*PIN#code` parser, so a PIN beginning with those four digits can never complete a DTMF admin command — the star-code fires mid-entry and clears the accumulator. `POST /api/admin/set-pin` now rejects the `4887` prefix (regression test `AdminHttpGate.SetPin_RejectsReservedStarCodePrefix`), but that only covers new/changed PINs; a device provisioned before the guard keeps the collision. The PIN is stored salted+hashed, so a boot-time scan is impossible — the practical ceiling is documentation (done: CHANGELOG) plus optionally a behavioral warning when the star-code fires and the same call continues with `#`-digits. GitHub #93.
-
----
-
-### 🔵 Issue #94: `docs/API.md` endpoint catalog is stale
-* **Status**: ⏳ Open / Doc debt
-* **Labels**: `documentation`
-* **Severity**: Low
-
-#### Description
-API.md's detailed specs (§4–§5) cover only the original five endpoints. `/api/cdr`, `/api/dnd`, `/api/forward`, `/api/group`, `/api/factory-reset`, `/api/configuring`, `/api/ota/*`, and the admin session endpoints have no per-endpoint specs. §0 (added 2026-07-17) summarizes the admin layer + dark-by-default reachability and carries a partial-catalog banner, so the doc is honest but incomplete. Source of truth: `HttpServer::handleClient()`. GitHub #94.
-
----
-
-### 🟡 Issue #77: DTMF CLASS codes bypass `setDnd()`/`setForward()`, dashboard goes stale
-* **Status**: ⏳ Open / Planned
-* **Labels**: `concurrency`, `dashboard`, `tech-debt`
-* **Severity**: Medium
-
-#### Description
-`onDtmfInfo` runs inside `handle()`'s `_mutex` lock (`RequestsHandler.cpp:175`, non-recursive). `setDnd()`/`setForward()` (`RequestsHandler.cpp:2249`/`2330`) each independently take that same `_mutex`, so `onDtmfInfo` cannot call them without deadlocking — and doesn't. Instead, `*60`/`*80` (`RequestsHandler.cpp:4056`/`4066`) write `_dnd` directly, and `*73`/`*72NNNN` (`RequestsHandler.cpp:4078`/`4160`) write `_forwards` directly, bypassing the setters entirely (comment at `:4048` acknowledges this: "We're already inside `_mutex`"). Consequence: `_snapshot.dnd`/`_snapshot.forwards`, which the HTTP dashboard's status endpoint reads, are refreshed *only* inside those setters — a DTMF-triggered DND/forward change never appears on the dashboard until an unrelated HTTP-side call happens to touch the same extension. `*72NNNN`'s inline path also skips a guard `setForward()` has (rejecting virtual extensions as forward targets).
-
-Found during a mutation-path audit of the admin plane (2026-07-15); a real fix needs either a recursive mutex or lock-already-held internal setter variants, not a one-line patch. Related check while here: `*PIN#999`'s DTMF factory-reset (`RequestsHandler.cpp:3987`) does a full `nvs_flash_erase()` where the HTTP factory-reset path only erases a scoped set of keys — worth confirming that divergence is intentional before closing this out.
-
----
-
-### 🟡 Issue #76: `SipMessage` representation — parse-mutate-reparse on every setter
-* **Status**: ⏳ Open / Planned
-* **Labels**: `performance`, `sip-core`, `tech-debt`
-* **Severity**: Medium
-* **Priority**: do this before taking on any further SIP-layer language/parsing work — it's the load-bearing piece underneath all of it.
-
-#### Description
-`src/SIP/SipMessage.cpp` (740 lines) still represents a message as a single mutable string (`_messageStr`), with every setter (`setHeader`/`setVia`/`setTo`/`setContact`/`setBody`/`syncContentLength`/...) doing an in-place `.replace()` on that string followed by a full reparse. A normal outbound response that touches five or six of those setters therefore re-scans the entire datagram five or six times to emit one packet — on an S3, not a spare-cycles platform.
-
-This is already flagged yellow in `docs/REALITY_CHECK.md` ("transient stack-to-heap cloning of `SipMessage` objects remains") — not new information, just not yet actioned.
-
-Not a memory-safety bug. The fix is a representation change, not a hardening pass: parse once into an immutable typed message, then build responses instead of mutating raw text in place. Pure C++, no new dependency.
-
----
-
 ### 🟡 Issue #74: Hold/resume on broadcast (ring-group) calls is not yet supported
 * **Status**: ⏳ Open / Planned
 * **Labels**: `bug`, `hold-resume`, `broadcast`
@@ -82,16 +35,6 @@ destructive behaviour). A full relay path for broadcast hold/resume is tracked h
 
 #### Description
 Since physical target hardware (smart display JC3248W535EN, POE boards, etc.) is currently offline, we need a physical validation sweep once hardware is re-connected to verify that display screen redraw latency doesn't interfere with real-time SIP engine ticks.
-
----
-
-### 🟡 Issue #41: SIP core: Arduino IDE platform detection guards need verification (ESP32/ARDUINO defines)
-* **Status**: ⏳ Open / Planned
-* **Labels**: `build-system`, `compatibility`
-* **Severity**: Low
-
-#### Description
-Arduino IDE build configs should be verified against platform detection macros (`ESP32`, `ARDUINO`, `ESP_PLATFORM`) to ensure smooth compatibility for hobbyist flashing.
 
 ---
 
@@ -211,6 +154,79 @@ until a fork (or a future pass here) adds the routing policy.
 ---
 
 ## Resolved Issues
+
+### 🟢 Issue #41: SIP core: Arduino IDE platform detection guards need verification (ESP32/ARDUINO defines)
+* **Status**: ✅ Resolved (static audit; no Arduino IDE/hardware available to compile-verify)
+* **Labels**: `build-system`, `compatibility`
+
+#### Resolution
+No Arduino IDE, `arduino-cli`, or ESP32 toolchain is available in this environment, so this couldn't be closed with an actual compile — what follows is a full static audit of every platform-detection guard in `src/`, `main/`, and `sketches/`, plus what was safe to fix without a compiler to check the result.
+
+**Inventory.** `src/` uses one dominant, deliberate pattern — `#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)` — in ~70 places across `RequestsHandler`, `Registrar`, `RtpSender`/`RtpReceiver`, `UdpServer`, `SipClient`, `SipDigest`, `AdminAuth`, `SipSecretStore`, `ArpLookup`, `PcapCapture`, `PbxEnv`, `SipWireUtil`. This is clearly intentional defensive coverage: `ESP_PLATFORM` is the ESP-IDF native define, `ESP32`/`ARDUINO` are what the Arduino-ESP32 core defines, and different core generations have varied in which of the three they set.
+
+**Narrower than that pattern, audited individually:**
+* `src/SIP/SipMessage.hpp` (socket header selection) and `src/SIP/TelephonyApiConfig.cpp` (×2, NVS header selection) checked only `ESP_PLATFORM || ESP32`, missing `ARDUINO`. Fixed to the 3-way form. This project only ships ESP32 sketches, and the Arduino-ESP32 core has always defined `ESP32` alongside `ARDUINO` for any ESP32 board, so `ARDUINO` without `ESP32` can't actually occur here — the fix has zero behavioral effect on any real build, it's pure consistency with the established convention. Verified with the full host suite (168/168) since these headers also compile on host (hitting the `#elif __linux__`/`#else` branches there either way).
+* `main/ui/ui.cpp` checks `ESP_PLATFORM` alone. Left as-is: `main/` is exclusively the ESP-IDF-native app entry (`idf.py`-only, per `main/CMakeLists.txt`'s use of `IDF_VERSION_MAJOR` etc.) — the Arduino sketches in `sketches/` have their own `setup()`/`loop()` and never compile anything under `main/`. Not reachable from the Arduino build path at all, so out of scope for this issue.
+* `src/Helpers/HttpServer.hpp`/`.cpp` (socket includes, 6 sites) and `src/Helpers/OtaUpdater.hpp`/`.cpp` (the ESP-IDF `esp_ota_*`/`esp_partition_t` wrapper) check `ESP_PLATFORM` alone, with **no** `ESP32`/`ARDUINO` fallback — and both *are* compiled into every Arduino sketch (each `.ino`'s header comment says to add every `.cpp` from `src/Helpers/`, and `HttpServer.cpp` calls into `OtaUpdater`). **Not changed** — I could not verify on a real toolchain whether this is a live bug, and the two plausible outcomes differ (compile failure, which is loud and immediately visible to a hobbyist flashing it, vs. a "silent host-stub" OTA on some older core, which the `OtaUpdater.cpp` header comment frames as one of two *deliberate* side-by-side implementations, not an oversight). Mitigating: every actively-maintained sketch's own header comment pins **"ESP32 Arduino Core ≥ 3.0" / "3.x"** (`SipServerETH.ino`, `SipServer_T_ETH_Lite_W5500.ino`, `SipServer_T_POE_Pro_LAN8720.ino`, `SipServer_JC3248W535.ino`) — core 3.x is built as an ESP-IDF component and reliably defines `ESP_PLATFORM`, so against the documented minimum supported core this is not a live gap. It would only bite on an older (2.x or earlier) core, which isn't what these sketches say to install. Flagged here rather than changed blind, since getting this wrong in either direction (widening a guard that turns out to matter, or leaving a real gap) isn't something I can confirm without a real Arduino IDE + `arduino-esp32` compile — left for whoever next has that hardware/toolchain available.
+
+No sketch-level (`.ino`) platform-detection branching exists to audit — the `.ino` files are pure hardware pin-mapping/setup code with no `#ifdef` on `ESP_PLATFORM`/`ESP32`/`ARDUINO` of their own; the `ARDUINO_EVENT_ETH_*` cases in the Ethernet sketches are event-enum switches (WiFi/ETH event callback dispatch), not platform guards.
+
+---
+
+### 🟢 Issue #94: `docs/API.md` endpoint catalog is stale
+* **Status**: ✅ Resolved
+* **Labels**: `documentation`
+
+#### Resolution
+Cross-checked `docs/API.md`'s §4 catalog against the actual route dispatch in `src/Helpers/HttpServer.cpp::handleClient()` (grepped every `req.path ==` / request-line match, including `/api/ota/upload`'s special-cased streaming interception and `/config/<mac>.cfg`'s prefix match). Every route the server actually serves now has a full per-endpoint spec: `/`, `/api/status`, `/api/kill`, `/api/cdr`, `/api/pcap`, `/api/trace`, `/config/<mac>.cfg`, `/api/dnd`, `/api/forward`, `/api/group`, `/api/wifi/scan`, `/api/wifi/connect`, `/api/wifi/mode_ap`, `/api/configuring`, `/api/factory-reset`, `/api/ota/status`, `/api/ota/upload`, `/api/ota/reboot` — all present with method, auth requirements, request params, response codes, and example payloads. The admin session endpoints (`/api/admin/*`) are covered in §0 by design (the doc's own note explains why they're not repeated in §4), not a gap. The partial-catalog banner this issue referenced is already gone.
+
+This was done by an earlier commit (`3a65c13 docs(api): fill in the stale endpoint catalog`, plus later additions as `/api/pcap`/`/api/trace`/`/config/<mac>.cfg` shipped) — `ISSUES.md` just hadn't been updated to reflect it. No doc changes were needed here beyond closing out the tracker entry.
+
+---
+
+### 🟢 Issue #93: Already-provisioned admin PINs beginning `4887` are shadowed by the `*4887` HTTP-open star-code
+* **Status**: ✅ Resolved (to its practical ceiling)
+* **Labels**: `security`, `dtmf`
+
+#### Resolution
+`*4887` is matched incrementally in `onDtmfInfo` before the `*PIN#code` parser, so a PIN beginning with those four digits can never complete a DTMF admin command — the star-code fires mid-entry and clears the accumulator. The PIN is stored salted+hashed, so a boot-time scan for already-provisioned collisions is fundamentally impossible; that residual is accepted, not fixable, and stays true regardless of anything else here. What the issue asked for is everything short of that impossible scan, and both pieces are now in place and verified:
+
+1. **Guard new/changed PINs.** `POST /api/admin/set-pin` rejects any PIN starting with `4887` (`AdminHttpGate.SetPin_RejectsReservedStarCodePrefix`), so the collision can't be freshly created going forward.
+2. **Behavioral warning for the existing-device case.** `onDtmfInfo` detects the shape of an interrupted `*PIN#code` entry immediately after `*4887` fires (`accum.starCodeFiredAtTick`) and logs a targeted warning naming the `4887` collision and pointing at `POST /api/admin/set-pin` to rotate the PIN — one warning per incident, verified by `AdminHttpGate.Trigger_ContinuedEntryAfterStarCodeLogsShadowedPinWarning` (warns) and `AdminHttpGate.Trigger_PlainStarCodeWithNoContinuationDoesNotWarn` (doesn't false-positive on an ordinary `*4887`-only open).
+
+Both are also documented outside the code: `CHANGELOG.md` records the guard and the detection, and `docs/THREAT_MODEL.md` §E-4/residuals carries the full writeup (mitigation, false-positive/negative shape, and the rotate-your-PIN remediation). Verified via the full host suite (168/168, including the three tests above) — no code change was needed, only closing out `ISSUES.md` to match what had already shipped.
+
+---
+
+### 🟢 Issue #77: DTMF CLASS codes bypass `setDnd()`/`setForward()`, dashboard goes stale
+* **Status**: ✅ Resolved
+* **Labels**: `concurrency`, `dashboard`, `tech-debt`
+
+#### Resolution
+`onDtmfInfo` runs inside `handle()`'s `_mutex` lock (non-recursive). `setDnd()`/`setForward()` each independently took that same `_mutex`, so `onDtmfInfo` couldn't call them without deadlocking — and didn't. `*60`/`*80` wrote `_dnd` directly, and `*73`/`*72NNNN` wrote `_forwards` directly, bypassing the setters' dashboard-snapshot refresh entirely: `_snapshot.dnd`/`_snapshot.forwards` (what the HTTP dashboard's status endpoint actually reads) were only ever refreshed inside `setDnd()`/`setForward()`, so a DTMF-triggered DND/forward change never appeared on the dashboard until an unrelated HTTP-side call happened to touch the same extension.
+
+Fixed with the lock-already-held internal setter variants the issue called for, not a recursive mutex: `setDndLocked()`/`setForwardLocked()` now hold the mutation + snapshot-refresh body that used to live directly inside `setDnd()`/`setForward()`. The public setters take `_mutex` and call the `*Locked` core; `onDtmfInfo`'s `*60`/`*80`/`*73`/`*72NNNN` call the same `*Locked` core directly, since they're already inside `handle()`'s `_mutex`. One code path, one snapshot refresh, for both the HTTP and DTMF trigger.
+
+This also closed the `*72NNNN` gap noted in the issue: `setForward()`'s guard rejecting `777`/`999` as the extension being configured now applies to the DTMF path too, since `*72NNNN`/`*73` route through `setForwardLocked()` instead of touching `_forwards` inline — a crafted mid-dialog INFO with `From: 777` can no longer set up a forward entry on the virtual echo extension (regression test: `DtmfClassCodes.Star72NNNN_RejectsVirtualExtensionAsTheConfiguredExtension`).
+
+New regression coverage (`tests/DtmfClassCodes_test.cpp`, 5 tests) drives real DTMF INFO packets through `handle()` and asserts against `getDndExtensions()`/`getForwards()` — the same snapshot-reading getters the dashboard uses — not the internal maps, so the tests fail the way the original bug actually manifested (stale dashboard) rather than passing against the live-map state that was never the problem. Full host suite: 168/168 passing.
+
+**Not changed, flagged for a deliberate decision:** the issue also asked to confirm whether `*PIN#999`'s DTMF factory-reset diverging from the HTTP factory-reset is intentional. Confirmed it's a real, non-trivial divergence, not a documentation gap: the DTMF path calls `nvs_flash_erase()` — a full NVS partition wipe (PBX config, CDR history, adopted-device registry, per-extension SIP secrets, everything) — while `HttpServer::sendApiFactoryReset` only erases `wifi_mode`/`wifi_ssid`/`wifi_pass`/`decayed` plus the admin credential via `AdminAuth::clearCredential()` (also scoped — salt/hash + session state only). One is a hard wipe, the other a soft network/credential reset, under the same "factory reset" name reached by two different triggers. Left unchanged here since picking a behavior is a product/security decision (how much a physical-access DTMF factory-reset should destroy) rather than a bug fix; the two paths' actual scope is now documented precisely enough for that decision to be made deliberately rather than by omission.
+
+---
+
+### 🟢 Issue #76: `SipMessage` representation — parse-mutate-reparse on every setter
+* **Status**: ✅ Resolved
+* **Labels**: `performance`, `sip-core`, `tech-debt`
+
+#### Resolution
+The `_messageStr`-plus-full-reparse representation this issue described no longer matches the code — `src/SIP/SipMessage.cpp` was already rewritten (`dfeecba`, cppcheck follow-up in `146f63b`) to own its parsed pieces directly: a `_startLine` string, an ordered `_headerLines` vector, and a `_body` string, no shared buffer. Setters (`setVia`/`setTo`/`setContact`/`setCSeq`/...) do a single by-name lookup-and-replace against `_headerLines`; there is no cached derived state to keep in sync, so nothing needs a reparse after a mutation. `reparse()` is gone from both `SipMessage` and `SipSdpMessage`.
+
+Auditing this turned up one real residual: every response-building call site in `RequestsHandler.cpp` (51 of them) cloned a message into the static pool via `getMessageFromPool(source->toString(), source->getSource())` — serializing the already-parsed source back into one wire string and then re-splitting that string, even though `SipMessage`'s copy assignment (`= default`, added by the same rewrite specifically so messages could be cloned cheaply) is already a plain owned-string/vector copy with nothing to reconstruct. Added a `getMessageFromPool(const SipMessage&)` overload that copies the parsed fields directly (`*msg = source`, no stringify/resplit) and switched all 51 sites to it. The 4 call sites that build a message from scratch (`ss.str()`, no prior `SipMessage` to clone) were left untouched — there's no redundant reparse to remove there. Verified with the full host test suite (163/163 passing, host build) and a live REGISTER + echo-call (777) smoke test against the built `SipServer` binary (no `SIP Message pool exhausted` fallback observed under a 10-client registration + 5-concurrent-call load).
+
+Also corrected `docs/REALITY_CHECK.md`'s stale "transient stack-to-heap cloning of `SipMessage` objects remains" note (§2 of the scorecard): that had already been resolved separately by the static `_messagePool` (`RequestsHandler::getMessageFromPool()`), which every response-building call site already used before this change; only the wasted reparse on top of it remained, fixed above.
+
+---
 
 ### 🟢 Issue #73: `Held` state CDR-logged as Failed with zero duration
 * **Status**: ✅ Resolved (sip-backport)
