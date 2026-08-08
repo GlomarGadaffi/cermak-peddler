@@ -38,21 +38,6 @@ Found during a mutation-path audit of the admin plane (2026-07-15); a real fix n
 
 ---
 
-### 🟡 Issue #76: `SipMessage` representation — parse-mutate-reparse on every setter
-* **Status**: ⏳ Open / Planned
-* **Labels**: `performance`, `sip-core`, `tech-debt`
-* **Severity**: Medium
-* **Priority**: do this before taking on any further SIP-layer language/parsing work — it's the load-bearing piece underneath all of it.
-
-#### Description
-`src/SIP/SipMessage.cpp` (740 lines) still represents a message as a single mutable string (`_messageStr`), with every setter (`setHeader`/`setVia`/`setTo`/`setContact`/`setBody`/`syncContentLength`/...) doing an in-place `.replace()` on that string followed by a full reparse. A normal outbound response that touches five or six of those setters therefore re-scans the entire datagram five or six times to emit one packet — on an S3, not a spare-cycles platform.
-
-This is already flagged yellow in `docs/REALITY_CHECK.md` ("transient stack-to-heap cloning of `SipMessage` objects remains") — not new information, just not yet actioned.
-
-Not a memory-safety bug. The fix is a representation change, not a hardening pass: parse once into an immutable typed message, then build responses instead of mutating raw text in place. Pure C++, no new dependency.
-
----
-
 ### 🟡 Issue #74: Hold/resume on broadcast (ring-group) calls is not yet supported
 * **Status**: ⏳ Open / Planned
 * **Labels**: `bug`, `hold-resume`, `broadcast`
@@ -211,6 +196,19 @@ until a fork (or a future pass here) adds the routing policy.
 ---
 
 ## Resolved Issues
+
+### 🟢 Issue #76: `SipMessage` representation — parse-mutate-reparse on every setter
+* **Status**: ✅ Resolved
+* **Labels**: `performance`, `sip-core`, `tech-debt`
+
+#### Resolution
+The `_messageStr`-plus-full-reparse representation this issue described no longer matches the code — `src/SIP/SipMessage.cpp` was already rewritten (`dfeecba`, cppcheck follow-up in `146f63b`) to own its parsed pieces directly: a `_startLine` string, an ordered `_headerLines` vector, and a `_body` string, no shared buffer. Setters (`setVia`/`setTo`/`setContact`/`setCSeq`/...) do a single by-name lookup-and-replace against `_headerLines`; there is no cached derived state to keep in sync, so nothing needs a reparse after a mutation. `reparse()` is gone from both `SipMessage` and `SipSdpMessage`.
+
+Auditing this turned up one real residual: every response-building call site in `RequestsHandler.cpp` (51 of them) cloned a message into the static pool via `getMessageFromPool(source->toString(), source->getSource())` — serializing the already-parsed source back into one wire string and then re-splitting that string, even though `SipMessage`'s copy assignment (`= default`, added by the same rewrite specifically so messages could be cloned cheaply) is already a plain owned-string/vector copy with nothing to reconstruct. Added a `getMessageFromPool(const SipMessage&)` overload that copies the parsed fields directly (`*msg = source`, no stringify/resplit) and switched all 51 sites to it. The 4 call sites that build a message from scratch (`ss.str()`, no prior `SipMessage` to clone) were left untouched — there's no redundant reparse to remove there. Verified with the full host test suite (163/163 passing, host build) and a live REGISTER + echo-call (777) smoke test against the built `SipServer` binary (no `SIP Message pool exhausted` fallback observed under a 10-client registration + 5-concurrent-call load).
+
+Also corrected `docs/REALITY_CHECK.md`'s stale "transient stack-to-heap cloning of `SipMessage` objects remains" note (§2 of the scorecard): that had already been resolved separately by the static `_messagePool` (`RequestsHandler::getMessageFromPool()`), which every response-building call site already used before this change; only the wasted reparse on top of it remained, fixed above.
+
+---
 
 ### 🟢 Issue #73: `Held` state CDR-logged as Failed with zero duration
 * **Status**: ✅ Resolved (sip-backport)

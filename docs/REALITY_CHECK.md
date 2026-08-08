@@ -45,7 +45,7 @@ graph TD
 | Criterion | Target Metric | Post-Refactor Status | Grade | Technical Summary |
 | :--- | :--- | :--- | :---: | :--- |
 | **1. Safe Panic Handling** | Zero CPU panics in Onboarding Setup Mode on `/api/status` calls | Full protection with pointer null-checks | **`🟢 PASS`** | `HttpServer` now utilizes a safe `RequestsHandler*` pointer instead of a raw reference, backed by explicit `nullptr` checks on all status and administration endpoints. |
-| **2. Heap Fragmentation** | Zero steady-state allocations (`new`/`std::make_shared`) for clients/sessions | Pre-allocated static pools recycled via custom resets | **`🟡 PASS`**<br>*With Notes* | Static pools of size 32 (`SipClient`) and 8 (`Session`) eliminate steady-state allocations for active elements. Transient stack-to-heap cloning of `SipMessage` objects remains. |
+| **2. Heap Fragmentation** | Zero steady-state allocations (`new`/`std::make_shared`) for clients/sessions | Pre-allocated static pools recycled via custom resets | **`🟢 PASS`** | Static pools of size 32 (`SipClient`), 8 (`Session`), and `POCKETDIAL_MSG_POOL` (`SipMessage`) eliminate steady-state allocations for active elements and response cloning alike. |
 | **3. Stack Watermark Safety** | Stack allocations < 1.5 KB; Heap-allocated buffers for large frames | Large buffers shifted to the heap; high watermarks safe | **`🟢 PASS`** | The 4 KB socket read buffer was moved from local stack to heap-allocated `std::vector` inside `handleClient()`. generous 8 KB stack sizes allocated to all core tasks. |
 | **4. Lock-Free Polling** | HTTP polling bypasses signaling lock; zero packet drop during poll | Double-buffered snapshot with isolated mutex | **`🟢 PASS`** | Core `_mutex` is bypassed for dashboard queries. `HttpServer` fetches data from a copied snapshot protected by `_snapshotMutex`, written once per second during `tick()`. |
 | **5. Rate Limiting** | Protection from registration flood; drops packet under attack | Bounded rate limits with sweep | **`🟢 PASS`** | Fully implemented using a 60-second idle bucket sweep and token bucket algorithm capped at `MAX_BUCKETS = 256` to prevent heap exhaustion. `_packetsDropped` is properly tracked. |
@@ -76,7 +76,7 @@ graph TD
 * **Remaining Risks:** None. Onboarding AP/Setup mode runs stably without any panics.
 
 ### 2. Heap Fragmentation Mitigation (Steady-state dynamic allocation)
-* **Grade:** `🟡 PASS WITH RESERVATIONS`
+* **Grade:** `🟢 PASS`
 * **Issue Background:** [Issue #53](../ISSUES.md#L67-L83) detailed the hazard of executing dynamic allocations (`std::make_shared`) inside the active UDP signaling path. High-frequency SIP registration traffic would fragment the ESP32's limited heap, eventually leading to `bad_alloc` panics or out-of-memory crashes.
 * **Code Verification:**
   * `RequestsHandler` pre-allocates pools in its constructor (`src/SIP/RequestsHandler.cpp:31-39`):
@@ -89,11 +89,8 @@ graph TD
     }
     ```
   * Active elements are recycled in `allocateClient` (`src/SIP/RequestsHandler.cpp:1043`) and `allocateSession` (`src/SIP/RequestsHandler.cpp:1078`) using `client->reset(...)` rather than allocating new objects.
-* **Reservations & Remaining Risks:** 
-  * While persistent structures (`SipClient`, `Session`) are safely pooled, temporary objects are still dynamically allocated. For example, when building keep-alive pings (`RequestsHandler.cpp:1040`) or cloning messages during response generation (`RequestsHandler.cpp:848`), the code invokes `std::make_shared<SipMessage>`. 
-  * Although these are transient heap allocations that are immediately freed when the task block completes, they still cause mild heap churn. 
-  > [!IMPORTANT]
-  > **Recommendation:** To achieve absolute deterministic behavior, the transient `SipMessage` instances should also be allocated from a static pool, or parsed into static memory structures.
+  * The transient `SipMessage` allocations this section used to flag are also gone: `RequestsHandler::getMessageFromPool()` draws from a static `_messagePool` (sized `POCKETDIAL_MSG_POOL`) instead of `make_shared`-ing a fresh message per response, and every response-building call site in `RequestsHandler.cpp` goes through it. `std::make_shared<SipSdpMessage>` now appears only at pool-init time and as the last-resort fallback when the pool itself is exhausted (logged, not silent).
+* **Remaining Risks:** None outstanding for this criterion. (Issue #76 additionally closed out a related redundant-work gap: cloning a message into the pool used to serialize the source back to a wire string and re-split it — `getMessageFromPool(source->toString(), source->getSource())` — even though the pool slot could just as well be assigned directly from the parsed source. A `getMessageFromPool(const SipMessage&)` overload now does that direct copy; see ISSUES.md.)
 
 ### 3. Stack Watermark Safety (HTTP Client Handling Task)
 * **Grade:** `🟢 PASS`

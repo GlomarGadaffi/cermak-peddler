@@ -49,6 +49,13 @@ public:
 		OnHandledEvent onHandledEvent);
 
 	static std::shared_ptr<SipMessage> getMessageFromPool(std::string message, sockaddr_in src);
+	// Clones an already-parsed message into a free pool slot via a direct field
+	// copy (SipMessage's copy assignment is a plain owned-string/vector copy —
+	// no shared buffer to fix up). Used by every response-building call site that
+	// used to go through getMessageFromPool(source->toString(), source->getSource()),
+	// which paid a full serialize + reparse just to duplicate a message we had
+	// already parsed once (issue #76).
+	static std::shared_ptr<SipMessage> getMessageFromPool(const SipMessage& source);
 
 	// ── Media beachhead static helpers (pure; host-unit-tested) ──────────────────
 	// Build the server's own SDP body for the 440 answer (server media: PCMU on the
