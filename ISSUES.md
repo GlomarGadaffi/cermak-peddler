@@ -6,16 +6,6 @@ This document serves as the active issue tracker and architectural roadmap for *
 
 ## Active Issues & Backlog Roadmap
 
-### 🔵 Issue #94: `docs/API.md` endpoint catalog is stale
-* **Status**: ⏳ Open / Doc debt
-* **Labels**: `documentation`
-* **Severity**: Low
-
-#### Description
-API.md's detailed specs (§4–§5) cover only the original five endpoints. `/api/cdr`, `/api/dnd`, `/api/forward`, `/api/group`, `/api/factory-reset`, `/api/configuring`, `/api/ota/*`, and the admin session endpoints have no per-endpoint specs. §0 (added 2026-07-17) summarizes the admin layer + dark-by-default reachability and carries a partial-catalog banner, so the doc is honest but incomplete. Source of truth: `HttpServer::handleClient()`. GitHub #94.
-
----
-
 ### 🟡 Issue #74: Hold/resume on broadcast (ring-group) calls is not yet supported
 * **Status**: ⏳ Open / Planned
 * **Labels**: `bug`, `hold-resume`, `broadcast`
@@ -174,6 +164,17 @@ until a fork (or a future pass here) adds the routing policy.
 ---
 
 ## Resolved Issues
+
+### 🟢 Issue #94: `docs/API.md` endpoint catalog is stale
+* **Status**: ✅ Resolved
+* **Labels**: `documentation`
+
+#### Resolution
+Cross-checked `docs/API.md`'s §4 catalog against the actual route dispatch in `src/Helpers/HttpServer.cpp::handleClient()` (grepped every `req.path ==` / request-line match, including `/api/ota/upload`'s special-cased streaming interception and `/config/<mac>.cfg`'s prefix match). Every route the server actually serves now has a full per-endpoint spec: `/`, `/api/status`, `/api/kill`, `/api/cdr`, `/api/pcap`, `/api/trace`, `/config/<mac>.cfg`, `/api/dnd`, `/api/forward`, `/api/group`, `/api/wifi/scan`, `/api/wifi/connect`, `/api/wifi/mode_ap`, `/api/configuring`, `/api/factory-reset`, `/api/ota/status`, `/api/ota/upload`, `/api/ota/reboot` — all present with method, auth requirements, request params, response codes, and example payloads. The admin session endpoints (`/api/admin/*`) are covered in §0 by design (the doc's own note explains why they're not repeated in §4), not a gap. The partial-catalog banner this issue referenced is already gone.
+
+This was done by an earlier commit (`3a65c13 docs(api): fill in the stale endpoint catalog`, plus later additions as `/api/pcap`/`/api/trace`/`/config/<mac>.cfg` shipped) — `ISSUES.md` just hadn't been updated to reflect it. No doc changes were needed here beyond closing out the tracker entry.
+
+---
 
 ### 🟢 Issue #93: Already-provisioned admin PINs beginning `4887` are shadowed by the `*4887` HTTP-open star-code
 * **Status**: ✅ Resolved (to its practical ceiling)
