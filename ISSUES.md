@@ -6,16 +6,6 @@ This document serves as the active issue tracker and architectural roadmap for *
 
 ## Active Issues & Backlog Roadmap
 
-### 🟡 Issue #93: Already-provisioned admin PINs beginning `4887` are shadowed by the `*4887` HTTP-open star-code
-* **Status**: ⏳ Open / Documented residual
-* **Labels**: `security`, `dtmf`
-* **Severity**: Low
-
-#### Description
-`*4887` is matched incrementally in `onDtmfInfo` before the `*PIN#code` parser, so a PIN beginning with those four digits can never complete a DTMF admin command — the star-code fires mid-entry and clears the accumulator. `POST /api/admin/set-pin` now rejects the `4887` prefix (regression test `AdminHttpGate.SetPin_RejectsReservedStarCodePrefix`), but that only covers new/changed PINs; a device provisioned before the guard keeps the collision. The PIN is stored salted+hashed, so a boot-time scan is impossible — the practical ceiling is documentation (done: CHANGELOG) plus optionally a behavioral warning when the star-code fires and the same call continues with `#`-digits. GitHub #93.
-
----
-
 ### 🔵 Issue #94: `docs/API.md` endpoint catalog is stale
 * **Status**: ⏳ Open / Doc debt
 * **Labels**: `documentation`
@@ -184,6 +174,20 @@ until a fork (or a future pass here) adds the routing policy.
 ---
 
 ## Resolved Issues
+
+### 🟢 Issue #93: Already-provisioned admin PINs beginning `4887` are shadowed by the `*4887` HTTP-open star-code
+* **Status**: ✅ Resolved (to its practical ceiling)
+* **Labels**: `security`, `dtmf`
+
+#### Resolution
+`*4887` is matched incrementally in `onDtmfInfo` before the `*PIN#code` parser, so a PIN beginning with those four digits can never complete a DTMF admin command — the star-code fires mid-entry and clears the accumulator. The PIN is stored salted+hashed, so a boot-time scan for already-provisioned collisions is fundamentally impossible; that residual is accepted, not fixable, and stays true regardless of anything else here. What the issue asked for is everything short of that impossible scan, and both pieces are now in place and verified:
+
+1. **Guard new/changed PINs.** `POST /api/admin/set-pin` rejects any PIN starting with `4887` (`AdminHttpGate.SetPin_RejectsReservedStarCodePrefix`), so the collision can't be freshly created going forward.
+2. **Behavioral warning for the existing-device case.** `onDtmfInfo` detects the shape of an interrupted `*PIN#code` entry immediately after `*4887` fires (`accum.starCodeFiredAtTick`) and logs a targeted warning naming the `4887` collision and pointing at `POST /api/admin/set-pin` to rotate the PIN — one warning per incident, verified by `AdminHttpGate.Trigger_ContinuedEntryAfterStarCodeLogsShadowedPinWarning` (warns) and `AdminHttpGate.Trigger_PlainStarCodeWithNoContinuationDoesNotWarn` (doesn't false-positive on an ordinary `*4887`-only open).
+
+Both are also documented outside the code: `CHANGELOG.md` records the guard and the detection, and `docs/THREAT_MODEL.md` §E-4/residuals carries the full writeup (mitigation, false-positive/negative shape, and the rotate-your-PIN remediation). Verified via the full host suite (168/168, including the three tests above) — no code change was needed, only closing out `ISSUES.md` to match what had already shipped.
+
+---
 
 ### 🟢 Issue #77: DTMF CLASS codes bypass `setDnd()`/`setForward()`, dashboard goes stale
 * **Status**: ✅ Resolved
