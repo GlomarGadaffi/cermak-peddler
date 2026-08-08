@@ -5,7 +5,7 @@
 #include <cstdlib>
 #include <algorithm>
 
-#if defined(ESP_PLATFORM) || defined(ESP32)
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	// Persisted in a DEDICATED NVS namespace ("tapicfg") so a factory-reset of
 	// the PBX config ("pbxcfg") never collaterally wipes — or accidentally
 	// dumps — API credentials. NOTE: values are plaintext in flash unless the
@@ -152,7 +152,7 @@ std::string TelephonyApiConfig::setActiveSlot(size_t idx)
 
 // ── Persistence backends ──────────────────────────────────────────────────────
 
-#if defined(ESP_PLATFORM) || defined(ESP32)
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 
 void TelephonyApiConfig::load()
 {

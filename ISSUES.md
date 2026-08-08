@@ -38,16 +38,6 @@ Since physical target hardware (smart display JC3248W535EN, POE boards, etc.) is
 
 ---
 
-### 🟡 Issue #41: SIP core: Arduino IDE platform detection guards need verification (ESP32/ARDUINO defines)
-* **Status**: ⏳ Open / Planned
-* **Labels**: `build-system`, `compatibility`
-* **Severity**: Low
-
-#### Description
-Arduino IDE build configs should be verified against platform detection macros (`ESP32`, `ARDUINO`, `ESP_PLATFORM`) to ensure smooth compatibility for hobbyist flashing.
-
----
-
 ### 🔵 Issue #35: [Feature Request] Zero-Touch Phone Auto-Provisioning (HTTP)
 * **Status**: ⏳ Open / Planned (Backlog)
 * **Labels**: `feature-request`, `provisioning`
@@ -164,6 +154,24 @@ until a fork (or a future pass here) adds the routing policy.
 ---
 
 ## Resolved Issues
+
+### 🟢 Issue #41: SIP core: Arduino IDE platform detection guards need verification (ESP32/ARDUINO defines)
+* **Status**: ✅ Resolved (static audit; no Arduino IDE/hardware available to compile-verify)
+* **Labels**: `build-system`, `compatibility`
+
+#### Resolution
+No Arduino IDE, `arduino-cli`, or ESP32 toolchain is available in this environment, so this couldn't be closed with an actual compile — what follows is a full static audit of every platform-detection guard in `src/`, `main/`, and `sketches/`, plus what was safe to fix without a compiler to check the result.
+
+**Inventory.** `src/` uses one dominant, deliberate pattern — `#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)` — in ~70 places across `RequestsHandler`, `Registrar`, `RtpSender`/`RtpReceiver`, `UdpServer`, `SipClient`, `SipDigest`, `AdminAuth`, `SipSecretStore`, `ArpLookup`, `PcapCapture`, `PbxEnv`, `SipWireUtil`. This is clearly intentional defensive coverage: `ESP_PLATFORM` is the ESP-IDF native define, `ESP32`/`ARDUINO` are what the Arduino-ESP32 core defines, and different core generations have varied in which of the three they set.
+
+**Narrower than that pattern, audited individually:**
+* `src/SIP/SipMessage.hpp` (socket header selection) and `src/SIP/TelephonyApiConfig.cpp` (×2, NVS header selection) checked only `ESP_PLATFORM || ESP32`, missing `ARDUINO`. Fixed to the 3-way form. This project only ships ESP32 sketches, and the Arduino-ESP32 core has always defined `ESP32` alongside `ARDUINO` for any ESP32 board, so `ARDUINO` without `ESP32` can't actually occur here — the fix has zero behavioral effect on any real build, it's pure consistency with the established convention. Verified with the full host suite (168/168) since these headers also compile on host (hitting the `#elif __linux__`/`#else` branches there either way).
+* `main/ui/ui.cpp` checks `ESP_PLATFORM` alone. Left as-is: `main/` is exclusively the ESP-IDF-native app entry (`idf.py`-only, per `main/CMakeLists.txt`'s use of `IDF_VERSION_MAJOR` etc.) — the Arduino sketches in `sketches/` have their own `setup()`/`loop()` and never compile anything under `main/`. Not reachable from the Arduino build path at all, so out of scope for this issue.
+* `src/Helpers/HttpServer.hpp`/`.cpp` (socket includes, 6 sites) and `src/Helpers/OtaUpdater.hpp`/`.cpp` (the ESP-IDF `esp_ota_*`/`esp_partition_t` wrapper) check `ESP_PLATFORM` alone, with **no** `ESP32`/`ARDUINO` fallback — and both *are* compiled into every Arduino sketch (each `.ino`'s header comment says to add every `.cpp` from `src/Helpers/`, and `HttpServer.cpp` calls into `OtaUpdater`). **Not changed** — I could not verify on a real toolchain whether this is a live bug, and the two plausible outcomes differ (compile failure, which is loud and immediately visible to a hobbyist flashing it, vs. a "silent host-stub" OTA on some older core, which the `OtaUpdater.cpp` header comment frames as one of two *deliberate* side-by-side implementations, not an oversight). Mitigating: every actively-maintained sketch's own header comment pins **"ESP32 Arduino Core ≥ 3.0" / "3.x"** (`SipServerETH.ino`, `SipServer_T_ETH_Lite_W5500.ino`, `SipServer_T_POE_Pro_LAN8720.ino`, `SipServer_JC3248W535.ino`) — core 3.x is built as an ESP-IDF component and reliably defines `ESP_PLATFORM`, so against the documented minimum supported core this is not a live gap. It would only bite on an older (2.x or earlier) core, which isn't what these sketches say to install. Flagged here rather than changed blind, since getting this wrong in either direction (widening a guard that turns out to matter, or leaving a real gap) isn't something I can confirm without a real Arduino IDE + `arduino-esp32` compile — left for whoever next has that hardware/toolchain available.
+
+No sketch-level (`.ino`) platform-detection branching exists to audit — the `.ino` files are pure hardware pin-mapping/setup code with no `#ifdef` on `ESP_PLATFORM`/`ESP32`/`ARDUINO` of their own; the `ARDUINO_EVENT_ETH_*` cases in the Ethernet sketches are event-enum switches (WiFi/ETH event callback dispatch), not platform guards.
+
+---
 
 ### 🟢 Issue #94: `docs/API.md` endpoint catalog is stale
 * **Status**: ✅ Resolved
