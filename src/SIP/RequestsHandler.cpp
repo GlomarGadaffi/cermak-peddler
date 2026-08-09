@@ -116,31 +116,55 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	refreshDeviceSnapshot();
 }
 
-std::shared_ptr<SipMessage> RequestsHandler::getMessageFromPool(std::string message, sockaddr_in src)
+std::shared_ptr<SipMessage> RequestsHandler::findFreePoolSlot()
 {
 	for (auto& msg : _messagePool)
 	{
 		if (msg.use_count() == 1)
 		{
-			msg->reset(std::move(message), src);
 			return msg;
 		}
 	}
-	std::cerr << "[WARNING] SIP Message pool exhausted! Fallback to heap allocation.\n";
+	return nullptr;
+}
+
+static void logPoolExhausted(const char* poolName, size_t& warnCount)
+{
+	if ((warnCount++ % 100) == 0)
+	{
+		std::cerr << "[WARNING] " << poolName << " pool exhausted (" << (warnCount)
+			<< " total)! Fallback to heap allocation.\n";
+	}
+}
+
+std::shared_ptr<SipMessage> RequestsHandler::getMessageFromPool(std::string message, sockaddr_in src)
+{
+	if (std::shared_ptr<SipMessage> msg = findFreePoolSlot())
+	{
+		msg->reset(std::move(message), src);
+		return msg;
+	}
+	static size_t warnCount = 0;
+	logPoolExhausted("SIP Message", warnCount);
+	// ponytail: unbounded heap allocation, no cap, no reject-and-drop like the
+	// session-pool-full path ("440 media: session pool full") uses — a sustained
+	// retransmit flood could churn the heap indefinitely. Ceiling: none today.
+	// Upgrade path: once a small fallback-in-flight count is exceeded, drop the
+	// packet instead of allocating, mirroring allocateSession()'s 503-and-reject
+	// behavior. Tracked as Issue #101. See also allocateVirtualPeer() below.
 	return std::make_shared<SipSdpMessage>(std::move(message), src);
 }
 
 std::shared_ptr<SipMessage> RequestsHandler::getMessageFromPool(const SipMessage& source)
 {
-	for (auto& msg : _messagePool)
+	if (std::shared_ptr<SipMessage> msg = findFreePoolSlot())
 	{
-		if (msg.use_count() == 1)
-		{
-			*msg = source;
-			return msg;
-		}
+		*msg = source;
+		return msg;
 	}
-	std::cerr << "[WARNING] SIP Message pool exhausted! Fallback to heap allocation.\n";
+	static size_t warnCount = 0;
+	logPoolExhausted("SIP Message", warnCount);
+	// ponytail: same unbounded-fallback ceiling as above (Issue #101).
 	std::shared_ptr<SipMessage> msg = std::make_shared<SipSdpMessage>("", sockaddr_in{});
 	*msg = source;
 	return msg;
@@ -525,9 +549,7 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 			for (const auto& target : session.value()->getPendingTargets())
 			{
 				auto cancelMsg = getMessageFromPool(*data);
-				char ipBuf[INET_ADDRSTRLEN]{};
-				inet_ntop(AF_INET, &target->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
-				std::string targetIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(target->getAddress().sin_port));
+				std::string targetIpPort = sipwire::addrToIpPort(target->getAddress());
 
 				cancelMsg->setHeader("CANCEL sip:" + target->getNumber() + "@" + targetIpPort + " SIP/2.0");
 
@@ -1231,20 +1253,13 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 			{
 				auto byeFork = getMessageFromPool(*data);
 				std::string serverIpPort = activeIp + ":" + std::to_string(_serverPort);
-
-				char ipBuf[INET_ADDRSTRLEN]{};
-				inet_ntop(AF_INET, &answeringClient->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
-				std::string targetIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(answeringClient->getAddress().sin_port));
+				std::string targetIpPort = sipwire::addrToIpPort(answeringClient->getAddress());
 
 				byeFork->setHeader("BYE sip:" + answeringClient->getNumber() + "@" + targetIpPort + " SIP/2.0");
 
 				std::string originalTo(data->getTo());
 				std::string newTo = "To: <sip:" + answeringClient->getNumber() + "@" + serverIpPort + ">";
-				size_t tagPos = originalTo.find(";tag=");
-				if (tagPos != std::string::npos)
-				{
-					newTo += originalTo.substr(tagPos);
-				}
+				siphdr::appendTagFrom(newTo, originalTo);
 				byeFork->setTo(newTo);
 
 				_outbox.emplace_back(answeringClient->getAddress(), std::move(byeFork));
@@ -1362,11 +1377,7 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 					{
 						std::string originalTo(inviteMsg->getTo());
 						std::string bTo(data->getTo());
-						size_t tagPos = bTo.find(";tag=");
-						if (tagPos != std::string::npos)
-						{
-							originalTo += bTo.substr(tagPos);
-						}
+						siphdr::appendTagFrom(originalTo, bTo);
 						response->setTo(originalTo);
 					}
 
@@ -1387,9 +1398,7 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 							if (target->getNumber() != answeringClient->getNumber())
 							{
 								auto cancelMsg = getMessageFromPool(*inviteMsg);
-								char ipBuf[INET_ADDRSTRLEN]{};
-								inet_ntop(AF_INET, &target->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
-								std::string targetIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(target->getAddress().sin_port));
+								std::string targetIpPort = sipwire::addrToIpPort(target->getAddress());
 
 								cancelMsg->setHeader("CANCEL sip:" + target->getNumber() + "@" + targetIpPort + " SIP/2.0");
 								cancelMsg->setCSeq(originalCSeq);
@@ -1468,20 +1477,13 @@ void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 			auto ackFork = getMessageFromPool(*data);
 			std::string activeIp = _localIp;
 			std::string serverIpPort = activeIp + ":" + std::to_string(_serverPort);
-
-			char ipBuf[INET_ADDRSTRLEN]{};
-			inet_ntop(AF_INET, &answeringClient->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
-			std::string targetIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(answeringClient->getAddress().sin_port));
+			std::string targetIpPort = sipwire::addrToIpPort(answeringClient->getAddress());
 
 			ackFork->setHeader("ACK sip:" + answeringClient->getNumber() + "@" + targetIpPort + " SIP/2.0");
 
 			std::string originalTo(data->getTo());
 			std::string newTo = "To: <sip:" + answeringClient->getNumber() + "@" + serverIpPort + ">";
-			size_t tagPos = originalTo.find(";tag=");
-			if (tagPos != std::string::npos)
-			{
-				newTo += originalTo.substr(tagPos);
-			}
+			siphdr::appendTagFrom(newTo, originalTo);
 			ackFork->setTo(newTo);
 
 			_outbox.emplace_back(answeringClient->getAddress(), std::move(ackFork));
@@ -1645,9 +1647,7 @@ void RequestsHandler::buildInviteFork(const std::shared_ptr<SipMessage>& invite,
 	inviteFork->setContact(buildContact(caller->getNumber()));
 
 	std::string activeIp = _localIp;
-	char ipBuf[INET_ADDRSTRLEN]{};
-	inet_ntop(AF_INET, &target->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
-	std::string targetIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(target->getAddress().sin_port));
+	std::string targetIpPort = sipwire::addrToIpPort(target->getAddress());
 	std::string serverIpPort = activeIp + ":" + std::to_string(_serverPort);
 
 	inviteFork->setHeader("INVITE sip:" + target->getNumber() + "@" + targetIpPort + " SIP/2.0");
@@ -1832,9 +1832,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildCancel(const std::shared_ptr<S
 
 	auto cancelMsg = getMessageFromPool(*invite);
 
-	char ipBuf[INET_ADDRSTRLEN]{};
-	inet_ntop(AF_INET, &target->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
-	std::string targetIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(target->getAddress().sin_port));
+	std::string targetIpPort = sipwire::addrToIpPort(target->getAddress());
 
 	cancelMsg->setHeader("CANCEL sip:" + target->getNumber() + "@" + targetIpPort + " SIP/2.0");
 	cancelMsg->setTo("To: <sip:" + target->getNumber() + "@" + serverIpPort + ">");
@@ -2652,9 +2650,7 @@ bool RequestsHandler::sendMessageTo(const std::string& ext, const std::string& t
 		}
 
 		const sockaddr_in& addr = client.value()->getAddress();
-		char ipBuf[INET_ADDRSTRLEN]{};
-		inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf));
-		std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(addr.sin_port));
+		std::string destIpPort = sipwire::addrToIpPort(addr);
 
 		std::string activeIp = _localIp;
 		std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
@@ -2851,9 +2847,7 @@ void RequestsHandler::tick()
 		{
 			if (client->getNumber().empty()) continue;
 			const auto& addr = client->getAddress();
-			char ipBuf[INET_ADDRSTRLEN]{};
-			inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf));
-			std::string ipPort = std::string(ipBuf) + ":" + std::to_string(ntohs(addr.sin_port));
+			std::string ipPort = sipwire::addrToIpPort(addr);
 			nextSnapshot.clients.emplace_back(client->getNumber(), ipPort);
 		}
 
@@ -2961,9 +2955,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildOptionsPing(const std::shared_
 {
 	std::string clientNum = client->getNumber();
 
-	char ipBuf[INET_ADDRSTRLEN]{};
-	inet_ntop(AF_INET, &client->getAddress().sin_addr, ipBuf, sizeof(ipBuf));
-	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(client->getAddress().sin_port));
+	std::string destIpPort = sipwire::addrToIpPort(client->getAddress());
 
 	std::string activeIp = _localIp;
 	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
@@ -4155,9 +4147,7 @@ std::shared_ptr<SipMessage> RequestsHandler::buildServerBye(
 {
 	std::string activeIp = _localIp;
 	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
-	char ipBuf[INET_ADDRSTRLEN]{};
-	inet_ntop(AF_INET, &destAddr.sin_addr, ipBuf, sizeof(ipBuf));
-	std::string destIpPort = std::string(ipBuf) + ":" + std::to_string(ntohs(destAddr.sin_port));
+	std::string destIpPort = sipwire::addrToIpPort(destAddr);
 	std::string branch = "z9hG4bK" + IDGen::GenerateID(12);
 
 	std::ostringstream ss;
@@ -4186,6 +4176,10 @@ std::shared_ptr<SipClient> RequestsHandler::allocateVirtualPeer(std::string numb
 		}
 	}
 	// Pool drained: fall back to a one-off heap SipClient rather than failing the call.
-	std::cerr << "[WARNING] Virtual-peer pool exhausted! Fallback to heap allocation.\n";
+	// ponytail: same unbounded-fallback ceiling as getMessageFromPool above — no cap,
+	// no reject-and-drop under sustained pressure. See that function's comment for
+	// the upgrade path. Tracked as Issue #101.
+	static size_t warnCount = 0;
+	logPoolExhausted("Virtual-peer", warnCount);
 	return std::make_shared<SipClient>(std::move(number), address, expiresSeconds);
 }

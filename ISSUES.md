@@ -6,6 +6,24 @@ This document serves as the active issue tracker and architectural roadmap for *
 
 ## Active Issues & Backlog Roadmap
 
+### 🟡 Issue #101: Pool-exhaustion backpressure, SDP re-parse, PcapCapture alloc-under-lock, incomplete firmware audit
+* **Status**: ⏳ Open / Planned
+* **Labels**: `performance`, `reliability`, `memory-safety`, `cleanup`, `refactoring`, `esp32`
+* **Severity**: Medium (bundles five sub-items, ranked A-E in the issue body; A and D are the medium-severity ones)
+
+#### Description
+Follow-up from a two-pass review of `src/SIP` (a laziness/reuse-discipline pass plus an embedded-firmware hardware-risk pass) run after PR #100. Two duplication findings and one pre-existing host-build break from that review were fixed directly on `main` (see commit); this issue tracks the five items deliberately **not** fixed in that pass:
+
+- **A** — `getMessageFromPool()`/`allocateVirtualPeer()` (`RequestsHandler.cpp`) still fall back to an unbounded heap allocation on pool exhaustion, unlike `allocateSession()`'s correct reject-and-503 pattern. Mitigated this pass with rate-limited logging + a `ponytail:` ceiling comment; the real reject-and-drop redesign touches ~55 call sites (`getMessageFromPool()` alone is called ~55 times across the file) and needs its own PR.
+- **B** — `SipSdpMessage` re-parses the full SDP body on every accessor call (`SipSdpMessage.cpp:92-120`), no caching.
+- **C** — `TransactionLayer::maybeTrack()` (`TransactionLayer.cpp:39-57`) repeats a correct bounds-safe copy pattern 4x; left as-is, refactor risk outweighs the line-count benefit.
+- **D** — `PcapCapture::record()` (`PcapCapture.hpp:60-66`) does a per-SIP-packet `std::string` alloc/free while holding the caller's mutex, on the hot path when capture is enabled.
+- **E** — The firmware-lens pass didn't finish walking `SipWireUtil.hpp`/`RtpReceiver.cpp`/`RtpSender.cpp` (endianness/packed-struct), `TransactionLayer.cpp` (blocking calls on the retransmit-timer path), or watchdog-starvation risk in long-running loops.
+
+Full detail per item: https://github.com/GlomarGadaffi/pocket-dial/issues/101
+
+---
+
 ### 🟡 Issue #74: Hold/resume on broadcast (ring-group) calls is not yet supported
 * **Status**: ⏳ Open / Planned
 * **Labels**: `bug`, `hold-resume`, `broadcast`

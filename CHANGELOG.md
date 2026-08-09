@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased (post-100-review-followups) - 2026-08-09
+
+A pass through `src/SIP` following a laziness/reuse-discipline review plus an
+embedded-firmware hardware-risk review run after PR #100. See Issue #101 for
+the items found but deliberately not fixed here (pool-exhaustion backpressure
+redesign, `SipSdpMessage` re-parse caching, `PcapCapture` alloc-under-lock,
+and an incomplete firmware audit of the RTP/wire-format files).
+
+### Fixed
+
+- `RequestsHandler.cpp`: consolidated 10 hand-rolled `inet_ntop` +
+  IP:port-formatting blocks onto the existing `sipwire::addrToIpPort()`
+  helper, which the file already included and used correctly once but had
+  re-derived by hand 10 more times as it grew.
+
+- `RequestsHandler.cpp`: consolidated 3 duplicate To-header `;tag=` splice
+  blocks onto a new `siphdr::appendTagFrom()` helper in `SipHeaderUtil.hpp`.
+
+- Rate-limited (1-in-100) the `SIP Message pool exhausted` /
+  `Virtual-peer pool exhausted` warning logs, previously an unthrottled
+  `stderr` write per occurrence — a flood that exhausts the pool would
+  otherwise also flood the log/serial pipe. The underlying unbounded
+  heap-fallback behavior itself is unchanged and tracked as Issue #101.
+
+- Host build (MSVC): defined `NOMINMAX` for the non-IDF CMake branch.
+  `Registrar::noteChange()`'s `std::max(...)` call was colliding with
+  `windows.h`'s `max()` macro, breaking the host build MSVC gates on
+  independent of this review. Full host suite: 168/168 passing.
+
 ## Unreleased (tracker-followups) - 2026-08-04
 
 A pass through the open issue tracker: small hardening/perf fixes, docs

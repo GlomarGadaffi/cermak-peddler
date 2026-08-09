@@ -10,6 +10,14 @@ else()
     set(CMAKE_CXX_STANDARD 17)
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+    if (WIN32)
+        # windows.h's max()/min() macros collide with std::max/std::min (e.g.
+        # Registrar.cpp's noteChange()) unless suppressed. Applies to this
+        # directory and tests/ (add_subdirectory below inherits directory
+        # properties regardless of its own project() call).
+        add_compile_definitions(NOMINMAX)
+    endif()
+
     set(SRC_DIR "${PROJECT_SOURCE_DIR}/src")
 
     set(HELPERS_SRC_FILES "${SRC_DIR}/Helpers")

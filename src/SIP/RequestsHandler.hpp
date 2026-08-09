@@ -57,6 +57,11 @@ public:
 	// already parsed once (issue #76).
 	static std::shared_ptr<SipMessage> getMessageFromPool(const SipMessage& source);
 
+private:
+	// Returns a free (use_count()==1) pool slot, or nullptr if the pool is exhausted.
+	static std::shared_ptr<SipMessage> findFreePoolSlot();
+
+public:
 	// ── Media beachhead static helpers (pure; host-unit-tested) ──────────────────
 	// Build the server's own SDP body for the 440 answer (server media: PCMU on the
 	// server's RTP port). Pure formatter — exposed so tests can assert its body and

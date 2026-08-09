@@ -22,6 +22,18 @@ namespace siphdr
 		return std::string(header.substr(p, e - p));
 	}
 
+	// Appends the ";tag=..." suffix found in `source` (if any) onto `header` in place.
+	// Used when building a new From/To header that must carry over the dialog tag
+	// from a different (already-tagged) header line.
+	inline void appendTagFrom(std::string& header, std::string_view source)
+	{
+		size_t tagPos = source.find(";tag=");
+		if (tagPos != std::string_view::npos)
+		{
+			header += source.substr(tagPos);
+		}
+	}
+
 	// Strip a leading "HeaderName:" prefix (e.g. "From:", "To:", "Call-ID:") so
 	// server-minted requests emit a clean value and never ship a doubled prefix.
 	// Safe on bare values (the check is that the text before ':' contains only
