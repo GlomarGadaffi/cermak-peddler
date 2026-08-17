@@ -29,9 +29,13 @@ struct PbxEnv
 	virtual ~PbxEnv() = default;
 
 	// Queue a message for sending once the current handle()/tick() pass unlocks.
+	// A null `msg` is dropped, so `enqueue(addr, messageFromPool(...))` is safe
+	// to write inline without a check (Issue #101(A)).
 	virtual void enqueue(const sockaddr_in& to, std::shared_ptr<SipMessage> msg) = 0;
 
-	// Draw a SipMessage from the fixed pool (heap fallback on exhaustion).
+	// Draw a SipMessage from the fixed pool. Falls back to a BOUNDED number of
+	// heap allocations and then returns nullptr (Issue #101(A)) — check it before
+	// dereferencing. The contract on refusal is to drop: the peer retransmits.
 	virtual std::shared_ptr<SipMessage> messageFromPool(std::string raw, sockaddr_in src) = 0;
 
 	// Append to the deferred log queue (flushed off-lock).
@@ -46,7 +50,9 @@ struct PbxEnv
 	// Look up a live registration binding; nullptr when `number` isn't registered.
 	virtual std::shared_ptr<SipClient> findRegistered(std::string_view number) = 0;
 	// Draw a transient virtual-peer SipClient (777/440/park leg) from the fixed
-	// pool (heap fallback on exhaustion — graceful, never a crash).
+	// pool. Falls back to a BOUNDED number of heap allocations and then returns
+	// nullptr (Issue #101(A)) — check it, and abandon the operation rather than
+	// wiring a session to a null dest.
 	virtual std::shared_ptr<SipClient> allocVirtualPeer(std::string number, const sockaddr_in& addr) = 0;
 	// Draw a Session from the fixed pool; nullptr on exhaustion. NOT yet visible
 	// to lookups — pair with insertSession once it is wired up.

@@ -92,6 +92,7 @@ void RegisterBeeper::sendBeep(const std::shared_ptr<SipClient>& phone)
 	   << body;
 
 	auto invite = _env.messageFromPool(ss.str(), addr);
+	if (!invite) return;   // pool exhausted: drop, peer retransmits (#101A)
 	// Normalise the codec list and (re)derive Content-Length from the actual body —
 	// a wrong Content-Length silently breaks the offer on UDP (the 777-path bug).
 	invite->enforceG711();

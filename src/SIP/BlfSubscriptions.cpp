@@ -149,6 +149,7 @@ void BlfSubscriptions::onSubscribe(const std::shared_ptr<SipMessage>& data)
 	if (pkg != "dialog")
 	{
 		auto resp = _env.messageFromPool(data->toString(), data->getSource());
+		if (!resp) return;   // pool exhausted: drop, peer retransmits (#101A)
 		resp->setHeader(SipMessageTypes::BAD_EVENT);
 		resp->clearBody();
 		resp->setVia(std::string(data->getVia()) + ";received=" + activeIp);
@@ -162,6 +163,7 @@ void BlfSubscriptions::onSubscribe(const std::shared_ptr<SipMessage>& data)
 	if (!_env.validAor(target))
 	{
 		auto resp = _env.messageFromPool(data->toString(), data->getSource());
+		if (!resp) return;   // pool exhausted: drop, peer retransmits (#101A)
 		resp->setHeader(SipMessageTypes::BAD_REQUEST);
 		resp->clearBody();
 		resp->setVia(std::string(data->getVia()) + ";received=" + activeIp);
@@ -190,6 +192,7 @@ void BlfSubscriptions::onSubscribe(const std::shared_ptr<SipMessage>& data)
 		if (sub == nullptr)
 		{
 			auto resp = _env.messageFromPool(data->toString(), data->getSource());
+			if (!resp) return;   // pool exhausted: drop, peer retransmits (#101A)
 			resp->setHeader("SIP/2.0 503 Service Unavailable");
 			resp->clearBody();
 			resp->setVia(std::string(data->getVia()) + ";received=" + activeIp);
@@ -210,6 +213,7 @@ void BlfSubscriptions::onSubscribe(const std::shared_ptr<SipMessage>& data)
 	// 4. 202 Accepted (RFC 6665 §4.2.1).
 	{
 		auto resp = _env.messageFromPool(data->toString(), data->getSource());
+		if (!resp) return;   // pool exhausted: drop, peer retransmits (#101A)
 		resp->setHeader(SipMessageTypes::ACCEPTED);
 		resp->clearBody();
 		resp->setVia(std::string(data->getVia()) + ";received=" + activeIp);
@@ -231,9 +235,16 @@ void BlfSubscriptions::onSubscribe(const std::shared_ptr<SipMessage>& data)
 	std::string state = computeDialogState(target, dir, dialogId);
 	const bool terminating = (expires == 0);
 	auto notify = buildDialogNotify(*sub, state, dir, dialogId, terminating, "noresource");
-	_env.enqueue(sub->addr, std::move(notify));
-	sub->lastState = state + "|" + dir + "|" + dialogId;
-	sub->version++;
+	// Same reasoning as refresh(): only bank lastState if the NOTIFY was actually
+	// built, so a pool refusal leaves it empty and the next refresh() retries
+	// rather than treating this state as already delivered (#101A). The
+	// `terminating` teardown below still runs either way.
+	if (notify)
+	{
+		_env.enqueue(sub->addr, std::move(notify));
+		sub->lastState = state + "|" + dir + "|" + dialogId;
+		sub->version++;
+	}
 
 	if (terminating)
 	{
@@ -252,6 +263,11 @@ void BlfSubscriptions::refresh()
 		std::string token = state + "|" + dir + "|" + dialogId;
 		if (token == sub.lastState) continue;
 		auto notify = buildDialogNotify(sub, state, dir, dialogId, false, "");
+		// Do NOT record lastState if the pool refused: the token is what suppresses
+		// re-notifying, so banking a state we never sent would leave this watcher's
+		// lamp stale until the target's state changes AGAIN. Leaving it untouched
+		// means the next refresh() retries this NOTIFY (#101A).
+		if (!notify) continue;
 		_env.enqueue(sub.addr, std::move(notify));
 		sub.lastState = token;
 		sub.version++;

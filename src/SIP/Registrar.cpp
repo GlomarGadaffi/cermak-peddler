@@ -65,6 +65,7 @@ void Registrar::persistMode()
 void Registrar::sendChallenge(const std::shared_ptr<SipMessage>& data, bool stale)
 {
 	auto response = _env.messageFromPool(data->toString(), data->getSource());
+	if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 	response->setHeader("SIP/2.0 401 Unauthorized");
 	response->clearBody();
 	response->setVia(std::string(data->getVia()) + ";received=" + _env.localIp());
@@ -80,6 +81,7 @@ void Registrar::sendChallenge(const std::shared_ptr<SipMessage>& data, bool stal
 void Registrar::sendForbidden(const std::shared_ptr<SipMessage>& data, const std::string& reason)
 {
 	auto response = _env.messageFromPool(data->toString(), data->getSource());
+	if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 	response->setHeader("SIP/2.0 403 " + reason);
 	response->clearBody();
 	response->setVia(std::string(data->getVia()) + ";received=" + _env.localIp());

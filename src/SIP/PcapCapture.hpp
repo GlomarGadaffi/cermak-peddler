@@ -32,7 +32,6 @@
 
 #include <chrono>
 #include <cstdint>
-#include <deque>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -45,6 +44,13 @@
 // pools in PoolConfig.hpp — this bounds *count*, not a static footprint.
 // Compile-time tunable (-DPOCKETDIAL_PCAP_RING_SIZE=N); lower it to claw back
 // RAM on a constrained node.
+//
+// Issue #101(D): the ring still grows lazily, but it no longer shrinks — once a
+// slot has been used its buffer is recycled for the next packet to land there
+// rather than freed. So the high-water mark is what a busy node settles at, and
+// the steady-state capture path allocates nothing. Capture is unconditional
+// (there is no enable flag; see the record() sites in RequestsHandler), which is
+// what makes that worth doing rather than a micro-optimization.
 #ifndef POCKETDIAL_PCAP_RING_SIZE
 #define POCKETDIAL_PCAP_RING_SIZE 64
 #endif
@@ -59,15 +65,52 @@ public:
 	// _mutex, the same lock guarding everything else a packet touches).
 	void record(bool outbound, const sockaddr_in& peer, std::string_view bytes)
 	{
-		if (_entries.size() >= POCKETDIAL_PCAP_RING_SIZE)
+		recordInto(outbound, peer).assign(bytes.data(), bytes.size());
+	}
+
+	// Issue #101(D): as record(), but hands back the entry's byte buffer for the
+	// caller to serialize straight into instead of making it materialize a
+	// temporary std::string first. Both capture sites are on the SIP hot path and
+	// run under RequestsHandler::_mutex, and capture is unconditional, so that
+	// temporary was a malloc/free per packet inside the critical section — on top
+	// of the one this class used to do copying it in.
+	//
+	// The returned buffer is empty but keeps whatever capacity the evicted entry
+	// had, so once the ring has filled — the steady state — recording a packet
+	// allocates nothing at all. The reference is valid until the next
+	// recordInto()/record()/clear().
+	std::string& recordInto(bool outbound, const sockaddr_in& peer)
+	{
+		Entry* slot;
+		if (_entries.size() < POCKETDIAL_PCAP_RING_SIZE)
 		{
-			_entries.pop_front();
+			// Still filling: grow by one. The ring is deliberately grown lazily
+			// rather than reserved up front, so a node that never sees traffic
+			// never pays for slots it has not used (see the sizing note above).
+			_entries.emplace_back();
+			slot = &_entries.back();
 		}
-		_entries.push_back(Entry{_nextSeq++, outbound, peer, std::string(bytes), monotonicUs()});
+		else
+		{
+			// Full: overwrite the oldest entry in place and advance the ring head.
+			// No pop/push, so nothing is freed and nothing is allocated.
+			slot = &_entries[_head];
+			_head = (_head + 1) % _entries.size();
+		}
+		slot->seq      = _nextSeq++;
+		slot->outbound = outbound;
+		slot->peer     = peer;
+		slot->tsUs     = monotonicUs();
+		slot->bytes.clear();   // clear() keeps capacity; assign()/append() reuse it
+		return slot->bytes;
 	}
 
 	std::size_t size() const { return _entries.size(); }
-	void clear() { _entries.clear(); }
+	void clear()
+	{
+		_entries.clear();
+		_head = 0;
+	}
 
 	// Issue #32: current ring contents formatted for the dashboard's live SIP
 	// tracer, which polls GET /api/trace and appends whatever it hasn't already
@@ -85,11 +128,10 @@ public:
 	{
 		std::vector<TraceRecord> out;
 		out.reserve(_entries.size());
-		for (const auto& e : _entries)
-		{
+		forEachOldestFirst([&out](const Entry& e) {
 			out.push_back(TraceRecord{e.seq, e.tsUs, e.outbound,
 				sipwire::addrToIpPort(e.peer), e.bytes});
-		}
+		});
 		return out;
 	}
 
@@ -113,8 +155,7 @@ public:
 
 		const uint32_t localAddr = static_cast<uint32_t>(inet_addr(localIp.c_str()));
 
-		for (const auto& e : _entries)
-		{
+		forEachOldestFirst([&](const Entry& e) {
 			std::string frame = frameFor(e, localAddr, localPort);
 			const uint32_t sec  = static_cast<uint32_t>(e.tsUs / 1000000ULL);
 			const uint32_t usec = static_cast<uint32_t>(e.tsUs % 1000000ULL);
@@ -124,7 +165,7 @@ public:
 			appendU32LE(out, len);   // incl_len
 			appendU32LE(out, len);   // orig_len: never truncated, so equal
 			out.append(frame);
-		}
+		});
 		return out;
 	}
 
@@ -137,10 +178,27 @@ private:
 		std::string bytes;
 		uint64_t    tsUs;
 	};
-	std::deque<Entry> _entries;
+	// Ring buffer. Grows to POCKETDIAL_PCAP_RING_SIZE and then stops: entries are
+	// overwritten in place, so storage order stops matching capture order once it
+	// wraps. `_head` is the index of the OLDEST entry (0 while still filling);
+	// everything that reads the ring goes through forEachOldestFirst().
+	std::vector<Entry> _entries;
+	std::size_t _head = 0;
 	// Monotonic, never reused (even across evictions) so a client's high-water
 	// mark from traceRecords() stays meaningful after older entries roll off.
 	uint64_t _nextSeq = 0;
+
+	// Oldest-to-newest traversal. While the ring is still filling `_head` is 0 and
+	// this is plain in-order iteration; after it wraps it walks from `_head`.
+	template <typename F>
+	void forEachOldestFirst(F&& fn) const
+	{
+		const std::size_t n = _entries.size();
+		for (std::size_t i = 0; i < n; ++i)
+		{
+			fn(_entries[(_head + i) % n]);
+		}
+	}
 
 	static uint64_t monotonicUs()
 	{

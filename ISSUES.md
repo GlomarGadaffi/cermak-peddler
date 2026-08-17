@@ -6,24 +6,6 @@ This document serves as the active issue tracker and architectural roadmap for *
 
 ## Active Issues & Backlog Roadmap
 
-### 🟡 Issue #101: Pool-exhaustion backpressure, SDP re-parse, PcapCapture alloc-under-lock, incomplete firmware audit
-* **Status**: ⏳ Open / Planned
-* **Labels**: `performance`, `reliability`, `memory-safety`, `cleanup`, `refactoring`, `esp32`
-* **Severity**: Medium (bundles five sub-items, ranked A-E in the issue body; A and D are the medium-severity ones)
-
-#### Description
-Follow-up from a two-pass review of `src/SIP` (a laziness/reuse-discipline pass plus an embedded-firmware hardware-risk pass) run after PR #100. Two duplication findings and one pre-existing host-build break from that review were fixed directly on `main` (see commit); this issue tracks the five items deliberately **not** fixed in that pass:
-
-- **A** — `getMessageFromPool()`/`allocateVirtualPeer()` (`RequestsHandler.cpp`) still fall back to an unbounded heap allocation on pool exhaustion, unlike `allocateSession()`'s correct reject-and-503 pattern. Mitigated this pass with rate-limited logging + a `ponytail:` ceiling comment; the real reject-and-drop redesign touches ~55 call sites (`getMessageFromPool()` alone is called ~55 times across the file) and needs its own PR.
-- **B** — `SipSdpMessage` re-parses the full SDP body on every accessor call (`SipSdpMessage.cpp:92-120`), no caching.
-- **C** — `TransactionLayer::maybeTrack()` (`TransactionLayer.cpp:39-57`) repeats a correct bounds-safe copy pattern 4x; left as-is, refactor risk outweighs the line-count benefit.
-- **D** — `PcapCapture::record()` (`PcapCapture.hpp:60-66`) does a per-SIP-packet `std::string` alloc/free while holding the caller's mutex, on the hot path when capture is enabled.
-- **E** — The firmware-lens pass didn't finish walking `SipWireUtil.hpp`/`RtpReceiver.cpp`/`RtpSender.cpp` (endianness/packed-struct), `TransactionLayer.cpp` (blocking calls on the retransmit-timer path), or watchdog-starvation risk in long-running loops.
-
-Full detail per item: https://github.com/GlomarGadaffi/pocket-dial/issues/101
-
----
-
 ### 🟡 Issue #74: Hold/resume on broadcast (ring-group) calls is not yet supported
 * **Status**: ⏳ Open / Planned
 * **Labels**: `bug`, `hold-resume`, `broadcast`
@@ -172,6 +154,45 @@ until a fork (or a future pass here) adds the routing policy.
 ---
 
 ## Resolved Issues
+
+### 🟢 Issue #101: Pool-exhaustion backpressure, SDP re-parse, PcapCapture alloc-under-lock, incomplete firmware audit
+* **Status**: ✅ Resolved 2026-08-17 — **A**, **B**, **D**, **E** fixed; **C** formally declined (see below)
+* **Labels**: `performance`, `reliability`, `memory-safety`, `cleanup`, `refactoring`, `esp32`
+* **Severity**: Medium (bundles five sub-items, ranked A-E in the issue body; A and D are the medium-severity ones)
+
+#### Description
+Follow-up from a two-pass review of `src/SIP` (a laziness/reuse-discipline pass plus an embedded-firmware hardware-risk pass) run after PR #100. Two duplication findings and one pre-existing host-build break from that review were fixed directly on `main` (see commit); this issue tracks the five items deliberately **not** fixed in that pass:
+
+- ~~**A** — `getMessageFromPool()`/`allocateVirtualPeer()` (`RequestsHandler.cpp`) still fall back to an unbounded heap allocation on pool exhaustion.~~ ✅ **Fixed 2026-08-17.** Both now fall back to a *bounded* number of heap allocations alive at once (`POCKETDIAL_MSG_HEAP_FALLBACK_MAX`, `POCKETDIAL_VPEER_HEAP_FALLBACK_MAX` in `PoolConfig.hpp`), tracked by an atomic in-flight counter decremented from the shared_ptr deleter, and return `nullptr` past that.
+
+  On refusal the contract is **drop, not 503** — building a 503 would need a message out of the very pool that just came up empty, so the reject-and-503 pattern `allocateSession()` uses is not available here. SIP over UDP retransmits (RFC 3261 §17), so a dropped packet costs latency rather than the call.
+
+  67 call sites updated (55 `getMessageFromPool` in `RequestsHandler.cpp`, 12 `messageFromPool` across the decomposed machines). Two things kept that from being 67 hand-written checks: `enqueue()` now drops a null centrally, which covers every inline `enqueue(addr, messageFromPool(...))`; and the highest-volume path — inbound packets — needed no new code at all, because `SipMessageFactory::createMessage` already returned `nullopt` on null and `handle()` already dropped it. Where a builder returns null its callers mostly checked already. Covered by `tests/RequestsHandler_pool_test.cpp`.
+- ~~**B** — `SipSdpMessage` re-parses the full SDP body on every accessor call (`SipSdpMessage.cpp:92-120`), no caching.~~ ✅ **Fixed 2026-08-17.** The six accessors now share one single-pass parse, cached until the body changes. Invalidation is driven by a `_bodyGen` counter on `SipMessage`, bumped by every `_body` mutation and published as `bodyGeneration()` — not a valid/dirty flag, because pooled messages are recycled through `reset()` and `*msg = source` and a flag-based cache would hand the previous call's `c=`/`m=` lines to the next call. The cache holds `(offset, length)` spans rather than `string_view`s so the pool's copy stays correct, and `SipMessage::operator=` is no longer `= default` (it advances `_bodyGen` instead of adopting the source's — the pool assigns through a base reference, so only the base subobject is assigned and a copied generation could make the destination's stale cache look fresh). Covered by `tests/SipSdpMessage_cache_test.cpp` (12 tests, mutation-verified).
+- **C** — `TransactionLayer::maybeTrack()` (`TransactionLayer.cpp:39-57`) repeats a correct bounds-safe copy pattern 4x. ⛔ **Declined 2026-08-17, deliberately not fixed.** Re-examined and the original call stands: the four blocks each copy a different `std::string_view` into a different fixed `char[]` member, and the only thing they share is shape. Folding them into a helper trades four obvious bounds-safe copies for one indirection over a member pointer or a lambda per field — the code gets shorter and the review surface gets worse, on the retransmit path, for no behavioral gain. Recorded here so the next reviewer does not re-litigate it.
+- ~~**D** — `PcapCapture::record()` (`PcapCapture.hpp:60-66`) does a per-SIP-packet `std::string` alloc/free while holding the caller's mutex.~~ ✅ **Fixed 2026-08-17.** The ring no longer pops and pushes; once full it overwrites the oldest entry in place and recycles that entry's buffer, so the steady-state capture path allocates nothing. `recordInto()` additionally hands the slot's buffer back to the caller and a new `SipMessage::toString(std::string&)` serializes straight into it, removing the per-packet temporary the two capture sites were building *before* `record()` even copied it. Worth doing properly because capture is unconditional — there is no enable flag, so this ran on every inbound and outbound message under `_mutex`. Covered by 3 new tests in `tests/PcapCapture_test.cpp`.
+- ~~**E** — The firmware-lens pass didn't finish walking `SipWireUtil.hpp`/`RtpReceiver.cpp`/`RtpSender.cpp` (endianness/packed-struct), `TransactionLayer.cpp` (blocking calls on the retransmit-timer path), or watchdog-starvation risk in long-running loops.~~ ✅ **Completed 2026-08-17.** Findings below.
+
+#### #101(E) audit findings
+
+**1. Data race in the message-pool handout — FOUND AND FIXED (the significant one).**
+`findFreePoolSlot()` scanned the *static* `_messagePool` for `use_count()==1` and then copied the `shared_ptr` — a check-then-take with no synchronization, reachable concurrently from two tasks:
+
+* the UDP receive task (`UdpServer.cpp:134` → `SipServer::onNewMessage` → `SipMessageFactory::createMessage` → `getMessageFromPool`), holding **no lock** — `handle()` only takes `_mutex` afterwards, on the already-allocated message;
+* the tick task (`esp_main.cpp:192`, or `SipServer::tickLoop` on desktop) → `tick()` → `TransactionLayer::sweep` → `messageFromPool`, under `_mutex`.
+
+Both could observe `use_count()==1` on the same slot and both take it, then `reset()` it concurrently — two owners writing one `SipMessage` and reallocating its strings under each other. Holding `_mutex` on one side does not help: a lock only excludes other holders of that same lock. It fires precisely under load (retransmit sweep active while packets arrive), which is the scenario item A exists to harden. Fixed with a dedicated leaf mutex around the scan-and-take; the fallback deleter is documented as never taking it, since the last reference can drop while it is held.
+
+**2. Endianness / packed structs — clean.** `RtpSender::buildRtpHeader` writes every multi-byte RTP field byte-by-byte in big-endian (`RtpSender.cpp:122-142`); `RtpReceiver` parses the same way. No packed structs, no casting a buffer to a header type, so no strict-aliasing exposure and no host-endianness assumption. `SipWireUtil.hpp` uses `ntohs` on a real `sockaddr_in` field and `inet_ntop` with a correctly-sized `INET_ADDRSTRLEN` buffer.
+
+**3. Blocking calls on the retransmit-timer path — clean, with one note.** `TransactionLayer::sweep()` allocates nothing but a pooled message, does no socket I/O (sends are deferred to the outbox and drained after unlock, per Issue #51), touches no NVS, and never sleeps. It already null-checked `messageFromPool` before this change. Note for the record: every `TransactionLayer` method runs *under* the engine `_mutex` by design (documented at `TransactionLayer.hpp:20`), and `maybeTrack()` does one `msg->toString()` heap allocation on the send path — bounded and not on the timer path, so left alone.
+
+**4. Watchdog starvation in long-running loops — clean.** Every long-lived loop blocks or yields on each iteration, so the idle task always runs: `UdpServer::receiveLoop` and `RtpReceiver::receiveLoop` block in `recvfrom()` with `SO_RCVTIMEO` set; `RtpSender`'s ESP send loop paces with `vTaskDelayUntil` and its host counterpart with `sleep_until`; the bind-retry loops back off with `vTaskDelay`. No spin-waits, no unbounded no-yield work.
+
+Full detail per item: https://github.com/GlomarGadaffi/pocket-dial/issues/101
+
+---
+
 
 ### 🟢 Issue #41: SIP core: Arduino IDE platform detection guards need verification (ESP32/ARDUINO defines)
 * **Status**: ✅ Resolved (static audit; no Arduino IDE/hardware available to compile-verify)
