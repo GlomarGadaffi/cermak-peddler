@@ -192,8 +192,14 @@ TEST(RequestsHandlerPool, HandlerDropsPacketsWhilePoolIsStarvedAndRecovers) {
 		handler.handle(RequestsHandler::getMessageFromPool(registerRaw("starved"), poolAddr()));
 
 		// Nothing was produced, and nothing captured — the packet never existed.
+		// Both views of the ring are checked: a bare header (24 bytes, no packet
+		// records) pins that no partial capture leaked in either direction, which
+		// getTraceRecords().empty() alone would not catch if only the outbound
+		// side had been recorded.
 		EXPECT_TRUE(handler.getTraceRecords().empty())
 			<< "a dropped packet must not reach the capture ring";
+		EXPECT_EQ(handler.getPcapCapture().size(), 24u)
+			<< "pcap ring must hold nothing but the global header";
 	}
 
 	// Capacity restored: the same packet now gets a response.
