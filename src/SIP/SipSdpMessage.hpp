@@ -77,7 +77,7 @@ private:
 	// Generation of the body _spans was parsed from. 0 is never a live body
 	// generation (SipMessage::_bodyGen starts at 1), so a fresh or freshly-copied
 	// message re-parses on first access without needing a separate valid flag.
-	mutable uint32_t _spansGen = 0;
+	mutable uint64_t _spansGen = 0;
 
 	// Re-parses the body iff it has changed since the last parse.
 	const SdpSpans& ensureParsed() const;

@@ -283,6 +283,14 @@ void BlfSubscriptions::sweepExpired()
 		std::string dir, dialogId;
 		std::string state = computeDialogState(sub.targetAor, dir, dialogId);
 		auto notify = buildDialogNotify(sub, state, dir, dialogId, true, "timeout");
+		if (!notify)
+		{
+			// Keep the slot one more sweep rather than wiping it after silently
+			// dropping the terminal NOTIFY: without it the watcher never learns the
+			// subscription ended and its lamp stays frozen until it re-SUBSCRIBEs.
+			// The deadline has already passed, so the next sweep retries (#101A).
+			continue;
+		}
 		_env.enqueue(sub.addr, std::move(notify));
 		_env.log("BLF: subscription to " + sub.targetAor + " expired");
 		sub = DialogSubscription{};

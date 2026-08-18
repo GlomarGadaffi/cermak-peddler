@@ -181,13 +181,27 @@ namespace
 	};
 }
 
-static void logPoolExhausted(const char* poolName, std::atomic<std::size_t>& warnCount)
+// Two distinct signals, deliberately. `Fallback` fires the moment the fixed pool
+// runs dry and the heap fallback takes over — pressure building, nothing lost yet.
+// `Refused` fires once the fallback budget is spent too and packets are actually
+// being dropped. Collapsing them (as an earlier cut of #101(A) did) removes the
+// only early warning an operator gets and reports trouble solely after the damage.
+enum class PoolPressure { Fallback, Refused };
+
+static void logPoolExhausted(const char* poolName, PoolPressure level,
+	std::atomic<std::size_t>& warnCount)
 {
 	// Rate-limited 1-in-100: a flood that drains the pool would otherwise also
-	// flood the log pipe.
-	if ((warnCount.fetch_add(1, std::memory_order_relaxed) % 100) == 0)
+	// flood the log pipe. The running total is kept in the message so the sampling
+	// does not hide the true magnitude.
+	const std::size_t n = warnCount.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((n - 1) % 100 == 0)
 	{
-		std::cerr << "[WARNING] " << poolName << " pool exhausted! Dropping.\n";
+		std::cerr << "[WARNING] " << poolName << " pool exhausted ("
+			<< n << " total)! "
+			<< (level == PoolPressure::Fallback
+				? "Falling back to bounded heap allocation.\n"
+				: "Fallback budget spent — DROPPING packets.\n");
 	}
 }
 
@@ -199,6 +213,15 @@ std::shared_ptr<SipMessage> RequestsHandler::acquirePooledMessage()
 	{
 		if (msg.use_count() == 1)
 		{
+			// The mutex serializes TAKERS, but the previous owner released this
+			// slot outside it — typically on the send path once the drained outbox
+			// goes out of scope. use_count() is only an atomic load, so on its own
+			// it establishes no happens-before with that releasing thread, and the
+			// reset() we are about to authorize reads the message's existing string
+			// and vector internals before overwriting them. This fence pairs with
+			// the release the refcount decrement performs, so those writes are
+			// visible before we hand the slot on.
+			std::atomic_thread_fence(std::memory_order_acquire);
 			// Copy INSIDE the lock: the copy is what publishes use_count()==2 and
 			// so what makes this slot invisible to the other task's scan. Callers
 			// initialize it (reset() / operator=) after we return, by which point
@@ -208,11 +231,17 @@ std::shared_ptr<SipMessage> RequestsHandler::acquirePooledMessage()
 	}
 
 	// Pool drawn down: fall back to the heap, but only up to a fixed number alive
-	// at once (Issue #101(A)). Past that, refuse and let the caller drop.
+	// at once (Issue #101(A)). Past that, refuse and let the caller drop. Both
+	// transitions are logged, from here rather than the callers, so the two
+	// getMessageFromPool overloads share one rate-limit counter per pool instead
+	// of each sampling 1-in-100 independently under the same label.
+	static std::atomic<std::size_t> msgWarnCount{0};
 	if (s_msgHeapFallbacksInFlight.load(std::memory_order_relaxed) >= POCKETDIAL_MSG_HEAP_FALLBACK_MAX)
 	{
+		logPoolExhausted("SIP Message", PoolPressure::Refused, msgWarnCount);
 		return nullptr;
 	}
+	logPoolExhausted("SIP Message", PoolPressure::Fallback, msgWarnCount);
 
 	SipMessage* raw = nullptr;
 	try
@@ -242,12 +271,7 @@ std::shared_ptr<SipMessage> RequestsHandler::acquirePooledMessage()
 std::shared_ptr<SipMessage> RequestsHandler::getMessageFromPool(std::string message, sockaddr_in src)
 {
 	std::shared_ptr<SipMessage> msg = acquirePooledMessage();
-	if (!msg)
-	{
-		static std::atomic<std::size_t> warnCount{0};
-		logPoolExhausted("SIP Message", warnCount);
-		return nullptr;
-	}
+	if (!msg) return nullptr;   // acquirePooledMessage() already logged the pressure
 	msg->reset(std::move(message), src);
 	return msg;
 }
@@ -255,12 +279,7 @@ std::shared_ptr<SipMessage> RequestsHandler::getMessageFromPool(std::string mess
 std::shared_ptr<SipMessage> RequestsHandler::getMessageFromPool(const SipMessage& source)
 {
 	std::shared_ptr<SipMessage> msg = acquirePooledMessage();
-	if (!msg)
-	{
-		static std::atomic<std::size_t> warnCount{0};
-		logPoolExhausted("SIP Message", warnCount);
-		return nullptr;
-	}
+	if (!msg) return nullptr;   // acquirePooledMessage() already logged the pressure
 	*msg = source;
 	return msg;
 }
@@ -1163,6 +1182,21 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 		queueLog("440 media: session pool full, rejected " + std::string(data->getFromNumber()), true);
 		return;
 	}
+	// The 200 OK is drawn BEFORE the session is published, because past
+	// _sessions.emplace() + Connected there is no clean way back: the caller's
+	// INVITE retransmit would hit the _rtpSender.isActive() guard at the top of
+	// this function and be answered 486 Busy Here, with the tone still streaming
+	// to a peer that never got an answer. Unwinding the stream here — the same
+	// thing the session-pool-full path above does — leaves the retransmit a clean
+	// retry (#101A).
+	auto ok = getMessageFromPool(*data);
+	if (!ok)
+	{
+		_rtpSender.stop(std::string(data->getCallID()));
+		queueLog("440 media: message pool exhausted, stream unwound", true);
+		return;
+	}
+
 	newSession->setDest(dummy440);
 	_sessions.emplace(data->getCallID(), newSession);
 	newSession->setState(Session::State::Connected);
@@ -1178,8 +1212,6 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 	// Assemble the OK from the INVITE's headers + our body. clearBody() leaves the
 	// header/blank-line boundary intact; we then append Content-Type + the SDP and
 	// let syncContentLength() (invoked by enforceG711) fix the length.
-	auto ok = getMessageFromPool(*data);
-	if (!ok) return;   // pool exhausted: drop, peer retransmits (#101A)
 	ok->setHeader(SipMessageTypes::OK);
 	ok->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 	ok->setTo(std::string(data->getTo()) + ";tag=" + toTag);
@@ -1376,8 +1408,14 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 			auto answeringClient = session.value()->getDest();
 			if (answeringClient)
 			{
+				// NOT a `return` on refusal: the caller's 200 OK is already queued
+				// above, so it has its final response and will never retransmit this
+				// BYE. Bailing here would skip endCall() below and leak the session
+				// with no CDR. Losing the fork only leaves the paged phone to time
+				// out its own dialog; losing the teardown is unrecoverable (#101A).
 				auto byeFork = getMessageFromPool(*data);
-				if (!byeFork) return;   // pool exhausted: drop, peer retransmits (#101A)
+				if (byeFork)
+				{
 				std::string serverIpPort = activeIp + ":" + std::to_string(_serverPort);
 				std::string targetIpPort = sipwire::addrToIpPort(answeringClient->getAddress());
 
@@ -1389,6 +1427,7 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 				byeFork->setTo(newTo);
 
 				_outbox.emplace_back(answeringClient->getAddress(), std::move(byeFork));
+				}
 			}
 		}
 		endCall(data->getCallID(), data->getFromNumber(), destNumber);
@@ -1490,14 +1529,20 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 						return;
 					}
 
+					// Drawn BEFORE the session is advanced: the branch above only
+					// re-enters while the state is still Invited, so refusing after
+					// setState(Connected) would strand the call permanently — the
+					// answering phone's 200 OK retransmit could never get back in
+					// here. Acquire first, mutate second (#101A).
+					auto response = getMessageFromPool(*data);
+					if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+
 					session->get()->setDest(answeringClient);
 					session->get()->setState(Session::State::Connected);
 					session->get()->clearRingTimer();   // hunt answered: disarm timeout
 
 					auto inviteMsg = session.value()->getInviteMessage();
 
-					auto response = getMessageFromPool(*data);
-					if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 					response->setContact(buildContact(answeringClient->getNumber()));
 
 					if (inviteMsg)
@@ -1773,13 +1818,17 @@ void RequestsHandler::onMessage(std::shared_ptr<SipMessage> data)
 	_outbox.emplace_back(data->getSource(), std::move(response));
 }
 
-void RequestsHandler::buildInviteFork(const std::shared_ptr<SipMessage>& invite,
+bool RequestsHandler::buildInviteFork(const std::shared_ptr<SipMessage>& invite,
 	const std::shared_ptr<SipClient>& caller,
 	const std::shared_ptr<SipClient>& target,
 	bool intercom)
 {
 	auto inviteFork = getMessageFromPool(*invite);
-	if (!inviteFork) return;   // pool exhausted: drop, peer retransmits (#101A)
+	// Returns bool because callers report success on this function's behalf —
+	// huntRingNext arms a 20 s no-answer timer, redirectInvite NOTIFYs the
+	// transferor. A silent void return had them announcing an INVITE that was
+	// never sent (#101A).
+	if (!inviteFork) return false;
 	inviteFork->setContact(buildContact(caller->getNumber()));
 
 	std::string activeIp = _localIp;
@@ -1801,6 +1850,7 @@ void RequestsHandler::buildInviteFork(const std::shared_ptr<SipMessage>& invite,
 	}
 	inviteFork->enforceG711();
 	_outbox.emplace_back(target->getAddress(), std::move(inviteFork));
+	return true;
 }
 
 void RequestsHandler::startBroadcastFork(std::shared_ptr<SipMessage> invite,
@@ -1823,15 +1873,21 @@ void RequestsHandler::startBroadcastFork(std::shared_ptr<SipMessage> invite,
 		_outbox.emplace_back(invite->getSource(), std::move(responseObj));
 		return;
 	}
+	std::string contactExt = intercom ? std::string("999") : std::string(invite->getToNumber());
+
+	// Drawn BEFORE the session is published. Refusing after _sessions.emplace()
+	// would register a session under this Call-ID with no target ever invited and
+	// — unlike the hunt path — no ring timer for tick() to sweep, so it would sit
+	// there permanently; the INVITE retransmit's duplicate emplace() is a silent
+	// no-op, so it would not replace the zombie either (#101A).
+	auto ringing = getMessageFromPool(*invite);
+	if (!ringing) return;   // pool exhausted: drop, peer retransmits (#101A)
+
 	newSession->setBroadcast(true);
 	newSession->setPendingTargets(targets);
 	newSession->setInviteMessage(invite);
 	_sessions.emplace(invite->getCallID(), newSession);
 
-	std::string contactExt = intercom ? std::string("999") : std::string(invite->getToNumber());
-
-	auto ringing = getMessageFromPool(*invite);
-	if (!ringing) return;   // pool exhausted: drop, peer retransmits (#101A)
 	ringing->setHeader("SIP/2.0 180 Ringing");
 	ringing->clearBody();
 	std::string activeIp = _localIp;
@@ -1871,7 +1927,13 @@ bool RequestsHandler::huntRingNext(const std::shared_ptr<Session>& session)
 		}
 
 		session->setPendingTargets({ mc.value() });
-		buildInviteFork(invite, caller, mc.value(), /*intercom=*/false);
+		if (!buildInviteFork(invite, caller, mc.value(), /*intercom=*/false))
+		{
+			// Nothing was rung, so do NOT arm the no-answer timer — that would burn
+			// the full NO_ANSWER_TIMEOUT waiting on a member that never got an
+			// INVITE. Try the next member instead (#101A).
+			continue;
+		}
 		session->armRingTimer(std::chrono::steady_clock::now() + NO_ANSWER_TIMEOUT);
 		return true;
 	}
@@ -1908,7 +1970,13 @@ bool RequestsHandler::redirectInvite(const std::shared_ptr<SipMessage>& invite,
 		if (!session)
 		{
 			std::shared_ptr<SipMessage> responseObj = getMessageFromPool(*invite);
-			if (!responseObj) return false;   // pool exhausted: drop, peer retransmits (#101A)
+			// true, not false, even though nothing was sent. false here means
+			// "target not registered — fall through", which on the CFU path would
+			// ring the extension the subscriber explicitly forwarded away from, and
+			// on the REFER path would report "target not registered" for a target
+			// that is. The target WAS resolved; we just could not serve it. Same
+			// answer as the 503 branch below (#101A).
+			if (!responseObj) return true;
 			responseObj->setHeader("SIP/2.0 503 Service Unavailable");
 			responseObj->clearBody();
 			responseObj->setContact(buildContact(caller->getNumber()));
@@ -2971,11 +3039,17 @@ void RequestsHandler::tick()
 			if (client->getNumber().empty()) continue;
 			if (now - client->getLastPingTime() >= std::chrono::seconds(5))
 			{
-				client->setLastPingTime(now);
 				auto ping = buildOptionsPing(client);
-				// Skip this client's keepalive if the pool refused; the next tick
-				// re-pings, and a missed OPTIONS only delays liveness detection.
-				if (ping) _outbox.emplace_back(client->getAddress(), std::move(ping));
+				// Stamp the ping time only once one actually exists. Stamping first
+				// would re-arm the interval gate for a ping that was never sent, so
+				// a refusal would cost a whole keepalive interval instead of being
+				// retried on the next tick — worst behavior exactly when the box is
+				// already overloaded (#101A).
+				if (ping)
+				{
+					client->setLastPingTime(now);
+					_outbox.emplace_back(client->getAddress(), std::move(ping));
+				}
 			}
 		}
 
@@ -4335,12 +4409,13 @@ std::shared_ptr<SipClient> RequestsHandler::allocateVirtualPeer(std::string numb
 	// PbxEnv::allocVirtualPeer — already runs under _mutex. The counter is still
 	// atomic because its decrement happens in the deleter, which runs wherever
 	// the owning Session finally releases it.
+	static std::atomic<std::size_t> vpeerWarnCount{0};
 	if (s_vpeerHeapFallbacksInFlight.load(std::memory_order_relaxed) >= POCKETDIAL_VPEER_HEAP_FALLBACK_MAX)
 	{
-		static std::atomic<std::size_t> warnCount{0};
-		logPoolExhausted("Virtual-peer", warnCount);
+		logPoolExhausted("Virtual-peer", PoolPressure::Refused, vpeerWarnCount);
 		return nullptr;
 	}
+	logPoolExhausted("Virtual-peer", PoolPressure::Fallback, vpeerWarnCount);
 
 	SipClient* raw = nullptr;
 	try

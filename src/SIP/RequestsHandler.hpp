@@ -422,7 +422,9 @@ private:
 	// Build and queue a single INVITE fork toward one target, re-pointing the
 	// request line / To at that target. `intercom` toggles the auto-answer headers.
 	// Caller holds _mutex.
-	void buildInviteFork(const std::shared_ptr<SipMessage>& invite,
+	// false when the message pool refused: no INVITE was sent, so the caller must
+	// not report success on its behalf (#101A).
+	bool buildInviteFork(const std::shared_ptr<SipMessage>& invite,
 		const std::shared_ptr<SipClient>& caller,
 		const std::shared_ptr<SipClient>& target,
 		bool intercom);

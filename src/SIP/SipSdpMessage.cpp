@@ -56,7 +56,7 @@ void SipSdpMessage::setMedia(std::string value)
 // line endings is unchanged, as is last-one-wins when a body repeats a field.
 const SipSdpMessage::SdpSpans& SipSdpMessage::ensureParsed() const
 {
-	const uint32_t gen = bodyGeneration();
+	const uint64_t gen = bodyGeneration();
 	if (_spansGen == gen)
 	{
 		return _spans;   // body has not been touched since the last parse

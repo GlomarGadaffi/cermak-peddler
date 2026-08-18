@@ -139,7 +139,7 @@ protected:
 	//
 	// Not atomic, and not internally synchronized: like the rest of SipMessage,
 	// a given message is only ever touched under RequestsHandler::_mutex.
-	uint32_t bodyGeneration() const { return _bodyGen; }
+	uint64_t bodyGeneration() const { return _bodyGen; }
 
 	bool _hasSdp = false;
 
@@ -176,7 +176,13 @@ private:
 	// The copy CONSTRUCTOR does copy it, which is correct — there is no
 	// pre-existing cache in a brand-new object to go stale, and the copied body
 	// and copied cache describe the same bytes.
-	uint32_t                 _bodyGen = 1;
+	// 64-bit, not 32: it only ever increments, and a pooled slot on a
+	// long-lived device bumps it several times per handled message. A 32-bit
+	// counter would eventually wrap onto a value a derived cache had already
+	// recorded — reviving a stale SDP parse against a different call's body, the
+	// exact hazard this exists to prevent — or onto 0, the fresh-cache sentinel.
+	// At even 10k bumps/second a 64-bit counter outlives the hardware.
+	uint64_t                 _bodyGen = 1;
 
 	sockaddr_in _src{};
 
