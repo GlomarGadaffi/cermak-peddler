@@ -36,6 +36,18 @@ namespace provisioning
 	inline std::string yealinkConfigFor(const std::string& extension,
 		const std::string& serverIp, int serverPort, bool authRequired)
 	{
+		// Every value below lands in a `key = value\r\n` line, so a CR or LF in the
+		// extension would inject config lines into the file the handset parses
+		// (Issue #107). Callers hand over an AOR-validated extension -- this is the
+		// format-level backstop for the ones that forget, and for future callers
+		// wiring in less-trusted input. Only CR/LF is rejected, not the whole AOR
+		// charset: '*55' and '+15551234' are legitimate extensions and provision fine.
+		if (extension.find('\r') != std::string::npos ||
+			extension.find('\n') != std::string::npos)
+		{
+			return {};
+		}
+
 		std::string out;
 		out.reserve(512);
 		out += "#!version:1.0.0.1\r\n";

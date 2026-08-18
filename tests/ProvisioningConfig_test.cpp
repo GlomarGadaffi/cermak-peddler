@@ -64,3 +64,48 @@ TEST(ProvisioningConfig, FindProvisioningInfoReturnsNulloptForUnknownMac)
 		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
 	EXPECT_FALSE(handler.findProvisioningInfo("805ec079c37f").has_value());
 }
+
+// ── Config-line injection via the extension (Issue #107) ──────────────────────
+//
+// yealinkConfigFor() interpolates the extension into `key = value\r\n` lines. An
+// extension carrying a CR or LF could therefore append config keys the admin
+// never wrote -- `account.1.password` being the interesting one. onRegister()
+// gates every adopted extension through isValidAor(), whose charset excludes
+// CR/LF, so this is not reachable today; these pin the format-level backstop so
+// it stays unreachable if a future caller feeds the builder from somewhere else.
+
+TEST(ProvisioningConfig, BuilderRefusesExtensionCarryingCrlfInjection)
+{
+	std::string cfg = provisioning::yealinkConfigFor(
+		"101\r\naccount.1.password = hunter2", "192.168.4.1", 5060,
+		/*authRequired=*/false);
+
+	EXPECT_TRUE(cfg.empty())
+		<< "a CRLF-bearing extension must produce no config at all, rather than "
+		   "one carrying the injected line: " << cfg;
+}
+
+TEST(ProvisioningConfig, BuilderRefusesBareCrAndBareLf)
+{
+	EXPECT_TRUE(provisioning::yealinkConfigFor("101\naccount.1.password = x",
+		"192.168.4.1", 5060, false).empty()) << "bare LF";
+	EXPECT_TRUE(provisioning::yealinkConfigFor("101\raccount.1.password = x",
+		"192.168.4.1", 5060, false).empty()) << "bare CR";
+	// Trailing, not just embedded -- a lone terminator still opens the next line.
+	EXPECT_TRUE(provisioning::yealinkConfigFor("101\r\n",
+		"192.168.4.1", 5060, false).empty()) << "trailing CRLF";
+}
+
+TEST(ProvisioningConfig, BuilderStillAcceptsTheRestOfTheAorCharset)
+{
+	// The guard rejects CR/LF only. Star codes, '+', and the RFC 3261 user-part
+	// punctuation isValidAor() allows are legitimate extensions and must still
+	// provision -- a stricter [0-9A-Za-z] strip would silently mangle these.
+	for (const char* ext : {"*55", "+15551234", "1_0.1-a", "#77"})
+	{
+		std::string cfg = provisioning::yealinkConfigFor(ext, "192.168.4.1", 5060,
+			/*authRequired=*/false);
+		EXPECT_NE(cfg.find(std::string("account.1.user_name = ") + ext), std::string::npos)
+			<< "extension '" << ext << "' should provision unchanged: " << cfg;
+	}
+}

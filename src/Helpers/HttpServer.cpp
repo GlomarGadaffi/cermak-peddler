@@ -1079,6 +1079,13 @@ void HttpServer::sendConfigCfg(int sock, const std::string& mac)
 	std::string activeIp = (_ip == "0.0.0.0") ? getPrimaryLocalIP() : _ip;
 	std::string cfg = provisioning::yealinkConfigFor(info->extension, activeIp, 5060,
 		info->authRequired);
+	if (cfg.empty())
+	{
+		// The builder refused the extension (CR/LF -- Issue #107). There is no safe
+		// partial config to serve, so this is a miss, not a 200 with an empty body.
+		send404(sock);
+		return;
+	}
 	sendResponse(sock, 200, "OK", "text/plain", cfg);
 }
 
