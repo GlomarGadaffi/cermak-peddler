@@ -54,7 +54,7 @@ elseif(SIP_TRANSPORT STREQUAL "display")
     set(MAIN_SRC "esp_main_display.cpp")
     set(EXTRA_REQUIRES esp_lcd espressif__esp_lcd_touch lvgl__lvgl esp_driver_ledc
         ${IDF_V6_DRIVERS})
-    set(ADDITIONAL_SRCS "drivers/esp_lcd_axs15231b.c" "ui/ui.cpp" "ui/qrcode.c" "wifi/DnsServer.cpp")
+    set(ADDITIONAL_SRCS "drivers/esp_lcd_axs15231b.cpp" "ui/ui.cpp" "ui/qrcode.cpp" "wifi/DnsServer.cpp")
     message(STATUS "SipServer transport: Guition AXS15231B Touch Display (LVGL)")
 else()
     set(MAIN_SRC "esp_main.cpp")
@@ -119,10 +119,10 @@ endif()
 
 if(SIP_TRANSPORT STREQUAL "display")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE POCKETDIAL_UDP_RX_CORE=0)
-    # qrcode.c (ricmoo QRCode, vendored): uses #pragma mark (an Xcode-ism) GCC flags as an
+    # qrcode.cpp (ricmoo QRCode, vendored): uses #pragma mark (an Xcode-ism) GCC flags as an
     # unknown pragma, plus an `x < 0` guard on an unsigned arg that -Wtype-limits reports
     # as always-false. Both are harmless in this third-party file; demote to warnings.
-    set_source_files_properties("ui/qrcode.c" PROPERTIES COMPILE_FLAGS "-Wno-error=unknown-pragmas -Wno-error=type-limits")
+    set_source_files_properties("ui/qrcode.cpp" PROPERTIES COMPILE_FLAGS "-Wno-error=unknown-pragmas -Wno-error=type-limits")
     # esp_main_display.cpp builds the AXS15231B panel-IO configs through the driver's
     # partial designated-initializer macros (the IDF convention); under C++ -Wextra the
     # unset trailing flag fields trip -Werror=missing-field-initializers. Demote it.

@@ -68,15 +68,25 @@ esp_err_t esp_lcd_new_panel_axs15231b(const esp_lcd_panel_io_handle_t io, const 
 {
     esp_err_t ret = ESP_OK;
     axs15231b_panel_t *axs15231b = NULL;
+    // Declared up here, before the first ESP_GOTO_*, rather than at its point of
+    // use further down: this file is compiled as C++, where jumping over a
+    // declaration with an initializer is ill-formed ("jump to label 'err' crosses
+    // initialization of ..."). C allowed it, which is why this only surfaced when
+    // the file was renamed .c -> .cpp.
+    uint8_t fb_bits_per_pixel = 0;
     ESP_GOTO_ON_FALSE(io && panel_dev_config && ret_panel, ESP_ERR_INVALID_ARG, err, TAG, "invalid argument");
-    axs15231b = calloc(1, sizeof(axs15231b_panel_t));
+    axs15231b = (axs15231b_panel_t *)calloc(1, sizeof(axs15231b_panel_t));
     ESP_GOTO_ON_FALSE(axs15231b, ESP_ERR_NO_MEM, err, TAG, "no mem for axs15231b panel");
 
     if (panel_dev_config->reset_gpio_num >= 0) {
-        gpio_config_t io_conf = {
-            .mode = GPIO_MODE_OUTPUT,
-            .pin_bit_mask = 1ULL << panel_dev_config->reset_gpio_num,
-        };
+        // `= {}` then assign, rather than designated initializers: C++ requires
+        // designators in declaration order (C99 did not), and a partial designated
+        // initializer also trips -Werror=missing-field-initializers under -Wextra.
+        // Value-initializing first sidesteps both, and stays correct if a future
+        // IDF adds a field to gpio_config_t.
+        gpio_config_t io_conf = {};
+        io_conf.pin_bit_mask = 1ULL << panel_dev_config->reset_gpio_num;
+        io_conf.mode         = GPIO_MODE_OUTPUT;
         ESP_GOTO_ON_ERROR(gpio_config(&io_conf), err, TAG, "configure GPIO for RST line failed");
     }
 
@@ -92,7 +102,6 @@ esp_err_t esp_lcd_new_panel_axs15231b(const esp_lcd_panel_io_handle_t io, const 
         break;
     }
 
-    uint8_t fb_bits_per_pixel = 0;
     switch (panel_dev_config->bits_per_pixel) {
     case 16: // RGB565
         axs15231b->colmod_val = 0x55;
@@ -136,7 +145,7 @@ esp_err_t esp_lcd_new_panel_axs15231b(const esp_lcd_panel_io_handle_t io, const 
 err:
     if (axs15231b) {
         if (panel_dev_config->reset_gpio_num >= 0) {
-            gpio_reset_pin(panel_dev_config->reset_gpio_num);
+            gpio_reset_pin((gpio_num_t)panel_dev_config->reset_gpio_num);
         }
         free(axs15231b);
     }
@@ -168,7 +177,7 @@ static esp_err_t panel_axs15231b_del(esp_lcd_panel_t *panel)
     axs15231b_panel_t *axs15231b = __containerof(panel, axs15231b_panel_t, base);
 
     if (axs15231b->reset_gpio_num >= 0) {
-        gpio_reset_pin(axs15231b->reset_gpio_num);
+        gpio_reset_pin((gpio_num_t)axs15231b->reset_gpio_num);
     }
     ESP_LOGD(TAG, "del axs15231b panel @%p", axs15231b);
     free(axs15231b);
@@ -182,11 +191,11 @@ static esp_err_t panel_axs15231b_reset(esp_lcd_panel_t *panel)
 
     // perform hardware reset
     if (axs15231b->reset_gpio_num >= 0) {
-        gpio_set_level(axs15231b->reset_gpio_num, !axs15231b->flags.reset_level);
+        gpio_set_level((gpio_num_t)axs15231b->reset_gpio_num, !axs15231b->flags.reset_level);
         vTaskDelay(pdMS_TO_TICKS(10));
-        gpio_set_level(axs15231b->reset_gpio_num, axs15231b->flags.reset_level);
+        gpio_set_level((gpio_num_t)axs15231b->reset_gpio_num, axs15231b->flags.reset_level);
         vTaskDelay(pdMS_TO_TICKS(10));
-        gpio_set_level(axs15231b->reset_gpio_num, !axs15231b->flags.reset_level);
+        gpio_set_level((gpio_num_t)axs15231b->reset_gpio_num, !axs15231b->flags.reset_level);
         vTaskDelay(pdMS_TO_TICKS(120));
     } else { // perform software reset
         tx_param(axs15231b, io, LCD_CMD_SWRESET, NULL, 0);
@@ -305,10 +314,10 @@ static esp_err_t panel_axs15231b_draw_bitmap(esp_lcd_panel_t *panel, int x_start
 
     // define an area of frame memory where MCU can access
     tx_param(axs15231b, io, LCD_CMD_CASET, (uint8_t[]) {
-        (x_start >> 8) & 0xFF,
-        x_start & 0xFF,
-        ((x_end - 1) >> 8) & 0xFF,
-        (x_end - 1) & 0xFF,
+        (uint8_t)((x_start >> 8) & 0xFF),
+        (uint8_t)(x_start & 0xFF),
+        (uint8_t)(((x_end - 1) >> 8) & 0xFF),
+        (uint8_t)((x_end - 1) & 0xFF),
     }, 4);
 
     // QSPI: skip per-flush RASET. This panel's QSPI mode does not handle arbitrary windowed
@@ -318,10 +327,10 @@ static esp_err_t panel_axs15231b_draw_bitmap(esp_lcd_panel_t *panel, int x_start
     // sweeps the entire frame in order.
     if (0 == axs15231b->flags.use_qspi_interface) {
         tx_param(axs15231b, io, LCD_CMD_RASET, (uint8_t[]) {
-            (y_start >> 8) & 0xFF,
-            y_start & 0xFF,
-            ((y_end - 1) >> 8) & 0xFF,
-            (y_end - 1) & 0xFF,
+            (uint8_t)((y_start >> 8) & 0xFF),
+            (uint8_t)(y_start & 0xFF),
+            (uint8_t)(((y_end - 1) >> 8) & 0xFF),
+            (uint8_t)((y_end - 1) & 0xFF),
         }, 4);
     }
 
@@ -415,7 +424,7 @@ esp_err_t esp_lcd_touch_new_i2c_axs15231b(const esp_lcd_panel_io_handle_t io, co
 
     /* Prepare main structure */
     esp_err_t ret = ESP_OK;
-    esp_lcd_touch_handle_t axs15231b = calloc(1, sizeof(esp_lcd_touch_t));
+    esp_lcd_touch_handle_t axs15231b = (esp_lcd_touch_handle_t)calloc(1, sizeof(esp_lcd_touch_t));
     ESP_GOTO_ON_FALSE(axs15231b, ESP_ERR_NO_MEM, err, TAG, "Touch handle malloc failed");
 
     /* Communication interface */
@@ -431,11 +440,10 @@ esp_err_t esp_lcd_touch_new_i2c_axs15231b(const esp_lcd_panel_io_handle_t io, co
 
     /* Prepare pin for touch interrupt */
     if (axs15231b->config.int_gpio_num != GPIO_NUM_NC) {
-        const gpio_config_t int_gpio_config = {
-            .mode = GPIO_MODE_INPUT,
-            .intr_type = GPIO_INTR_NEGEDGE,
-            .pin_bit_mask = BIT64(axs15231b->config.int_gpio_num)
-        };
+        gpio_config_t int_gpio_config = {};   // see the note on io_conf above
+        int_gpio_config.pin_bit_mask = BIT64(axs15231b->config.int_gpio_num);
+        int_gpio_config.mode         = GPIO_MODE_INPUT;
+        int_gpio_config.intr_type    = GPIO_INTR_NEGEDGE;
         ESP_GOTO_ON_ERROR(gpio_config(&int_gpio_config), err, TAG, "GPIO intr config failed");
 
         /* Register interrupt callback */
@@ -445,10 +453,9 @@ esp_err_t esp_lcd_touch_new_i2c_axs15231b(const esp_lcd_panel_io_handle_t io, co
     }
     /* Prepare pin for touch controller reset */
     if (axs15231b->config.rst_gpio_num != GPIO_NUM_NC) {
-        const gpio_config_t rst_gpio_config = {
-            .mode = GPIO_MODE_OUTPUT,
-            .pin_bit_mask = BIT64(axs15231b->config.rst_gpio_num)
-        };
+        gpio_config_t rst_gpio_config = {};   // see the note on io_conf above
+        rst_gpio_config.pin_bit_mask = BIT64(axs15231b->config.rst_gpio_num);
+        rst_gpio_config.mode         = GPIO_MODE_OUTPUT;
         ESP_GOTO_ON_ERROR(gpio_config(&rst_gpio_config), err, TAG, "GPIO reset config failed");
     }
     /* Reset controller */
