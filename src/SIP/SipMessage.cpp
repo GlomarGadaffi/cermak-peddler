@@ -132,6 +132,9 @@ SipMessage::SipMessage(const std::string& message, sockaddr_in src) : _src(src)
 // the comment on _bodyGen. Keep this in sync if a member is ever added; the
 // alternative (`= default`) silently reintroduces the stale-cache bug the
 // generation counter exists to prevent.
+// cppcheck flags _bodyGen as unassigned in operator=; the bump above IS the
+// correct semantics, so the check is suppressed rather than satisfied.
+// cppcheck-suppress operatorEqVarError
 SipMessage& SipMessage::operator=(const SipMessage& other)
 {
 	if (this == &other) return *this;   // no body change, so no generation bump
