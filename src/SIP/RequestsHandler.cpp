@@ -1510,10 +1510,14 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 		{
 			// Re-INVITE answer (hold/resume): relay 200 OK to the opposite leg and
 			// preserve the session state set by onReinvite() — do NOT re-run connect.
+			// Applies equally to a broadcast/ring-group session once it is
+			// Connected or Held (#74): after the first-answer connect path runs,
+			// getSrc()/getDest() name exactly the two live legs (original caller,
+			// answering client) the same way a unicast session's do, so the same
+			// source-address peer lookup relays a hold/resume 200 OK for either.
 			{
 				const auto st = session.value()->getState();
-				if ((st == Session::State::Connected || st == Session::State::Held) &&
-					!session.value()->isBroadcast())
+				if (st == Session::State::Connected || st == Session::State::Held)
 				{
 					auto legSrc  = session.value()->getSrc();
 					auto legDest = session.value()->getDest();
@@ -1542,11 +1546,10 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 			if (session.value()->isBroadcast())
 			{
 				// Only the first answer from a pending fork (Invited state) should run
-				// the connect path. A re-INVITE 200 OK from an already-connected or held
-				// broadcast call (Held / Connected state) falls through to a silent drop
-				// below — the peer relay above was already skipped by !isBroadcast(), so
-				// the hold/resume path for broadcast calls is currently unsupported and
-				// the 200 OK is discarded (the hold stays in place). (#69)
+				// the connect path below. A hold/resume re-INVITE's 200 OK arrives while
+				// the session is Connected or Held, which the block above already relays
+				// and returns from (#74) — so only a genuine new answer from a pending
+				// fork ever reaches this point (#69b).
 				if (session.value()->getState() == Session::State::Invited)
 				{
 					auto clientOpt = findClientByAddress(data->getSource());

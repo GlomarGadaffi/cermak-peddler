@@ -6,28 +6,6 @@ This document serves as the active issue tracker and architectural roadmap for *
 
 ## Active Issues & Backlog Roadmap
 
-### 🟡 Issue #74: Hold/resume on broadcast (ring-group) calls is not yet supported
-* **Status**: ⏳ Open / Planned
-* **Labels**: `bug`, `hold-resume`, `broadcast`
-* **Severity**: Medium
-
-#### Description
-When a phone in a ring-group (or 999 broadcast) call sends a re-INVITE to hold, the
-200 OK answer from the peer is silently discarded. The hold relay block in `onOk` is
-correctly guarded by `!isBroadcast()` to avoid looping, but there is no equivalent
-broadcast-aware relay path. As a result the phone's hold request is never forwarded, the
-re-INVITE transaction times out after 32 s (Timer D), and the phone treats hold as
-failed. Unicast hold/resume is unaffected.
-
-**Root cause (found by code review):** `onOk`'s broadcast first-answer block was guarded
-by `state != Connected`, which is also true for `Held` — so a re-INVITE 200 OK re-ran
-the connect path, overwrote the established dest, and sent CANCEL to already-gone targets.
-Fixed in this release: the guard now requires `state == Invited` so only a genuine first
-answer triggers the connect path. The 200 OK is now discarded (better than the previous
-destructive behaviour). A full relay path for broadcast hold/resume is tracked here.
-
----
-
 ### 🟡 Issue #44: End-to-end SIP call test needed on JC3248W535EN hardware
 * **Status**: ⏳ Open / Planned
 * **Labels**: `hardware-testing`, `verification`
@@ -136,6 +114,42 @@ The underlying ask — a live ring-buffer of SIP packets downloadable in real li
 Closed by adding `GET /api/diagnostics/pcap` in `HttpServer.cpp` as a second route to the exact same `sendApiPcap()` handler `/api/pcap` already uses — same `PcapCapture` ring, same session gate, same `application/vnd.tcpdump.pcap` response — rather than an HTTP redirect, so a plain `curl -o dump.pcap http://<device>/api/diagnostics/pcap` works without `-L` and opens directly in Wireshark. No second capture mechanism and no new allocation path: both routes read the one ring `RequestsHandler` already maintains. `docs/API.md`'s endpoint catalog and the `/api/pcap` section now note the alias.
 
 Covered by a new test in `tests/PcapCapture_test.cpp`, `ApiDiagnosticsPcapServesValidGlobalHeaderAndOneRecordOverRealSocket`: drives a real `HttpServer`+`RequestsHandler` pair over an actual TCP socket (mirroring `HttpTraceCommand_test.cpp`'s pattern), sends a REGISTER through the handler, then fetches `GET /api/diagnostics/pcap` and asserts on the wire bytes — the global header's magic number and `LINKTYPE_ETHERNET`, and the first record header's `incl_len`/`orig_len` agreement and that its declared frame length actually fits the response body and contains the captured SIP text verbatim. Full host suite passing. Full detail: https://github.com/GlomarGadaffi/pocket-dial/issues/33
+
+---
+
+### 🟢 Issue #74: Hold/resume on broadcast (ring-group) calls is not yet supported
+* **Status**: ✅ Resolved 2026-08-28
+* **Labels**: `bug`, `hold-resume`, `broadcast`
+
+#### Resolution
+When a phone in a ring-group (or 999 broadcast) call sent a re-INVITE to hold, the
+200 OK answer from the peer was silently discarded. `onOk`'s mid-dialog re-INVITE relay
+block (the one that forwards a hold/resume `200 OK` to the opposite leg once a session is
+`Connected` or `Held`) explicitly excluded broadcast sessions with `!isBroadcast()`, and
+the broadcast-specific block below it only runs the first-answer connect path when
+`state == Invited` — so a Held/Connected 200 OK matched neither branch and fell through
+to nothing. The offer itself was never the problem: `onReinvite()` relays a broadcast
+session's re-INVITE fine, since it identifies the peer leg by source address off
+`getSrc()`/`getDest()` with no `isBroadcast()` check at all. Only the answer's return trip
+was blocked, so the re-INVITE transaction timed out client-side (Timer D, ~32s) and the
+phone reported hold as failed even though the hold had actually taken effect on the wire.
+
+Fixed by dropping the `!isBroadcast()` restriction from the relay block. Once a broadcast
+session reaches `Connected` (the first-answer connect path has already run and set
+`dest` to the one target that answered, cancelling the rest), `getSrc()`/`getDest()` name
+exactly the two live legs the same way a unicast session's do — so the identical
+source-address peer lookup that already relays unicast hold/resume now relays broadcast
+hold/resume too, with no new helper or broadcast-specific logic needed. The two blocks are
+disjoint on session state (`Connected`/`Held` relay above; `Invited`-only connect below),
+so the earlier `#69b` fix (the connect/cancel path must never re-fire once a call is up)
+is untouched.
+
+New coverage in `tests/BroadcastHoldResume_test.cpp` drives a full 999 broadcast call
+through `handle()` end-to-end — register three extensions, connect (one target answers,
+the other is CANCELed), hold, then resume — and asserts the 200 OK for each actually
+reaches the held leg's peer, with the session state and `dest` tracked correctly
+throughout. It also pins `#69b`: exactly one `CANCEL` is ever sent to the losing fork
+target across the whole sequence, and the loser never receives any hold/resume traffic.
 
 ---
 
