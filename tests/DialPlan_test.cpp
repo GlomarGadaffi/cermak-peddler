@@ -835,13 +835,25 @@ TEST(DialPlanHttp, PostApiDialPlanUpsertsAndDeletesThroughTheAdminSurface)
 	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan",
 		"pattern=3XX&action=page&target=981")), 200);
 
+	// '*' and '#' are the grammar's own characters AND form-encoding metacharacters,
+	// so a rule that uses them has to survive getFormParam's url-decoding intact —
+	// a plan whose wildcard cannot be configured over the API is no plan at all.
+	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan",
+		"pattern=6*&action=group&target=610")), 200);
+	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan",
+		"pattern=%239&action=park&target=701")), 200);
+
 	auto rules = handler.getDialRules();
-	ASSERT_EQ(rules.size(), 2u);
+	ASSERT_EQ(rules.size(), 4u);
 	EXPECT_EQ(std::get<0>(rules[0]), "2XX");
 	EXPECT_EQ(std::get<1>(rules[0]), "group");
 	EXPECT_EQ(std::get<2>(rules[0]), "610");
 	EXPECT_EQ(std::get<0>(rules[1]), "3XX");
 	EXPECT_EQ(std::get<1>(rules[1]), "page");
+	EXPECT_EQ(std::get<0>(rules[2]), "6*")
+		<< "a trailing-star prefix rule must round-trip the form body verbatim";
+	EXPECT_EQ(std::get<0>(rules[3]), "#9")
+		<< "a '#' pattern must survive url-decoding as the literal character";
 
 	// The rule table is readable back out of /api/status, in table order.
 	std::string status = httpGetRaw(18090, "/api/status");
@@ -852,11 +864,13 @@ TEST(DialPlanHttp, PostApiDialPlanUpsertsAndDeletesThroughTheAdminSurface)
 	EXPECT_NE(second, std::string::npos);
 	EXPECT_LT(first, second) << "/api/status must emit the plan in evaluation order";
 
-	// An empty target deletes.
+	// An empty target deletes — including a pattern carrying a wildcard.
 	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan", "pattern=2XX&target=")), 200);
+	EXPECT_EQ(statusOf(httpPostRaw(18090, "/api/dialplan", "pattern=6*&target=")), 200);
 	rules = handler.getDialRules();
-	ASSERT_EQ(rules.size(), 1u);
+	ASSERT_EQ(rules.size(), 2u);
 	EXPECT_EQ(std::get<0>(rules[0]), "3XX");
+	EXPECT_EQ(std::get<0>(rules[1]), "#9");
 }
 
 TEST(DialPlanHttp, PostApiDialPlanRejectsBadParametersWith400)
