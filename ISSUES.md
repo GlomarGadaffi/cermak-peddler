@@ -212,6 +212,13 @@ build, so the FreeRTOS tick-task branch is compile-verified rather than assumed.
 The PIE vector path (`POCKETDIAL_MIXBUS_PIE`, `src/SIP/pie/`) is untouched and still opt-in: the
 scalar kernel is ~64k adds/s at ≤8 narrowband ports, a rounding error on a 240 MHz core.
 
+Two known limits are documented rather than papered over: the anchor leg is still outside the bus
+(`feedRx()` refuses in BUS mode — CONFERENCE_MIXER.md §7 carries the caveat and the follow-up), and
+the N conference `RtpSender`s share the fixed server media port, so the first binds it and the rest
+fall back to ephemeral source ports. Note that #75 is one of the entries where this tracker's
+numbering has diverged from GitHub's — GitHub issue 75 is an unrelated, closed Phase-1 item. Full
+detail: https://github.com/GlomarGadaffi/pocket-dial/pull/124
+
 ---
 
 ### 🟢 Issue #35 / #113: Zero-Touch Phone Auto-Provisioning (HTTP) — scope clarified to onboarding/admin-window reachability
