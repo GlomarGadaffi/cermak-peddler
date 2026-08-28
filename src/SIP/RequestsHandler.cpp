@@ -2486,6 +2486,19 @@ std::optional<RequestsHandler::ProvisioningInfo> RequestsHandler::findProvisioni
 	{
 		if (d.mac == mac)
 		{
+			// Defense in depth (Issue #107): the .cfg served for this device
+			// interpolates the extension into `key = value\r\n` lines, so a CR/LF in
+			// it would inject config lines nobody wrote. Every path that adopts an
+			// extension today goes through onRegister()'s isValidAor() gate, whose
+			// charset excludes CR/LF -- this re-checks that invariant at the point of
+			// use so provisioning does not silently depend on a gate three call layers
+			// away. Fails closed: no info -> the endpoint 404s.
+			if (!isValidAor(d.extension))
+			{
+				queueLog("Provisioning refused for " + mac +
+					": adopted extension fails the AOR charset", true);
+				return std::nullopt;
+			}
 			const bool authRequired = (d.state == Registrar::DeviceState::Secured) ||
 				(_registrar.getMode() == Registrar::Mode::Secure);
 			return ProvisioningInfo{d.extension, authRequired};

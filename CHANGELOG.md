@@ -187,6 +187,42 @@ Issue #101 item **B**.
 - Device build: all seven edited translation units compile clean for ESP32-S3
   under `-Wall -Wextra`, and the full `idf.py build` links (see the closeout
   section above).
+## Unreleased (issue-107-provisioning-crlf) - 2026-08-17
+
+Closes Issue #107. Defense in depth around the zero-touch provisioning config
+served by `GET /config/<mac>.cfg` (Issue #35, commit `b79570c`).
+
+### Fixed — config-line injection via the provisioned extension (#107)
+
+- `provisioning::yealinkConfigFor()` interpolates the extension into
+  `key = value\r\n` lines. An extension carrying a CR or LF would have appended
+  config keys nobody wrote — `account.1.password` being the interesting one —
+  to the file the handset parses. The builder now refuses outright (returns an
+  empty config) when the extension contains CR or LF, and `sendConfigCfg()`
+  treats an empty build as a 404 rather than serving a 200 with an empty body.
+
+- `RequestsHandler::findProvisioningInfo()` re-checks the adopted extension
+  against `isValidAor()` before handing it to the builder, so provisioning
+  fails closed instead of depending on a gate three call layers away.
+
+**Reachability, since the issue left it open:** not reachable today. Every path
+that writes `DeviceRecord::extension` is downstream of `onRegister()`'s
+`isValidAor()` check — `admitLearn()`'s adopt (`Registrar.cpp:177`) and
+re-extension (`:189`) paths both are — and that charset (alnum plus `. - _ + * #`)
+excludes CR/LF. The remaining writer, `loadDevices()` (`:348`), restores from an
+NVS blob whose own field/record delimiters are tab/newline, so a CR/LF-bearing
+extension could not have round-tripped through it either. Both guards are
+therefore backstops, not a live-hole patch: they keep the property local to the
+code that depends on it, for future callers wiring in less-trusted input.
+
+Deliberately *not* narrowed to `[0-9A-Za-z]` as the issue suggested — that
+would silently mangle `*55`, `+15551234`, and the rest of the AOR charset the
+registrar already accepts. Only CR/LF, the actual injection vector, is rejected.
+
+Covered by 3 new tests in `tests/ProvisioningConfig_test.cpp`
+(mutation-verified: with the guard removed the injected
+`account.1.password = hunter2` line appears 5x in the served config).
+Full host suite: 171/171 passing.
 
 ## Unreleased (post-100-review-followups) - 2026-08-09
 
