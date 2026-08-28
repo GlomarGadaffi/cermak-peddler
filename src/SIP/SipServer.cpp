@@ -63,12 +63,15 @@ SipServer::~SipServer()
 #endif
 }
 
-void SipServer::onNewMessage(std::string data, sockaddr_in src)
+void SipServer::onNewMessage(std::string_view data, sockaddr_in src)
 {
-	auto message = _messagesFactory.createMessage(std::move(data), std::move(src));
+	// Issue #105: createMessage() takes `data` by view (Issue #81), so it stays
+	// intact here — handle() gets it too, to capture the exact wire bytes
+	// instead of re-serializing the parsed message for /api/pcap.
+	auto message = _messagesFactory.createMessage(data, src);
 	if (message.has_value())
 	{
-		_handler.handle(std::move(message.value()));
+		_handler.handle(std::move(message.value()), data);
 	}
 }
 

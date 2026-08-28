@@ -188,6 +188,88 @@ TEST(PcapCapture, RequestsHandlerCapturesBothDirectionsOfARealPacket)
 	EXPECT_NE(file.find("SIP/2.0 "), std::string::npos) << "outbound response must be captured";
 }
 
+// Issue #105: the inbound capture must store the bytes recvfrom() actually
+// delivered, not a re-serialization of the parsed message. SipMessage::toString()
+// always writes CRLF line endings and joins the parsed pieces back together — it
+// does not restore whatever line-ending convention or malformed-but-tolerated
+// layout the wire bytes actually used. A message with bare-LF endings and compact
+// header forms (v:/f:/t:/i:) is valid SIP that the parser tolerates (SEC-02) but
+// round-trips through toString() into a different byte sequence, making it a
+// direct fixture for the fidelity bug: the capture must equal the ORIGINAL raw
+// text, not request->toString().
+TEST(PcapCapture, InboundCaptureStoresExactWireBytesNotReserializedMessage)
+{
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+
+	const sockaddr_in src = addr("192.168.4.50", 5060);
+	const std::string raw =
+		"REGISTER sip:server SIP/2.0\n"
+		"v: SIP/2.0/UDP 192.168.4.50:5060;branch=z9hG4bKcompact\n"
+		"f: <sip:105@server>;tag=rt105\n"
+		"t: <sip:105@server>\n"
+		"i: pcap-wire-fidelity-1\n"
+		"CSeq: 1 REGISTER\n"
+		"Contact: <sip:105@192.168.4.50:5060>;expires=3600\n"
+		"Content-Length: 0\n\n";
+
+	auto request = RequestsHandler::getMessageFromPool(raw, src);
+	ASSERT_TRUE(request != nullptr);
+	ASSERT_TRUE(request->isValidMessage());
+	// Fixture sanity: if toString() happened to reproduce `raw` byte-for-byte,
+	// this test couldn't tell the two capture paths apart.
+	ASSERT_NE(request->toString(), raw)
+		<< "fixture must actually re-serialize differently via toString(), or "
+		   "this test can't distinguish wire bytes from the parsed re-render";
+
+	// Mirrors what SipServer::onNewMessage() now does: pass the exact bytes
+	// recvfrom() delivered alongside the already-parsed message.
+	handler.handle(request, raw);
+
+	auto recs = handler.getTraceRecords();
+	ASSERT_GE(recs.size(), 1u);
+	EXPECT_EQ(recs[0].text, raw)
+		<< "inbound capture must store the exact wire bytes, not a "
+		   "re-serialization of the parsed message";
+
+	std::string file = handler.getPcapCapture();
+	EXPECT_NE(file.find(raw), std::string::npos)
+		<< "the raw wire text (LF endings, compact headers) must appear "
+		   "verbatim in the pcap frame";
+}
+
+// The default (no rawBytes passed) must keep behaving exactly as before: a
+// message built/handled without wire bytes in hand — an in-process call, or any
+// existing test calling handle() with one argument — still gets a toString()
+// capture. This is what keeps every pre-#105 handle(msg) call site correct with
+// zero changes.
+TEST(PcapCapture, InboundCaptureFallsBackToToStringWhenNoRawBytesGiven)
+{
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+
+	const sockaddr_in src = addr("192.168.4.51", 5060);
+	const std::string raw =
+		"REGISTER sip:server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.4.51:5060;branch=z9hG4bKfallback\r\n"
+		"From: <sip:106@server>;tag=rt106\r\n"
+		"To: <sip:106@server>\r\n"
+		"Call-ID: pcap-fallback-1\r\n"
+		"CSeq: 1 REGISTER\r\n"
+		"Contact: <sip:106@192.168.4.51:5060>;expires=3600\r\n"
+		"Content-Length: 0\r\n\r\n";
+
+	auto request = RequestsHandler::getMessageFromPool(raw, src);
+	ASSERT_TRUE(request != nullptr);
+	const std::string expected = request->toString();
+
+	handler.handle(request);   // no rawBytes argument, same as pre-#105 call sites
+
+	auto recs = handler.getTraceRecords();
+	ASSERT_GE(recs.size(), 1u);
+	EXPECT_EQ(recs[0].text, expected);
+}
+
 TEST(PcapCapture, RequestsHandlerGetTraceRecordsMirrorsGetPcapCapture)
 {
 	RequestsHandler handler("192.168.4.1", 5060,

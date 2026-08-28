@@ -27,7 +27,13 @@ public:
 	SipMessage(const std::string& message, sockaddr_in src);
 	virtual ~SipMessage() = default;
 
-	void reset(const std::string& message, sockaddr_in src);
+	// Issue #81: takes a view, not an owned string — the pool-recycle path
+	// (RequestsHandler::getMessageFromPool) hands this a view straight into
+	// UdpServer::receiveLoop()'s stack buffer with no copy in between.
+	// splitMessage() below copies what it needs (substr into owned _startLine /
+	// _headerLines / _body) synchronously before this returns, so nothing here
+	// retains the view past the call.
+	void reset(std::string_view message, sockaddr_in src);
 
 	// No shared buffer means no string_view to fix up after a copy — plain
 	// member-wise copy of the owned start line / header lines / body is already

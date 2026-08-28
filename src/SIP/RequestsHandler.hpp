@@ -17,6 +17,7 @@
 #include <functional>
 #include <unordered_map>
 #include <string>
+#include <string_view>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -54,7 +55,12 @@ public:
 	// caller that gets nullptr is to DROP: it cannot answer 503, because building
 	// the 503 would need a message out of the same empty pool. SIP over UDP
 	// retransmits, so a dropped packet costs latency, not the call.
-	static std::shared_ptr<SipMessage> getMessageFromPool(std::string message, sockaddr_in src);
+	// Issue #81: `message` is a view, never copied here — SipMessage::reset()
+	// below reads through it once, synchronously, to parse the pooled slot.
+	// Issue #105: taking it by view (not by value) also means a caller holding
+	// the original wire-received bytes (SipMessageFactory::createMessage, on
+	// behalf of SipServer::onNewMessage) keeps them intact after this returns.
+	static std::shared_ptr<SipMessage> getMessageFromPool(std::string_view message, sockaddr_in src);
 	// Clones an already-parsed message into a free pool slot via a direct field
 	// copy (SipMessage's copy assignment is a plain owned-string/vector copy —
 	// no shared buffer to fix up). Used by every response-building call site that
@@ -84,7 +90,14 @@ public:
 	static bool parseCallerRtp(const std::shared_ptr<SipMessage>& invite,
 		std::string& outIp, uint16_t& outPort);
 
-	void handle(std::shared_ptr<SipMessage> request);
+	// `rawBytes`, when non-empty, is the exact bytes recvfrom() delivered for this
+	// packet (Issue #105) — used verbatim for the inbound /api/pcap capture below
+	// instead of re-serializing the parsed message, so whitespace, compact-header
+	// forms, and CRLF/LF tolerance the parser normalized survive in the capture.
+	// Left empty (the default) by every caller that doesn't have wire bytes to
+	// offer — an in-process-built message or a test calling handle() directly —
+	// in which case the capture falls back to request->toString(), same as before.
+	void handle(std::shared_ptr<SipMessage> request, std::string_view rawBytes = {});
 	void tick();
 
 	std::optional<std::shared_ptr<Session>> getSession(std::string_view callID);

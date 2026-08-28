@@ -21,7 +21,13 @@ public:
 	RequestsHandler& getHandler() { return _handler; }
 
 private:
-	void onNewMessage(std::string data, sockaddr_in src);
+	// Issue #81: `data` is a zero-copy view into UdpServer::receiveLoop()'s stack
+	// buffer, valid only for the duration of this call — see UdpServer::
+	// OnNewMessageEvent's comment. This function runs entirely synchronously
+	// (createMessage() copies what it parses out of `data` before returning, and
+	// the raw view handed to handle() below is consumed before handle() returns),
+	// so it never needs to outlive the call.
+	void onNewMessage(std::string_view data, sockaddr_in src);
 	void onHandled(const sockaddr_in& dest, std::shared_ptr<SipMessage> message);
 
 	UdpServer _socket;
