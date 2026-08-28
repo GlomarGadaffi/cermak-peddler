@@ -43,6 +43,20 @@ elseif(SIP_TRANSPORT STREQUAL "lan8720")
     # the chip-specific PHY drivers out of esp_eth, so the LAN87xx driver now comes from
     # the espressif/lan87xx managed component (see idf_component.yml). On v5.x esp_eth
     # still ships esp_eth_phy_new_lan87xx, so the extra REQUIRES is only needed on v6+.
+    #
+    # Issue #111: LAN8720 drives the classic ESP32's INTERNAL EMAC — it cannot work on
+    # any other target (S2/S3/C-series have no internal EMAC), so this has to fail here,
+    # at configure time, rather than ~1400 objects into the build. Left unguarded, the
+    # component manager quietly declines to fetch espressif/lan87xx on a non-esp32 target
+    # (its own idf_component.yml rules: target == esp32), so the missing-header error
+    # that eventually surfaces reads like an ESP-IDF version mismatch, not an
+    # unsupported target/transport pairing. Use SIP_TRANSPORT=eth (W5500) elsewhere.
+    if(NOT IDF_TARGET STREQUAL "esp32")
+        message(FATAL_ERROR
+            "SIP_TRANSPORT=lan8720 requires the classic ESP32's internal EMAC; "
+            "IDF_TARGET is '${IDF_TARGET}'. Use SIP_TRANSPORT=eth (W5500) on ${IDF_TARGET}, "
+            "or set-target esp32 for the internal-EMAC LAN8720 board.")
+    endif()
     set(MAIN_SRC "esp_main_eth_lan8720.cpp")
     if(IDF_VERSION_MAJOR GREATER_EQUAL 6)
         set(EXTRA_REQUIRES esp_eth espressif__lan87xx ${IDF_V6_DRIVERS})
