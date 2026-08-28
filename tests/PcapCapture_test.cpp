@@ -7,6 +7,7 @@
 #include "PcapCapture.hpp"
 #include "RequestsHandler.hpp"
 #include "HttpServer.hpp"
+#include "AdminAuth.hpp"
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <WinSock2.h>
@@ -18,6 +19,9 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #endif
+
+#include <chrono>
+#include <thread>
 
 namespace
 {
@@ -38,6 +42,28 @@ namespace
 		       (static_cast<uint32_t>(static_cast<unsigned char>(buf[off + 1])) << 8) |
 		       (static_cast<uint32_t>(static_cast<unsigned char>(buf[off + 2])) << 16) |
 		       (static_cast<uint32_t>(static_cast<unsigned char>(buf[off + 3])) << 24);
+	}
+
+	bool canConnect(int port)
+	{
+#if defined(_WIN32) || defined(_WIN64)
+		SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+		if (s == INVALID_SOCKET) return false;
+#else
+		int s = socket(AF_INET, SOCK_STREAM, 0);
+		if (s < 0) return false;
+#endif
+		sockaddr_in a{};
+		a.sin_family = AF_INET;
+		a.sin_port = htons(static_cast<uint16_t>(port));
+		inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+		int rc = connect(s, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+#if defined(_WIN32) || defined(_WIN64)
+		closesocket(s);
+#else
+		close(s);
+#endif
+		return rc == 0;
 	}
 
 	// Minimal blocking HTTP GET over a raw socket — mirrors the pattern
@@ -494,4 +520,81 @@ TEST(PcapCapture, ApiTraceEscapesRawControlBytesFromWireCapture)
 		<< "raw control byte must not appear unescaped in the JSON body: " << body;
 	EXPECT_NE(body.find("\\u0001"), std::string::npos)
 		<< "control byte must be escaped as \\u0001: " << body;
+}
+
+// ── GET /api/diagnostics/pcap (Issue #33) ───────────────────────────────────
+//
+// The canonical path the original feature request asked for. It routes to the
+// exact same sendApiPcap() handler as /api/pcap (see HttpServer.cpp) — no
+// second capture mechanism, no second allocation path — so this test drives it
+// over a real socket the way a `curl -o dump.pcap` client would, and checks
+// the actual bytes on the wire: the 24-byte global header's magic number, and
+// one full 16-byte record header + synthesized frame for a captured packet.
+TEST(PcapCapture, ApiDiagnosticsPcapServesValidGlobalHeaderAndOneRecordOverRealSocket)
+{
+	// Ungated path: no PIN provisioned, so /api/diagnostics/pcap serves without
+	// a session (same setup as HttpTraceCommand_test.cpp's equivalent test) —
+	// keeps this test's outcome independent of whatever AdminAuth state an
+	// earlier test in the same binary left behind.
+	AdminAuth::clearCredential();
+
+	RequestsHandler handler("192.168.4.1", 5060,
+		[](const sockaddr_in&, std::shared_ptr<SipMessage>) {});
+	HttpServer server("127.0.0.1", 18096, nullptr);
+	server.attachHandler(&handler);
+	server.start();
+
+	for (int i = 0; i < 50 && !canConnect(18096); ++i)
+	{
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	ASSERT_TRUE(canConnect(18096));
+
+	const sockaddr_in src = addr("192.168.4.80", 5060);
+	const std::string raw =
+		"REGISTER sip:server SIP/2.0\r\n"
+		"Via: SIP/2.0/UDP 192.168.4.80:5060;branch=z9hG4bKdiag\r\n"
+		"From: <sip:108@server>;tag=rt108\r\n"
+		"To: <sip:108@server>\r\n"
+		"Call-ID: diagnostics-pcap-test\r\n"
+		"CSeq: 1 REGISTER\r\n"
+		"Contact: <sip:108@192.168.4.80:5060>;expires=3600\r\n"
+		"Content-Length: 0\r\n\r\n";
+	handler.handle(RequestsHandler::getMessageFromPool(raw, src));
+
+	const std::string resp = httpGetRaw(18096, "/api/diagnostics/pcap");
+	ASSERT_NE(resp.find("200"), std::string::npos) << resp;
+	ASSERT_NE(resp.find("application/vnd.tcpdump.pcap"), std::string::npos) << resp;
+	ASSERT_NE(resp.find("Content-Disposition: attachment"), std::string::npos) << resp;
+
+	const size_t bodyStart = resp.find("\r\n\r\n");
+	ASSERT_NE(bodyStart, std::string::npos);
+	const std::string body = resp.substr(bodyStart + 4);
+
+	// Global header: at least the 24 bytes must be present, magic number
+	// 0xa1b2c3d4 written little-endian, LINKTYPE_ETHERNET = 1.
+	ASSERT_GE(body.size(), 24u + 16u) << "expected a global header plus at least one record";
+	EXPECT_EQ(static_cast<unsigned char>(body[0]), 0xd4);
+	EXPECT_EQ(static_cast<unsigned char>(body[1]), 0xc3);
+	EXPECT_EQ(static_cast<unsigned char>(body[2]), 0xb2);
+	EXPECT_EQ(static_cast<unsigned char>(body[3]), 0xa1);
+	EXPECT_EQ(leU32At(body, 20), 1u) << "LINKTYPE_ETHERNET";
+
+	// First per-packet record header (16 bytes right after the global header):
+	// ts_sec, ts_usec, incl_len, orig_len. incl_len must equal orig_len (this
+	// capture never truncates), and the frame it describes — Ethernet(14) +
+	// IPv4(20) + UDP(8) + payload — must actually fit in what follows, and
+	// must contain the captured REGISTER's raw bytes verbatim.
+	const uint32_t inclLen = leU32At(body, 24 + 8);
+	const uint32_t origLen = leU32At(body, 24 + 12);
+	EXPECT_EQ(inclLen, origLen);
+	EXPECT_GE(inclLen, 14u + 20u + 8u) << "frame must be at least Eth+IPv4+UDP headers";
+	// A REGISTER always draws some response (200/401/403/etc, captured
+	// outbound too), so at least a second record follows this one — assert
+	// the first record's declared length actually fits inside the body rather
+	// than assuming exactly one record.
+	ASSERT_GE(body.size(), 24u + 16u + inclLen)
+		<< "first record's frame must fit within the response body";
+	EXPECT_NE(body.find("REGISTER sip:server"), std::string::npos)
+		<< "captured SIP bytes must appear verbatim in the record's frame";
 }

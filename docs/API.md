@@ -110,6 +110,7 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/kill`](#post-apikill) | `POST` | High | Same-Origin (+session once provisioned) | Forcefully disconnects and de-registers an active SIP extension. |
 | [`/api/cdr`](#get-apicdr) | `GET` | Low | None | Returns the in-memory Call Detail Record ring (most recent calls, newest first). |
 | [`/api/pcap`](#get-apipcap) | `GET` | Medium | Session once provisioned | Downloads the last `POCKETDIAL_PCAP_RING_SIZE` SIP signaling packets as a `.pcap` (Wireshark-readable). |
+| [`/api/diagnostics/pcap`](#get-apipcap) | `GET` | Medium | Session once provisioned | Alias for `/api/pcap` (Issue #33's originally-requested path) — identical response, same ring, same gate. |
 | [`/api/trace`](#get-apitrace) | `GET` | Medium | Session once provisioned | The same capture ring as JSON, for the dashboard's polling live SIP tracer. |
 | [`/config/<mac>.cfg`](#get-configmaccfg) | `GET` | Low | None (MAC is the bearer token) | Yealink auto-provisioning config for an already-adopted device. |
 | [`/api/dnd`](#post-apidnd) | `POST` | High | Same-Origin (+session once provisioned) | Sets or clears Do-Not-Disturb on an extension. |
@@ -376,6 +377,8 @@ Only packets that pass structural validation and the per-source-IP rate limiter 
 * **Response Status Codes**:
   * `200 OK`: Always — an empty/never-populated ring still returns a valid (headers-only) `.pcap`.
   * `401 Unauthorized`: Device is provisioned and the request carries no valid session.
+
+`GET /api/diagnostics/pcap` is a second route to this exact same handler — the path Issue #33's original feature request asked for — kept as a route rather than a redirect so `curl -o dump.pcap http://<device>/api/diagnostics/pcap` works without `-L`. Identical response, ring, and gate; use whichever path you like.
 
 ---
 
