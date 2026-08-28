@@ -57,6 +57,10 @@ public:
 
 	// Set false to simulate a drained session pool (the 503 guard paths).
 	bool sessionPoolAvailable = true;
+	// Set false to simulate an exhausted message pool (Issue #101(A) territory):
+	// messageFromPool() returns nullptr, as the real pool does once it and its
+	// bounded heap fallback are both spent.
+	bool messagePoolAvailable = true;
 
 	static sockaddr_in addr(const char* ip, uint16_t port)
 	{
@@ -93,6 +97,7 @@ public:
 	}
 	std::shared_ptr<SipMessage> messageFromPool(std::string raw, sockaddr_in src) override
 	{
+		if (!messagePoolAvailable) return nullptr;
 		return std::make_shared<SipMessage>(raw, src);
 	}
 	void log(std::string msg, bool /*isError*/ = false) override
@@ -156,7 +161,7 @@ public:
 			if (!session) continue;
 			if (session->getSrc() && session->getSrc()->getNumber() == aor)
 				fn(callID, *session, DialogRole::Caller);
-			else if (session->getDest() && session->getDest()->getNumber() == aor)
+			if (session->getDest() && session->getDest()->getNumber() == aor)
 				fn(callID, *session, DialogRole::Callee);
 		}
 	}

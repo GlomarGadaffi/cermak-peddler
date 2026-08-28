@@ -183,10 +183,42 @@ void RegisterBeeper::sweep(std::chrono::steady_clock::time_point now)
 			// has no Session to key off, so we just fall through to the same
 			// bounded fallback below rather than acting on it there too.
 			auto cancel = buildCancel(i);
-			if (cancel) _env.enqueue(bd.addr, std::move(cancel));
-			_env.log("Register beep: no answer from " + bd.ext + ", cancelled");
-			bd.state    = BeepState::AwaitingCancelDone;
-			bd.deadline = now + std::chrono::seconds(5);
+			if (cancel)
+			{
+				_env.enqueue(bd.addr, std::move(cancel));
+				_env.log("Register beep: no answer from " + bd.ext + ", cancelled");
+				bd.state    = BeepState::AwaitingCancelDone;
+				bd.deadline = now + std::chrono::seconds(5);
+			}
+			else if (++bd.cancelRetries < kMaxCancelRetries)
+			{
+				// buildCancel() couldn't get a pool slot (Issue #101(A) territory —
+				// precisely the flood conditions under which an operator reads these
+				// logs). Do NOT claim a CANCEL went out, and do NOT advance to
+				// AwaitingCancelDone: that state means "a CANCEL is in flight, keep
+				// matching this Call-ID for a raced 200 OK", which would be a lie
+				// here and would abandon the dialog in a half-cancelled limbo where
+				// nothing ever CANCELs it and the phone rings forever. Stay in
+				// AwaitingInviteOk so the next sweep() retries the CANCEL — once pool
+				// pressure eases the retry succeeds and follows the normal path
+				// above. Retry after a short, bounded delay (not every tick) so
+				// sustained pool exhaustion doesn't spin this slot.
+				_env.log("Register beep: no answer from " + bd.ext +
+					", cancel build failed — will retry");
+				bd.deadline = now + std::chrono::seconds(1);
+			}
+			else
+			{
+				// kMaxCancelRetries consecutive failures: pool pressure hasn't let
+				// up in ~5s of retrying. Give up on this slot rather than retrying
+				// forever — free it like any other abandoned dialog. The phone
+				// never got CANCELled, but it will simply ring out on its own
+				// timeout; better than pinning a beeper slot indefinitely under
+				// sustained load.
+				_env.log("Register beep: no answer from " + bd.ext +
+					", cancel build failed repeatedly — giving up, slot freed", true);
+				bd = BeepDialog{};
+			}
 			continue;
 		}
 		bd = BeepDialog{};   // AwaitingByeOk / AwaitingCancelDone fallback: free the slot

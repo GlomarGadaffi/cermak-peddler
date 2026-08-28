@@ -13,10 +13,10 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <chrono>
-#include <cstdlib>
 #include <iostream>
+#include <random>
 #else
-#include <cstdlib>   // std::rand on host (only for SSRC/seq seeding in stubbed start)
+#include <random>   // std::mt19937/random_device on host (SSRC/seq seeding in stubbed start)
 #endif
 
 namespace
@@ -29,16 +29,25 @@ namespace
 	// 2π as a double (M_PI is not guaranteed on MSVC without _USE_MATH_DEFINES).
 	constexpr double TWO_PI = 6.283185307179586476925286766559;
 
-	// Cross-platform 32-bit random (RTP SSRC / initial seq+timestamp). On ESP we use
-	// the hardware RNG; on host std::rand is fine (these are test-only there).
+	// Cross-platform 32-bit random (RTP SSRC / initial seq+timestamp). On ESP we
+	// use the hardware RNG. On host/Linux, RFC 3550 §3 wants the SSRC genuinely
+	// random (so colliding streams can be told apart) — std::rand() is a single
+	// process-wide stream shared and correlated across every caller, which is
+	// exactly the property SSRC randomness needs NOT to have. Each thread gets
+	// its own std::mt19937, seeded from std::random_device (Issue #108).
+#if !(defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO))
 	uint32_t rand32()
 	{
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-		return esp_random();
-#else
-		return (static_cast<uint32_t>(std::rand()) << 16) ^ static_cast<uint32_t>(std::rand());
-#endif
+		thread_local std::mt19937 gen{std::random_device{}()};
+		thread_local std::uniform_int_distribution<uint32_t> dist;
+		return dist(gen);
 	}
+#else
+	uint32_t rand32()
+	{
+		return esp_random();
+	}
+#endif
 }
 
 // ── ITU-T G.711 µ-law encode ────────────────────────────────────────────────
@@ -157,7 +166,16 @@ RtpSender::~RtpSender()
 		vTaskDelay(pdMS_TO_TICKS(5));
 	}
 #else
-	stop("");   // host stub: just clears the (no-task) active flag
+	// Issue #108: destroying a joinable std::thread calls std::terminate, so a
+	// stream must never be left running when this object goes away. stop("")
+	// (empty callID matches any active stream, per its own doc comment) covers
+	// both non-ESP shapes correctly: on Linux it sets _stopRequested and JOINS
+	// _senderThread synchronously (see that stop()'s own comment), so the
+	// thread is never outliving this object; on the plain host stub there is no
+	// real thread at all, so it just clears the (no-task) active flag. Either
+	// way this call is safe to make unconditionally, active stream or not
+	// (idempotent on an already-idle sender).
+	stop("");
 #endif
 }
 

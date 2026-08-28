@@ -40,6 +40,11 @@
 // ships this dedicated header. On v5.x esp_eth.h itself declared
 // esp_eth_phy_new_lan87xx and this header does not exist, so the include (and the
 // managed-component dependency in idf_component.yml) is gated to v6.0+.
+//
+// cppcheck (Issue #112): same analysis-path gap as esp_main_eth.cpp — the host
+// lint job's include path has no ESP-IDF tree, so it can't resolve the real
+// ESP_IDF_VERSION_VAL from esp_idf_version.h. A genuine idf.py build has it.
+// cppcheck-suppress syntaxError
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
 #include "esp_eth_phy_lan87xx.h"
 #endif

@@ -3731,6 +3731,11 @@ void RequestsHandler::onDtmfInfo(std::shared_ptr<SipMessage> data)
 			{
 				// NTP resync (esp_sntp_restart is ESP-IDF v5+; fall back to log if absent)
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+				// cppcheck (Issue #112): same ESP_IDF_VERSION_VAL analysis-path
+				// gap as esp_main_eth.cpp/esp_main_eth_lan8720.cpp -- the host
+				// lint job has no ESP-IDF tree on its include path to resolve
+				// esp_idf_version.h from. A genuine idf.py build has it.
+				// cppcheck-suppress syntaxError
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
 				esp_sntp_restart();
 #else

@@ -5,9 +5,17 @@
 namespace PocketDial {
 namespace {
 
+// cppcheck flags every scalar member below for having no constructor to
+// assign it (uninitMemberVarNoCtor). False positive: StatusEntry is a
+// deliberate plain aggregate -- the only instance is the constexpr
+// kStatusTable below, where every element is brace-initialised with all
+// three fields, so nothing is ever read uninitialised. A constructor would
+// defeat the point of a constexpr ROM table.
 struct StatusEntry {
+    // cppcheck-suppress uninitMemberVarNoCtor
     uint16_t         code;
     std::string_view reason;
+    // cppcheck-suppress uninitMemberVarNoCtor
     bool             softFail;
 };
 

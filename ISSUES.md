@@ -155,6 +155,61 @@ until a fork (or a future pass here) adds the routing policy.
 
 ## Resolved Issues
 
+### 🟡 Issue #112: Pin cppcheck in CI: version floats with ubuntu-latest, and 2.21 already finds 4 issues 2.13 doesn't
+* **Status**: 🟡 Partially resolved 2026-08-19 — all findings suppressed/fixed and verified against a real 2.21.0 build, but the `ci.yml` pin itself couldn't be pushed this session (missing `workflow` OAuth scope — see below) and needs a follow-up push
+* **Labels**: `cleanup`
+
+#### Resolution
+Wrote and verified the CI workflow change that pins the host job's cppcheck to **2.21.0**, built from its own tagged source (no official Linux binary, and pip's `cppcheck` package is an unrelated 1.5.1-vintage wrapper) rather than the `apt` package that floats with `ubuntu-latest`, cached by version via `actions/cache` — but this session's `gh` token lacks the `workflow` scope GitHub requires to push a `.github/workflows/*` change, so that diff could not be pushed to the PR branch. It sits, committed, on the local `backup-with-ci-workflow-change` branch and needs someone with that scope to push it or cherry-pick it onto the PR. Everything the pin would newly surface is already fixed/suppressed in source (below) and merged into the PR, so applying the pin once pushed should be a no-op against a clean CI run — it is not blocked on anything further.
+
+Before pinning, the issue's claimed 4 findings were verified rather than trusted — both 2.13.0 and 2.21.0 were built from source and run twice: once cross-compiled on Windows (surfaced a discrepancy), and once on a real Linux build via WSL Debian (gcc 14) to confirm it wasn't a Windows-build artifact. On Linux: 2.13.0 finds **zero** issues on `main`; 2.21.0 finds **13**, across six categories. The other nine beyond the issue's four are the identical false-positive shape as its own `SipStatus.cpp` example (plain aggregates now flagged per-scalar-member even though every construction site brace-initializes or immediately overwrites the field), plus a third, previously-unreported `ESP_IDF_VERSION_VAL` `syntaxError` site inside `RequestsHandler.cpp`, and one `performance` suggestion. All thirteen resolved — pinning without addressing all of them would have made the pin itself the next red-CI surprise:
+
+- The three `syntaxError` sites (`main/esp_main_eth.cpp:36`, `main/esp_main_eth_lan8720.cpp:43`, `src/SIP/RequestsHandler.cpp:3734`, all `#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(...)`) were investigated as the issue asked ("the dangerous one") rather than blind-suppressed: confirmed not a real parse defect — a genuine `idf.py` build resolves `esp_idf_version.h` fine; the host lint job's include path just has no ESP-IDF tree on it. Fixed with inline `// cppcheck-suppress syntaxError` at each site (verified with a standalone repro that this scopes to just that line, not the whole file) rather than the issue's suggested whole-file `--suppress=syntaxError:<path>`, which on `RequestsHandler.cpp` — the codebase's largest, most-frequently-changed file — would have silenced any future real syntax error there too.
+- `SipStatus.cpp` (both its `code` and `softFail` fields — cppcheck flags each scalar member individually), `DnsServer.cpp`, `PcapCapture.hpp` (×6), `RequestsHandler.hpp` (×2) got inline `// cppcheck-suppress` comments with per-site false-positive rationale.
+- `RequestsHandler.hpp`'s `getAdminExt()` performance suggestion (return by reference) was deliberately **declined**: `_adminExt` is mutated from call paths that don't share a lock with this getter, so returning a reference would let it dangle under a concurrent write — worse, not better.
+
+Verified clean (`EXIT=0`, zero findings) with the exact CI invocation on both a Windows cross-build and a real WSL/Linux build of cppcheck 2.21.0. Full detail: https://github.com/GlomarGadaffi/pocket-dial/issues/112
+
+---
+
+### 🟢 Issue #108: RtpSender Linux: no destructor join for the sender thread; SSRC/seq seeded from std::rand
+* **Status**: ✅ Resolved 2026-08-19 — SSRC/seq fixed; destructor was already correct on `main`
+* **Labels**: `bug`, `desktop`
+
+#### Resolution
+Two items:
+
+1. **SSRC/sequence/timestamp seeded from `std::rand()`.** Fixed: the host/Linux `rand32()` now uses a `thread_local std::mt19937` seeded from `std::random_device`, rather than a single process-wide `std::rand()` stream shared and correlated across every caller. The ESP branch (`esp_random()`, the hardware RNG) was already correct and is unchanged.
+2. **No destructor join.** Investigated and found **already correct** on `main` — the issue's "no destructor is visible in the patch" referred to commit `af5fd24` (the Linux media path) not adding one, but `~RtpSender()` predates that commit (added with the original media feature, `119ca84`) and its non-ESP branch already calls `stop("")` unconditionally, which on Linux sets `_stopRequested` and joins `_senderThread` synchronously before returning. No joinable thread is ever left running when the object is destroyed. Only the destructor's stale comment (still calling it a "host stub" after `af5fd24` gave that code path a real Linux thread) was updated — no behavior change. Verified by building and running the host suite under WSL/Linux (the real `__linux__` thread path, not the Windows host-stub no-op) with a new test that starts a stream and lets the object destruct without calling `stop()` first: completes cleanly, no `std::terminate()`.
+
+New/updated tests: `tests/Rtp_test.cpp` (`DestructorStopsActiveStreamWithoutCrash`). Full detail: https://github.com/GlomarGadaffi/pocket-dial/issues/108
+
+---
+
+### 🟢 Issue #106: BLF forEachSessionInvolving else-if drops the Callee leg when an extension calls itself
+* **Status**: ✅ Resolved 2026-08-19
+* **Labels**: `bug`
+
+#### Resolution
+`RequestsHandler::forEachSessionInvolving()` used an `if (isSrc) ... else if (isDest) ...` chain (a regression from commit `f0446d9`'s refactor), so a session whose src *and* dest are both the watched extension — a self-call, or a hunt/ring group where the caller is also a member — only ever reported the Caller role; the Callee leg was silently dropped from `BlfSubscriptions`' dialog-info XML. Restored to two independent `if`s so both roles fire when both match, as the pre-`f0446d9` visitor did.
+
+`tests/FakePbxEnv.hpp`'s `forEachSessionInvolving()` — the test double every BLF/beeper/park host test drives, since the production method is a private `PbxEnv` override and not directly host-testable — carried the identical bug and was fixed identically. Covered by two new tests in `tests/BlfSubscriptions_test.cpp`: one asserts the callback fires twice (once per role) for a self-call session, the other confirms `BlfSubscriptions::computeDialogState` reports the higher-ranked Callee leg rather than getting stuck on the Caller leg for a ringing self-call. Full detail: https://github.com/GlomarGadaffi/pocket-dial/issues/106
+
+---
+
+### 🟢 Issue #104: RegisterBeeper::sweep logs 'cancelled' and enters AwaitingCancelDone even when buildCancel fails
+* **Status**: ✅ Resolved 2026-08-19
+* **Labels**: `bug`
+
+#### Resolution
+Confirmed as a live bug via real-hardware evidence in the issue's comment thread (a LilyGO T-ETH-Elite S3 logging "cancelled" for a beep dialog in the same breath as message-pool exhaustion). `sweep()`'s `AwaitingInviteOk` branch unconditionally logged "cancelled" and advanced to `AwaitingCancelDone` even when `buildCancel()` returned `nullptr` under pool pressure — misrepresenting what happened, and leaving the dialog in a state that claims a CANCEL is in flight when none was sent.
+
+Fixed: on `buildCancel()` failure the dialog stays in `AwaitingInviteOk` with a short retry deadline and a distinct "cancel build failed — will retry" log; the next `sweep()` tick retries, succeeding once pool pressure eases. Per the issue's own caution against getting stuck forever either, added a bounded retry count (`BeepDialog::cancelRetries`, capped at 5) — after five consecutive failures `sweep()` gives up and frees the slot rather than retrying indefinitely under sustained exhaustion.
+
+Covered by two new tests in `tests/RegisterBeeper_test.cpp` (a new `FakePbxEnv::messagePoolAvailable` toggle forces `buildCancel()` to fail, matching the existing `sessionPoolAvailable` pattern): one confirms the retry-then-succeed path, the other confirms the bounded give-up-and-free path under sustained pressure. Full detail: https://github.com/GlomarGadaffi/pocket-dial/issues/104
+
+---
+
 ### 🟢 Issue #101: Pool-exhaustion backpressure, SDP re-parse, PcapCapture alloc-under-lock, incomplete firmware audit
 * **Status**: ✅ Resolved 2026-08-17 — **A**, **B**, **D**, **E** fixed; **C** formally declined (see below)
 * **Labels**: `performance`, `reliability`, `memory-safety`, `cleanup`, `refactoring`, `esp32`

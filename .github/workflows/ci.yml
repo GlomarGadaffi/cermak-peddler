@@ -12,6 +12,16 @@ jobs:
   build-and-test-host:
     name: Host Build & Simulation Testing
     runs-on: ubuntu-latest
+    env:
+      # Pinned analyzer version (Issue #112) -- bump deliberately, not via a
+      # runner-image update. 2.21.0 is the version this pin was verified
+      # against: every `// cppcheck-suppress ...` comment landed alongside
+      # this pin (SipStatus.cpp, PcapCapture.hpp, RequestsHandler.hpp/.cpp,
+      # AnchorClient.hpp, DnsServer.cpp, esp_main_eth*.cpp) was added because
+      # 2.21.0 flags it and the prior floating apt version (2.13.0) did not.
+      # Bumping this version is expected to surface new findings to triage,
+      # not to fail silently -- do not bump without re-running locally first.
+      CPPCHECK_VERSION: 2.21.0
 
     steps:
       - name: Checkout Repository
@@ -20,10 +30,38 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential cppcheck clang-tidy jq curl
+          sudo apt-get install -y cmake build-essential clang-tidy jq curl
+
+      - name: Cache pinned cppcheck build
+        id: cppcheck-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/cppcheck-install
+          key: ${{ runner.os }}-cppcheck-${{ env.CPPCHECK_VERSION }}
+
+      - name: Build & Install cppcheck (pinned version)
+        # Issue #112: the apt package tracks ubuntu-latest's own image, so the
+        # analyzer version (and therefore what it finds) floats with every
+        # runner-image bump -- a future bump can turn a green PR red on code
+        # nobody touched. cppcheck ships no prebuilt Linux binary, so the
+        # version is pinned by building it from its own tagged source instead
+        # (cached above, keyed on the version, so this only runs once per bump).
+        if: steps.cppcheck-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -sSL -o cppcheck.tar.gz \
+            "https://github.com/danmar/cppcheck/archive/refs/tags/${CPPCHECK_VERSION}.tar.gz"
+          tar xzf cppcheck.tar.gz
+          cmake -S "cppcheck-${CPPCHECK_VERSION}" -B cppcheck-build \
+                -DCMAKE_BUILD_TYPE=Release -DUSE_MATCHCOMPILER=ON \
+                -DBUILD_TESTS=OFF -DBUILD_GUI=OFF \
+                -DCMAKE_INSTALL_PREFIX="$HOME/cppcheck-install"
+          cmake --build cppcheck-build -j"$(nproc)"
+          cmake --install cppcheck-build
 
       - name: Run Static Analysis (cppcheck)
         run: |
+          export PATH="$HOME/cppcheck-install/bin:$PATH"
+          cppcheck --version
           cppcheck --error-exitcode=1 \
                    --enable=warning,performance \
                    --inline-suppr \

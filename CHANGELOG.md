@@ -1,5 +1,229 @@
 # Changelog
 
+## Unreleased (issue-106-104-108-112-misc-bugs) - 2026-08-19
+
+Four small, independently-filed correctness bugs plus one CI hygiene fix,
+bundled into one PR per the triage bucket. Full host suite: 196/196 passing
+(WSL/Linux — see Verification).
+
+### Fixed — BLF `forEachSessionInvolving` drops the Callee leg on a self-call (#106)
+
+- `RequestsHandler::forEachSessionInvolving()` (the production `PbxEnv`
+  implementation) used an `if (isSrc) ... else if (isDest) ...` chain, a
+  regression from commit `f0446d9`'s refactor away from independent flags. When
+  a session's src *and* dest are both the watched extension (an extension
+  calling itself, or a hunt/ring group where the caller is also a member), the
+  `else if` meant only the Caller role ever fired — `BlfSubscriptions::
+  computeDialogState` never saw the Callee leg, so a watcher's dialog-info XML
+  reported the wrong role/state for that dialog. Restored to two independent
+  `if`s so both roles fire when both match — matching the pre-`f0446d9`
+  behavior where the visitor received both flags at once.
+
+- `tests/FakePbxEnv.hpp`'s `forEachSessionInvolving()` (the test double every
+  `BlfSubscriptions`/`RegisterBeeper`/`ParkOrbit` host test drives) carried the
+  identical bug, since it was written to mirror the production method. Fixed
+  identically.
+
+  `RequestsHandler::forEachSessionInvolving()` itself is a private `PbxEnv`
+  override (`RequestsHandler` privately inherits `PbxEnv`) and so isn't
+  directly host-testable in isolation; the fake mirrors it exactly and is
+  covered by two new tests in `tests/BlfSubscriptions_test.cpp`: one asserts
+  the callback fires twice (once per `DialogRole`) for a self-call session,
+  the other drives the real `BlfSubscriptions::computeDialogState` end-to-end
+  through the fake and confirms a ringing self-call reports the higher-ranked
+  Callee leg (`early`/`recipient`) rather than getting stuck on the
+  lower-ranked Caller leg (`trying`/`initiator`) — which is exactly the
+  externally-observable symptom the `else if` bug produced.
+
+### Fixed — `RegisterBeeper::sweep` claims "cancelled" when the CANCEL was never built (#104)
+
+Real-hardware evidence (see the issue's comment thread): a LilyGO T-ETH-Elite
+S3 logged `"Register beep: no answer from 321, cancelled"` immediately
+alongside `"[tx] pool exhausted — INVITE sent without retransmit tracking"` —
+i.e. `buildCancel()` failing under the exact message-pool pressure Issue
+#101(A) bounds, not a hypothetical.
+
+- `sweep()`'s `AwaitingInviteOk` branch unconditionally logged `"cancelled"`
+  and advanced to `AwaitingCancelDone` even when `buildCancel(i)` returned
+  `nullptr` (pool exhausted). `AwaitingCancelDone` means "a CANCEL is in
+  flight, keep matching this Call-ID for a raced 200 OK" — asserting that when
+  no CANCEL went out is both a misleading log during exactly the flood an
+  operator would be reading it in, and leaves the dialog in a half-cancelled
+  limbo state that nothing ever revisits (the phone was never actually
+  CANCELled, and the dialog no longer looks like it needs to be).
+
+  Now: on `buildCancel()` failure the dialog stays in `AwaitingInviteOk` with a
+  short (1s) deadline, logs a distinct "cancel build failed — will retry"
+  message, and the next `sweep()` tick retries — succeeding once pool pressure
+  eases, at which point it follows the original cancelled/`AwaitingCancelDone`
+  path unchanged.
+
+- Per the issue's own caution ("don't leave it stuck forever either"): added a
+  bounded retry count (`BeepDialog::cancelRetries`, capped at
+  `RegisterBeeper::kMaxCancelRetries` = 5). If pool pressure hasn't eased after
+  five consecutive retry ticks, `sweep()` gives up and frees the slot outright
+  (logged as an error) instead of retrying indefinitely under sustained
+  exhaustion — the phone simply rings out on its own INVITE timeout instead of
+  ever being CANCELled, which is strictly better than pinning a beeper slot
+  forever.
+
+  Covered by two new tests in `tests/RegisterBeeper_test.cpp`: one forces
+  `buildCancel()` to fail once (via a new `FakePbxEnv::messagePoolAvailable`
+  toggle, matching the existing `sessionPoolAvailable` pattern) and asserts the
+  log/state behavior plus a successful retry once the pool recovers; the other
+  forces ten consecutive failures and asserts sweep gives up and frees the slot
+  rather than retrying forever.
+
+### Fixed — `RtpSender` SSRC/sequence/timestamp seeded from `std::rand()` (#108)
+
+- RFC 3550 §3 wants the RTP SSRC genuinely random so colliding streams can be
+  told apart, and the initial sequence/timestamp random so a receiver can
+  detect restarts. The host/Linux `rand32()` used `std::rand()` — a single
+  process-wide stream, shared and correlated across every caller, which is the
+  opposite of what SSRC randomness needs. Replaced with a `thread_local
+  std::mt19937` seeded from `std::random_device`, one generator per thread
+  rather than one shared global stream. The ESP branch is unchanged
+  (`esp_random()`, the hardware RNG, was already correct).
+
+- **Destructor join, investigated and found already correct on `main`:** the
+  issue flagged "no destructor is visible in the patch" (referring to commit
+  `af5fd24`'s Linux media path). `~RtpSender()` does exist — it predates
+  `af5fd24` (added with the original media feature, commit `119ca84`) and was
+  carried through unchanged — and its non-ESP branch unconditionally calls
+  `stop("")`. On Linux, `stop()` sets `_stopRequested` and **joins
+  `_senderThread` synchronously** before returning (see `stop()`'s own
+  comment), so a joinable `std::thread` is never left running when the object
+  is destroyed; on the plain host stub there is no real thread to join at all.
+  No code change was needed for this half — only a comment update, since the
+  destructor's comment still called it a "host stub" after `af5fd24` gave the
+  same code path a real Linux thread to join. Verified directly: built and ran
+  the host test suite under WSL/Linux (`__linux__`, the real thread path, not
+  the Windows host-stub one) with a new test that starts a stream and lets the
+  `RtpSender` destruct without calling `stop()` first — the process completes
+  cleanly rather than calling `std::terminate()`. New test in `tests/Rtp_test.cpp`.
+
+### Fixed — cppcheck version floats with `ubuntu-latest`; scope grew during verification (#112)
+
+- **The suppression half is landed here; the version-pin half needs a
+  follow-up push.** This session's `gh` token lacks the `workflow` OAuth
+  scope GitHub requires to push a change under `.github/workflows/`, so the
+  `ci.yml` diff that actually pins cppcheck to 2.21.0 (built from its own
+  tagged source — no official Linux binary, and pip's `cppcheck` package is
+  an unrelated 1.5.1-vintage wrapper — cached by version via `actions/cache`
+  so a version bump is deliberate, not a runner-image surprise) could not be
+  pushed to this branch. It's fully written and verified (see below) and sits
+  on the local `backup-with-ci-workflow-change` branch; someone with that
+  scope needs to cherry-pick it onto this PR (or push that branch and merge
+  it) before this issue is truly closed. Until then CI keeps running the
+  floating apt 2.13.0, which is a no-op with respect to every suppression
+  below (2.13.0 reports none of these findings), so nothing regresses in the
+  meantime — the pin is additive, not a prerequisite for the rest of this PR.
+
+- **The issue's own count was verified and found incomplete.** The issue
+  documented exactly 4 findings 2.21.0 has that 2.13.0 doesn't. To pin
+  responsibly this needed verifying on the real toolchain rather than trusted
+  at face value, so both versions were built from source and run **twice**:
+  once on this Windows sandbox's cross-compiled cppcheck (caught the
+  discrepancy) and once on a real Linux build via WSL Debian (gcc 14, matching
+  the actual `ubuntu-latest` job) to rule out a Windows-build artifact.
+  Confirmed on Linux: 2.13.0 finds **zero** issues on `main`; 2.21.0 finds
+  **13**, across six categories, not four. The other nine are the identical
+  false-positive shape as the issue's own `SipStatus.cpp` example — plain
+  aggregates cppcheck now flags per-scalar-member (`uninitMemberVarNoCtor`)
+  even though every construction site brace-initializes or immediately
+  overwrites the field before any read — plus a third, previously-unreported
+  `ESP_IDF_VERSION_VAL` `syntaxError` site and one `performance` finding.
+  Pinning to 2.21.0 without addressing all thirteen would have made the pin
+  itself the next red-CI surprise, so all thirteen are resolved here:
+
+  - **The two `syntaxError` findings the issue asked to investigate "for
+    real"** (`main/esp_main_eth.cpp:36`, `main/esp_main_eth_lan8720.cpp:43`,
+    both `#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(...)`) — plus a third,
+    identical, previously-unreported instance found during verification
+    (`src/SIP/RequestsHandler.cpp:3734`, inside the DTMF NTP-resync
+    handler) — are **not** a real parse defect: `esp_idf_version.h` is a real
+    ESP-IDF header that a genuine `idf.py` build (Job 2 of this workflow)
+    resolves fine. The host lint job's include path (`-I src/Helpers -I
+    src/SIP -I main`) has no ESP-IDF tree on it, so cppcheck can't expand
+    `ESP_IDF_VERSION_VAL` and aborts that `#if`. Suppressed with inline
+    `// cppcheck-suppress syntaxError` comments at each site (verified this
+    scopes to just that line and doesn't blind cppcheck to the rest of the
+    file — confirmed with a standalone repro before applying), rather than
+    the issue's suggested whole-file `--suppress=syntaxError:<path>`, which
+    would have silenced *any* future syntax error anywhere in
+    `RequestsHandler.cpp` — the codebase's largest, most-frequently-changed
+    file, and precisely the "dangerous" outcome the issue was warning about,
+    just from the flag rather than from the finding itself.
+  - **`SipStatus.cpp:11` `uninitMemberVarNoCtor`** (and, found during
+    verification, the same struct's `code` field at line 9 — cppcheck flags
+    each scalar member individually, not once per struct): `StatusEntry` is a
+    deliberate plain aggregate; its only instance, the constexpr
+    `kStatusTable`, brace-initializes every field. Suppressed inline with the
+    issue's own rationale.
+  - **`main/wifi/DnsServer.cpp:113,141` `dangerousTypeCast`**: the standard
+    BSD-sockets `(struct sockaddr *)&x` idiom for `bind()`/`recvfrom()`.
+    Suppressed inline with the issue's own rationale.
+  - **`src/SIP/PcapCapture.hpp` `uninitMemberVarNoCtor` ×6**
+    (`TraceRecord::seq/tsUs/outbound`, `Entry::seq/outbound/tsUs`, found during
+    verification, not in the issue): `TraceRecord`'s one construction site
+    brace-initializes every field; `Entry`'s one populator (`recordInto()`)
+    assigns every field immediately after the `emplace_back()`/slot-reuse that
+    default-constructs it, before any read. Suppressed inline.
+  - **`src/SIP/RequestsHandler.hpp` `uninitMemberVarNoCtor` ×2**
+    (`ProvisioningInfo::authRequired`, `RateBucket::tokens`, found during
+    verification): both are always fully brace-initialized or immediately
+    overwritten at their one construction site each
+    (`findProvisioningInfo()`'s return; `_rateBuckets[ip] = {40.0, now}`).
+    Suppressed inline.
+  - **`src/SIP/AnchorClient.hpp` `uninitMemberVarNoCtor` ×1** (`CallEvent::
+    type`, found during verification): every `CallEvent` construction site in
+    `LoopbackAnchorClient.cpp` brace-initializes all four fields. Suppressed
+    inline.
+  - **`src/SIP/RequestsHandler.hpp:160` `performance: returnByReference`**
+    (`getAdminExt()`, found during verification) — deliberately **declined**,
+    not applied: `_adminExt` is mutated by `saveAdminExt()`/`loadAdminExt()`
+    from call paths that don't share a lock with this getter (callers read it
+    off the SIP thread, e.g. the dashboard/HTTP plane). Returning by value at
+    least hands the caller an independent copy the instant this call returns;
+    returning `const std::string&` as suggested would additionally let that
+    reference dangle/tear if a concurrent save reallocates the string while
+    the caller still holds it — strictly worse, not a free performance win.
+    Suppressed inline with that rationale.
+
+### Verification
+
+Full host suite built and run on **two** toolchains for this bucket, since
+issue #112's own build was cross-verified on real Linux (see above) and the
+Windows sandbox's Smart App Control policy (enterprise code-integrity
+enforcement, unrelated to this change) began blocking execution of freshly-
+linked, unsigned test binaries partway through this session:
+
+- **Windows, MSVC 19.44 (Visual Studio 17 2022)**: for #106 and #104,
+  temporarily reverted just the production fix (`RequestsHandler.hpp`,
+  `RegisterBeeper.cpp`, and the `forEachSessionInvolving()` half of
+  `FakePbxEnv.hpp`) with the new tests left in place, confirming all three new
+  tests fail against the pre-fix behavior, then restored the fix and confirmed
+  they pass. Full suite (171 pre-existing + new tests) passing on the fixed
+  tree, prior to the Smart App Control block described below.
+- **WSL Debian, gcc 14.2.0** (matches the CI runner's OS/toolchain family):
+  configured, built, and ran the fixed tree's full suite — **196/196
+  passing**, including the `RtpSender` destructor test running the real
+  `__linux__` `std::thread` path (not the Windows host-stub no-op path, which
+  would have proven nothing about the join fix).
+- **Windows, MSVC 19.44 (Visual Studio 17 2022)**: built clean through
+  `RegisterBeeper.cpp`, `RequestsHandler.hpp`/`.cpp`, `RtpSender.cpp`,
+  `AnchorClient.hpp`, `PcapCapture.hpp`, `SipStatus.cpp`, and all touched test
+  files with no new warnings; test *execution* is currently blocked on this
+  machine by Smart App Control (`CodeIntegrity` event log:
+  "did not meet the Enterprise signing level requirements") for any
+  freshly-rebuilt, unsigned `sip_parser_tests.exe` — confirmed unrelated to
+  these changes (the already-built `SipServer.exe` runs fine; only newly
+  re-linked test binaries are affected) and not something fixable from within
+  this session.
+- **cppcheck 2.21.0**, built from source on both a Windows cross-compile and a
+  real WSL/Linux build, run against the final tree with the workflow's exact
+  invocation: `EXIT=0`, zero findings, on both.
+
 ## Unreleased (issue-101-closeout) - 2026-08-17
 
 Closes Issue #101: items **A**, **B**, **D** and **E** are fixed, **C** is
