@@ -40,6 +40,7 @@
 #include "RegisterBeeper.hpp"
 #include "ParkOrbit.hpp"
 #include "BlfSubscriptions.hpp"
+#include "ConferenceRoom.hpp"
 
 class RequestsHandler : private PbxEnv
 {
@@ -83,7 +84,10 @@ public:
 	// Build the server's own SDP body for the 440 answer (server media: PCMU on the
 	// server's RTP port). Pure formatter — exposed so tests can assert its body and
 	// the resulting Content-Length correctness (the 777-bug class).
-	static std::string buildMediaSdp(const std::string& serverIp, int rtpPort);
+	// `sendrecv` flips the direction attribute: 440 is a one-way tone (sendonly), a
+	// conference leg (888) is two-way (sendrecv) — the phone must know to send audio.
+	static std::string buildMediaSdp(const std::string& serverIp, int rtpPort,
+		bool sendrecv = false);
 
 	// Parse the caller's RTP destination from an INVITE: the SDP c= line IP (falling
 	// back to the INVITE source IP) + the m=audio port via getRtpPort(). Returns false
@@ -111,6 +115,10 @@ public:
 	uint64_t getPacketsDropped() const;   // Issue #38: rate-limited/blocked packets
 	size_t getClientCount();
 	size_t getSessionCount();
+	// Legs currently mixed on the meet-me conference (virtual extension 888); 0 while
+	// no room has ever been dialled. Reads the live room, not the dashboard snapshot,
+	// so it is exact the instant a leg joins or leaves.
+	int getConferenceLegs();
 
 	// Call Detail Records (CDR): a thread-safe snapshot of the recent-call ring,
 	// newest first. Copied out under _snapshotMutex like the client/session views.
@@ -523,6 +531,21 @@ private:
 	// one-way RTP tone stream to the caller's RTP address. ONE concurrent stream: a
 	// 2nd dial while busy is rejected 486 Busy Here. Caller holds _mutex.
 	void onMediaInvite(std::shared_ptr<SipMessage> data, const std::shared_ptr<SipClient>& caller);
+
+	// ── Local N-way conference: virtual extension 888 (server-mixed RTP) ─────────
+	// onInvite() routes a dial of 888 here (Issue #75). The server answers 200 OK
+	// advertising THIS LEG's own RTP receive port and joins the caller to the shared
+	// ConferenceRoom, whose single MixBus gives every leg the sum of the others minus
+	// itself. The room is created on the first dial-in and then kept alive (its bus
+	// rings and mix-tick task are not worth churning per call). A dial past
+	// POCKETDIAL_CONF_LEGS is rejected 486 Busy Here, mirroring the 440 cap. Caller
+	// holds _mutex.
+	void onConferenceInvite(std::shared_ptr<SipMessage> data, const std::shared_ptr<SipClient>& caller);
+
+	// The shared meet-me room, created lazily on the first 888 dial-in — a MixBus and
+	// its per-leg rings are ~50 KB, too much to pay at boot on a node that may never
+	// hold a conference. Null until then. Caller holds _mutex.
+	std::unique_ptr<ConferenceRoom> _conference;
 
 	void unregisterClient(std::string_view number);
 

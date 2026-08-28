@@ -111,6 +111,7 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/TelephonyApiConfig.cpp"
                             "../src/SIP/MixBus.cpp"
                             "../src/SIP/mix_kernels_scalar.cpp"
+                            "../src/SIP/ConferenceRoom.cpp"
                     INCLUDE_DIRS "../src/Helpers" "../src/SIP" "drivers" "ui" "wifi"
                     REQUIRES nvs_flash lwip esp_netif esp_event freertos mdns app_update esp_driver_ledc console esp_timer ${EXTRA_REQUIRES}
                     PRIV_REQUIRES esp_wifi)

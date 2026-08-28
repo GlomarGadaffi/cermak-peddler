@@ -662,6 +662,14 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	if (destNumber == ConferenceRoom::EXT)
+	{
+		// CANCEL of a conference dial-in: endCall() drops the leg (see its
+		// ConferenceRoom::leave call), so the room needs nothing extra here.
+		endCall(data->getCallID(), data->getFromNumber(), ConferenceRoom::EXT);
+		return;
+	}
+
 	if (_park.orbitIndex(destNumber) >= 0)
 	{
 		endCall(data->getCallID(), data->getFromNumber(), destNumber);
@@ -877,6 +885,14 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	if (destNumber == ConferenceRoom::EXT)
+	{
+		// Meet-me conference (888): the server answers, joins this caller to the one
+		// shared MixBus, and mixes. N callers dialing 888 are N legs of one conference.
+		onConferenceInvite(data, caller.value());
+		return;
+	}
+
 	// Call parking (park-orbit, 700..70N): an INVITE to a FREE orbit parks the
 	// caller's leg there; an INVITE to an OCCUPIED orbit retrieves the parked call.
 	{
@@ -1012,11 +1028,13 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	endHandle(data->getToNumber(), response);
 }
 
-std::string RequestsHandler::buildMediaSdp(const std::string& serverIp, int rtpPort)
+std::string RequestsHandler::buildMediaSdp(const std::string& serverIp, int rtpPort, bool sendrecv)
 {
-	// The server's OWN SDP offer/answer for the 440 tone stream. PCMU (PT 0) only —
-	// matches enforceG711()/the codec the rest of the PBX speaks. Sendonly: the
-	// server streams to the caller and ignores any media the caller sends back.
+	// The server's OWN SDP offer/answer for a server-media call. PCMU (PT 0) only —
+	// matches enforceG711()/the codec the rest of the PBX speaks. Sendonly (the 440
+	// tone default): the server streams to the caller and ignores any media the caller
+	// sends back. Sendrecv is what a conference leg (888) needs — the mix is only a
+	// mix if the phone actually sends its own audio up.
 	// CRLF line endings throughout so Content-Length (computed by the caller via
 	// syncContentLength()) matches the wire bytes exactly.
 	std::string s;
@@ -1027,7 +1045,7 @@ std::string RequestsHandler::buildMediaSdp(const std::string& serverIp, int rtpP
 	s += "t=0 0\r\n";
 	s += "m=audio " + std::to_string(rtpPort) + " RTP/AVP 0\r\n";
 	s += "a=rtpmap:0 PCMU/8000\r\n";
-	s += "a=sendonly\r\n";
+	s += sendrecv ? "a=sendrecv\r\n" : "a=sendonly\r\n";
 	return s;
 }
 
@@ -1217,6 +1235,106 @@ void RequestsHandler::onMediaInvite(std::shared_ptr<SipMessage> data,
 		+ " (callID=" + std::string(data->getCallID()) + ")");
 }
 
+// ── Local N-way conference (virtual extension 888) ───────────────────────────
+// Issue #75 / docs/CONFERENCE_MIXER.md §7. Every caller that dials 888 gets its own
+// leg on ONE shared ConferenceRoom: a MediaBridge in BUS mode, its own RTP receive
+// port, and one MixBus port. The bus's single tick then hands each leg the saturated
+// sum of the OTHER legs, so a third caller joining is just a third port — no signaling
+// fan-out, no per-pair wiring, and a leg leaving only marks its port Draining.
+//
+// Ordering discipline is copied deliberately from onMediaInvite() above (Issue #115):
+// parse the caller's RTP -> join the room -> allocate the session -> draw the 200 OK
+// from the message pool -> only THEN publish the session and answer. Every failure
+// before the answer unwinds what it started, so the caller's INVITE retransmit finds
+// a clean slate instead of a half-joined leg with no dialog behind it.
+void RequestsHandler::onConferenceInvite(std::shared_ptr<SipMessage> data,
+	const std::shared_ptr<SipClient>& caller)
+{
+	const std::string activeIp = _localIp;
+	const std::string callID(data->getCallID());
+	const std::string confExt(ConferenceRoom::EXT);
+
+	auto refuse = [&](const char* statusLine, const char* why) {
+		auto msg = getMessageFromPool(*data);
+		if (!msg) return;   // pool exhausted: drop, peer retransmits (#101A)
+		msg->setHeader(statusLine);
+		msg->clearBody();
+		msg->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		msg->setContact(buildContact(confExt));
+		_outbox.emplace_back(data->getSource(), std::move(msg));
+		queueLog("888 conference: " + std::string(why) + " for "
+			+ std::string(data->getFromNumber()), true);
+	};
+
+	// Where does this phone want its audio? Same c=/m= parse the 440 path uses.
+	std::string destIp;
+	uint16_t destPort = 0;
+	if (!parseCallerRtp(data, destIp, destPort))
+	{
+		refuse(SipMessageTypes::BAD_REQUEST, "no usable RTP destination in INVITE");
+		return;
+	}
+
+	// The room (and its single mix-tick driver) is built on the first dial-in and then
+	// kept for the life of the process: standing the tick task up and down underneath
+	// legs whose RTP tasks may still be in flight is exactly the teardown race the bus's
+	// Draining state exists to avoid. Idle cost is the bus rings; see PoolConfig.hpp.
+	if (!_conference)
+	{
+		_conference = std::make_unique<ConferenceRoom>();
+		_conference->startDriver();
+		queueLog("888 conference: room created (" + std::to_string(ConferenceRoom::MAX_LEGS)
+			+ " legs, " + std::to_string(ConferenceRoom::TICK_MS) + " ms mix tick)");
+	}
+
+	// Join first: a full room must not consume a session slot. The leg index is also
+	// the proof the media actually came up, so nothing is answered on a dead leg.
+	const int leg = _conference->join(callID, std::string(caller->getNumber()), destIp, destPort);
+	if (leg < 0)
+	{
+		refuse("SIP/2.0 486 Busy Here", "room full or media failed to start");
+		return;
+	}
+
+	auto newSession = allocateSession(callID, caller);
+	if (!newSession)
+	{
+		_conference->leave(callID);
+		refuse("SIP/2.0 503 Service Unavailable", "session pool full");
+		return;
+	}
+
+	// Draw the answer BEFORE publishing the session — past _sessions.emplace() the
+	// retransmission guard at the top of onInvite() silently drops the caller's retry,
+	// so a pool refusal here would strand a joined leg with no answer ever sent.
+	// The SDP advertises THIS LEG's receive port (not the 440 sender's port): that is
+	// where the handset must send its audio for the mix to hear it.
+	const std::string toTag = IDGen::GenerateID(9);
+	const std::string sdpBody = buildMediaSdp(activeIp, _conference->rtpPortFor(callID),
+		/*sendrecv=*/true);
+	auto ok = buildOkWithSdp(data, activeIp, toTag, sdpBody);
+	if (!ok)
+	{
+		_conference->leave(callID);
+		queueLog("888 conference: message pool exhausted, leg unwound", true);
+		return;
+	}
+
+	// Per-session dummy dest (never a shared client) so a concurrent 777/440/888 call
+	// can't overwrite this call's destination identity.
+	auto dummyConf = allocateVirtualPeer(confExt, data->getSource());
+	newSession->setDest(dummyConf);
+	_sessions.emplace(callID, newSession);
+	newSession->setState(Session::State::Connected);
+
+	_outbox.emplace_back(data->getSource(), std::move(ok));
+
+	queueLog("888 conference: " + std::string(caller->getNumber()) + " joined leg "
+		+ std::to_string(leg) + " (" + std::to_string(_conference->legCount()) + "/"
+		+ std::to_string(ConferenceRoom::MAX_LEGS) + "), media to "
+		+ destIp + ":" + std::to_string(destPort));
+}
+
 void RequestsHandler::onTrying(std::shared_ptr<SipMessage> data)
 {
 	auto session = getSession(data->getCallID());
@@ -1355,6 +1473,20 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		// Media beachhead teardown: stop the RTP tone stream (only if it owns this
 		// Call-ID), 200 OK the BYE, and end the session. Stream stop is idempotent.
 		_rtpSender.stop(std::string(data->getCallID()));
+		auto response = getMessageFromPool(*data);
+		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+		response->setHeader(SipMessageTypes::OK);
+		std::string activeIp = _localIp;
+		response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+		_outbox.emplace_back(data->getSource(), std::move(response));
+		endCall(data->getCallID(), data->getFromNumber(), destNumber);
+		return;
+	}
+
+	if (destNumber == ConferenceRoom::EXT)
+	{
+		// Conference hang-up: 200 OK the BYE and end the call. endCall() releases the
+		// MixBus port (Active -> Draining); the remaining legs keep mixing untouched.
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
 		response->setHeader(SipMessageTypes::OK);
@@ -1615,6 +1747,14 @@ void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 	std::string destNumber(data->getToNumber());
 	if (destNumber == "777")
 	{
+		return;
+	}
+
+	if (destNumber == ConferenceRoom::EXT)
+	{
+		// The server is the UAS on a conference leg (as with 777): the ACK completes
+		// our own 200 OK and there is no second leg to relay it to. Media is already
+		// flowing — the leg joined the bus when the INVITE was answered.
 		return;
 	}
 
@@ -2051,6 +2191,15 @@ void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumbe
 	_txLayer.freeForCallId(callID);
 	// Free any park orbit slot holding this call's parked leg.
 	_park.freeForCallId(callID);
+	// Drop this call's conference leg, if it had one. Idempotent for every other
+	// call, so this is the ONE place a 888 leg is released — BYE, CANCEL, a session
+	// timer expiring and the orphan sweep all funnel through endCall(), and none of
+	// them has to remember the room exists. Releasing the leg only marks its MixBus
+	// port Draining; the next mix tick reclaims the rings without touching the others.
+	if (_conference)
+	{
+		_conference->leave(std::string(callID));
+	}
 
 	// Capture the session (for CDR start time / final state) BEFORE we erase it.
 	std::shared_ptr<Session> ending;
@@ -2575,7 +2724,7 @@ void RequestsHandler::setForwardLocked(const std::string& extension, const std::
 	// DTMF *73/*72NNNN inline path skipped it entirely (Issue #77), so a
 	// crafted mid-dialog INFO with From: 777/999 could set up a "forward" on
 	// a virtual extension. Routing both callers through here closes that gap.
-	if (extension == "777" || extension == "999")
+	if (extension == "777" || extension == "999" || extension == ConferenceRoom::EXT)
 	{
 		queueLog("Forward set ignored for virtual extension " + extension, true);
 	}
@@ -2660,7 +2809,7 @@ void RequestsHandler::setRingGroup(const std::string& groupExt, const std::strin
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 
-		if (groupExt == "777" || groupExt == "999")
+		if (groupExt == "777" || groupExt == "999" || groupExt == ConferenceRoom::EXT)
 		{
 			queueLog("Ring group ignored for reserved extension " + groupExt, true);
 		}
@@ -3182,6 +3331,12 @@ size_t RequestsHandler::getSessionCount()
 {
 	std::lock_guard<std::mutex> lock(_snapshotMutex);
 	return _snapshot.sessions.size();
+}
+
+int RequestsHandler::getConferenceLegs()
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	return _conference ? _conference->legCount() : 0;
 }
 
 void RequestsHandler::tick()
@@ -4293,10 +4448,12 @@ void RequestsHandler::onReinvite(std::shared_ptr<SipMessage> data)
 	auto src = session->getSrc();
 	auto dest = session->getDest();
 
-	// Virtual-extension legs (777 echo) have no real peer to relay the offer to —
-	// decline the re-INVITE so the holding phone keeps the call on the original SDP.
+	// Virtual-extension legs (777 echo, 888 conference) have no real peer to relay the
+	// offer to — their "dest" is a stand-in SipClient carrying the CALLER's own address,
+	// so relaying would send the phone its own re-INVITE back. Decline instead, so the
+	// holding phone keeps the call on the original SDP.
 	const std::string destNum = dest ? dest->getNumber() : "";
-	if (destNum == "777" || !src || !dest)
+	if (destNum == "777" || destNum == ConferenceRoom::EXT || !src || !dest)
 	{
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
@@ -4395,7 +4552,8 @@ void RequestsHandler::onUpdate(std::shared_ptr<SipMessage> data)
 	auto dest = session->getDest();
 	const std::string destNum = dest ? dest->getNumber() : "";
 
-	if (destNum == "777" || !src || !dest)
+	// Same virtual-leg guard as onReinvite() above: 777/888 have no peer leg.
+	if (destNum == "777" || destNum == ConferenceRoom::EXT || !src || !dest)
 	{
 		auto resp = getMessageFromPool(*data);
 		if (!resp) return;   // pool exhausted: drop, peer retransmits (#101A)

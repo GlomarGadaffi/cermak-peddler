@@ -537,7 +537,7 @@ TEST(DialPlanRouting, UnmatchedUnknownNumberStill404s)
 	handler.setDialRule("2XX", "group", "610");
 
 	wire.clear();
-	handler.handle(makeInvite("500", "888", "192.168.9.50", "fallthrough-2"));
+	handler.handle(makeInvite("500", "489", "192.168.9.50", "fallthrough-2"));
 
 	EXPECT_TRUE(wire.sawContaining("404 Not Found"));
 	EXPECT_EQ(wire.inviteCount(), 0u);

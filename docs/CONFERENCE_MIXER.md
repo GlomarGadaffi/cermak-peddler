@@ -317,9 +317,12 @@ which is the same kernel shape as a Goertzel/correlation detector.
 
 ## 7. Integration with `MediaBridge` (the diff)
 
-**Not done in this pass** — this bus ships as a standalone, tested module (same posture as the
-rest of this document's reference status). Wiring it into `MediaBridge`/`RequestsHandler`'s
-call routing is tracked as follow-up work; sketch of the eventual diff:
+**Shipped** (Issue #75). `MediaBridge` gained a BUS mode — `init()` takes an optional `MixBus*`,
+and a non-null bus swaps both media callbacks at their far end. `ConferenceRoom`
+(`src/SIP/ConferenceRoom.*`) owns one bus, up to `POCKETDIAL_CONF_LEGS` legs of
+`{RtpReceiver, RtpSender, MediaBridge}`, and the single 20 ms tick driver; `RequestsHandler`
+intercepts the virtual extension **`888`** in `onInvite()` (alongside `777`/`999`/`440`/park) and
+joins the caller. The diff as it landed:
 
 | Today (`MediaBridge`) | With the bus |
 |---|---|
@@ -327,11 +330,20 @@ call routing is tracked as follow-up work; sketch of the eventual diff:
 | TX cb: `_playoutBuffer.read` → `ulawEncodeBuffer` | TX cb: `bus.outputFrame(port, pcm, n)` → `ulawEncodeBuffer` |
 | `startBridge`: wire callbacks | `startBridge`: `port = bus.attach();` then wire |
 | `stopBridge`: stop sockets | `stopBridge`: `bus.detach(port);` then stop sockets |
-| `feedRx` writes the single playout buffer | anchor leg is just another port → `bus.inputFrame(anchorPort, …)` |
+| `feedRx` writes the single playout buffer | BUS mode refuses it — see the caveat below |
 | one mutex-guarded single bridge | N ports, one shared bus, one tick driver |
 
-The single tick driver replaces nothing in `MediaBridge` — it would be one new periodic task
-(or hang it off the existing sender cadence).
+The single tick driver replaces nothing in `MediaBridge`: it is one new periodic task inside
+`ConferenceRoom` (Core 0, `RtpSender`'s media priority, on device; a `std::thread` off it).
+Deliberately **not** hung off the existing sender cadence — there are N senders and one bus, so
+that would be N clocks racing to drain the same rings. `ConferenceRoom::tickOnce()` lets the host
+suite step the clock instead of running the driver.
+
+> **Caveat — the anchor leg is still outside the bus.** The row above is the one line of this
+> sketch that did not ship as drawn. A bussed `MediaBridge` holds exactly one port, its handset
+> leg; `feedRx()` returns `false` in BUS mode rather than writing into a `_playoutBuffer` the
+> sender no longer reads. Giving the anchor its own port (and a pump for its return direction) is
+> follow-up work. Nothing in the local conference needs it — handset legs alone are enough ports.
 
 ---
 
@@ -364,7 +376,11 @@ src/SIP/MixBus.cpp                attach/detach/tick (compiled, -Wall -Wextra cl
 src/SIP/mix_kernels.h             kernel signatures + POCKETDIAL_MIXBUS_PIE toggle
 src/SIP/mix_kernels_scalar.cpp    correct scalar bodies (the default + fallback)
 src/SIP/pie/mix_sum4_s16.S        confirmed-ISA saturating int16 sum (small-conf path)
+src/SIP/MediaBridge.hpp/.cpp      the transport endcap; BUS mode is §7's diff
+src/SIP/ConferenceRoom.hpp/.cpp   one bus + N legs + THE single tick driver; extension 888
 tests/MixBus_test.cpp             verifies minus-self, no-over-saturation, reclaim (GoogleTest)
+tests/ConferenceRoom_test.cpp     the §7 wiring: N legs through the real µ-law rim, a leg
+                                  leaving, the tick driver, and the 888 dial intercept
 ```
 
 The self-test runs as part of the normal host suite:

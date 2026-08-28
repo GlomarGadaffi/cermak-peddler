@@ -64,33 +64,14 @@ signaling-only and needs none of the below. **Out of scope, intentionally not im
 **What DOES ship, opt-in:** `AnchorClient` / `MediaBridge` / `TelephonyProvider` /
 `TelephonyApiConfig` (`src/SIP/`) are the vendor-neutral "bones" for bridging a call to an
 external audio system — compiled, unit-tested, and ready to extend, but not wired into any call
-path by default. `MixBus` (`src/SIP/MixBus.*`, see
-[docs/CONFERENCE_MIXER.md](docs/CONFERENCE_MIXER.md)) is a standalone, tested N-way audio mixer,
-also not yet wired into `MediaBridge` (tracked: #75 below). **Dialing a number does nothing with
-any of this today** — these are building blocks, not a feature you can pick up a phone and use,
-until a fork (or a future pass here) adds the routing policy.
+path by default. **Dialing a number does nothing with the anchor path today** — those are building
+blocks, not a feature you can pick up a phone and use, until a fork (or a future pass here) adds
+the routing policy.
 
----
-
-## Anchored Media (Opt-In, Vendor-Agnostic)
-
-### 🔵 Issue #75: [Feature] Wire MixBus into MediaBridge for local N-way conferencing
-* **Status**: ⏳ Open / Planned (Backlog)
-* **Labels**: `feature`, `media`, `conferencing`
-* **Description**: `MixBus` (the N-way audio summing junction, §1–6 of
-  [docs/CONFERENCE_MIXER.md](docs/CONFERENCE_MIXER.md)) is implemented, unit-tested, and
-  vendor-neutral, but `MediaBridge` still serves one 1:1 leg per instance — the bus isn't wired
-  into the call path. §7 of that doc sketches the diff: `MediaBridge`'s RX/TX callbacks swap to
-  `bus.inputFrame`/`outputFrame`, `startBridge`/`stopBridge` gain `bus.attach`/`detach`, and a
-  single periodic tick driver replaces nothing else. This is generic LAN-conferencing
-  functionality (no anchor/vendor required — handset legs alone are enough ports), distinct from
-  and not blocked on the anchor call-routing policy noted in Non-Goals above.
-* **Acceptance**: 3+ registered extensions can be bridged onto one `MixBus` instance (via
-  whatever dial mechanism lands with this issue — e.g. a conference extension/star-code, design
-  TBD); each hears the sum of the others, minus itself; a leg leaving doesn't disturb the rest.
-* **Notes**: Scalar kernel cost is ~64k adds/s at ≤8 narrowband ports — negligible on a 240 MHz
-  core (see CONFERENCE_MIXER.md §4). Vectorising (the PIE kernels, `src/SIP/pie/`) stays opt-in
-  behind `POCKETDIAL_MIXBUS_PIE` until profiling says it's needed.
+The one exception is `MixBus` (`src/SIP/MixBus.*`, see
+[docs/CONFERENCE_MIXER.md](docs/CONFERENCE_MIXER.md)), which **is** now dialable: #75 (resolved,
+below) wired it into `MediaBridge` and put a local N-way conference on extension `888` via
+`ConferenceRoom`. That path needs no anchor and no vendor — handset legs alone are enough ports.
 
 ---
 
@@ -164,6 +145,79 @@ The table is hard-capped at **`POCKETDIAL_MAX_DIAL_RULES` = 16** (`src/SIP/PoolC
 Two details worth naming. Pattern and target are charset-validated (`[0-9A-Za-z#*]`) at config time in both `setDialRule()` and the HTTP handler — the persisted record is tab/newline delimited, and a smuggled separator would have corrupted every rule after it on the next boot. And a rule whose target no longer resolves (a group or zone deleted after the rule was written) is answered `404` at dial time rather than falling through: falling through would silently ring whichever real extension happens to share the dialed digits, i.e. connect the caller to the wrong person, whereas a stale rule failing loudly is diagnosable from a single response.
 
 Exposed through the existing admin config surface exactly as ring groups are: `POST /api/dialplan` (`pattern`/`action`/`target`, empty target deletes) behind the same same-origin + `pd_session` gate as `/api/group`, with the table echoed back in `/api/status` under `dialplan` in evaluation order. NVS-persisted under key `dplan` in table order, since order is the semantics. Host-tested in `tests/DialPlan_test.cpp` (32 tests): grammar, precedence in both directions, the cap through both the pure class and `setDialRule`/`getDialRules`, fallthrough, dispatch into each of the three actions, the stale-target `404`, and a real-socket round-trip of `POST /api/dialplan` through `HttpServer`. Full suite 233/233. Docs: `docs/API.md` endpoint catalog + status schema.
+
+---
+
+### 🟢 Issue #75: [Feature] Wire MixBus into MediaBridge for local N-way conferencing
+* **Status**: ✅ Resolved 2026-08-28 — the bus is wired into `MediaBridge` and dialable as conference extension `888`
+* **Labels**: `feature`, `media`, `conferencing`
+
+#### Resolution
+`MixBus` was a correct, unit-tested summing junction that nothing called. It now carries real
+calls, along the diff [docs/CONFERENCE_MIXER.md](docs/CONFERENCE_MIXER.md) §7 sketched, plus the
+one piece §7 left as "design TBD": a way to actually dial in.
+
+**`MediaBridge` gained a BUS mode.** `init()` takes an optional `MixBus*`; a non-null bus swaps
+both media callbacks at their far end — decoded handset µ-law goes to `bus.inputFrame(port, …)`
+instead of `AnchorClient::writeAudio`, and the sender pulls `bus.outputFrame(port, …)` (the
+saturated sum of every *other* port) instead of draining `_playoutBuffer`. `startBridge()` claims
+the port with `bus.attach()` **before** opening a socket, so a full bus fails with nothing to
+unwind; every failure path after that (and `stopBridge()`) detaches. Detach is deliberately
+non-blocking: the port goes `Draining` and the mix tick reclaims the rings, which is what makes
+"a leg leaving doesn't disturb the rest" true rather than hopeful. The two callback bodies moved
+out of their lambdas into named `onHandsetRtp()` / `fillHandsetTx()` members, because on host
+`RtpReceiver`/`RtpSender::start()` are stubs that store a callback and never invoke it — inline
+lambdas would have been untestable off-device. ANCHOR mode (no bus passed) is byte-for-byte the
+old behaviour and is covered by a regression test; in BUS mode `feedRx()` now *refuses* rather
+than writing into a buffer nothing reads, since the anchor leg wanting its own bus port (§7's
+"anchor leg is just another port") is follow-up work, and silently swallowing the chunk would
+have looked like working audio.
+
+**`ConferenceRoom` (new, `src/SIP/ConferenceRoom.*`) owns the room and the clock.** One `MixBus`,
+`POCKETDIAL_CONF_LEGS` (default 4) legs of `{RtpReceiver, RtpSender, MediaBridge}`, and — the part
+§3 calls 80% of the work — **exactly one** 20 ms tick driver: a Core-0 FreeRTOS task at the same
+priority as `RtpSender`'s media task on device, a `std::thread` off it. It is deliberately not
+hung off a leg's sender cadence: there are N senders and one bus, so that would have been N
+clocks racing to drain the same rings. `tickOnce()` lets the host suite step the clock by hand
+instead of starting the driver at all.
+
+**Dialing it: virtual extension `888`**, intercepted in `onInvite()` exactly like `777`/`999`/
+`440`/`700`–`709`. The server answers 200 OK with **that leg's own RTP receive port** and a
+`sendrecv` SDP (`buildMediaSdp()` gained a direction flag; `440` stays `sendonly`), then joins the
+caller. N callers dialing `888` are N legs of one conference — no fan-out, no per-pair wiring. The
+answer follows the 440 path's ordering discipline for the reason Issue #115 exists: join → allocate
+session → draw the OK from the pool → *only then* publish the session, with every earlier failure
+unwinding the leg, so a retransmitted INVITE finds a clean slate instead of a half-joined leg with
+no dialog behind it. A dial past the leg cap degrades to 486 Busy Here and consumes no session
+slot. `endCall()` releases the leg, which makes it the single teardown point for BYE, CANCEL,
+session-timer expiry and the orphan sweep alike — `leave()` is idempotent, so no caller has to know
+the room exists. `888` also joins `777`/`999` on the reserved list that forwards and ring groups
+may not shadow. The room is built on the first dial-in and then kept: its rings are ~50 KB, too
+much to pay at boot on a node that may never hold a conference, and standing the tick task up and
+down underneath legs whose RTP tasks may still be in flight is exactly the teardown race the
+`Draining` state exists to avoid.
+
+Coverage is `tests/ConferenceRoom_test.cpp` (15 tests): three and four legs mixing end-to-end
+through the real µ-law rim (expected values computed by round-tripping through G.711, never
+hardcoded sums — µ-law is lossy); §1's over-saturation counterexample asserted through the
+bridges, not just the bus; a leg leaving mid-conference with the survivors' output checked
+sample-by-sample; port reclaim and reuse; the room cap and one-leg-per-Call-ID; the driver proved
+to actually tick (via the `Draining`→`Free` reclaim only `tick()` performs); and the `888`
+intercept driven through a real `RequestsHandler` with three registered extensions, a BYE from one
+of them, a dial past the cap, and a hold re-INVITE on a conference leg (declined 488 rather than
+relayed to the caller's own address — the same virtual-leg guard `777` gets). Verified: host suite
+216/216, cppcheck 2.21.0 (the CI-pinned build) clean, and a real ESP-IDF `esp32s3`/`eth` firmware
+build, so the FreeRTOS tick-task branch is compile-verified rather than assumed.
+
+The PIE vector path (`POCKETDIAL_MIXBUS_PIE`, `src/SIP/pie/`) is untouched and still opt-in: the
+scalar kernel is ~64k adds/s at ≤8 narrowband ports, a rounding error on a 240 MHz core.
+
+Two known limits are documented rather than papered over: the anchor leg is still outside the bus
+(`feedRx()` refuses in BUS mode — CONFERENCE_MIXER.md §7 carries the caveat and the follow-up), and
+the N conference `RtpSender`s share the fixed server media port, so the first binds it and the rest
+fall back to ephemeral source ports. Note that #75 is one of the entries where this tracker's
+numbering has diverged from GitHub's — GitHub issue 75 is an unrelated, closed Phase-1 item. Full
+detail: https://github.com/GlomarGadaffi/pocket-dial/pull/124
 
 ---
 
