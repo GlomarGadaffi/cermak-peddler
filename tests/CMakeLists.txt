@@ -47,6 +47,12 @@ add_executable(sip_parser_tests
     # 200 OK was silently dropped instead of reaching the held leg. Drives a full
     # 999 broadcast call through connect -> hold -> resume via handle().
     BroadcastHoldResume_test.cpp
+    # Issue #69: the bounded pattern -> action dial plan that generalizes the
+    # ring-group mechanism. Pure grammar/precedence/cap coverage against
+    # DialPlan.hpp, end-to-end routing (dispatch + fallthrough) driven through
+    # RequestsHandler::handle(), and a real-socket round-trip of the
+    # POST /api/dialplan admin surface through HttpServer.
+    DialPlan_test.cpp
     Rtp_test.cpp
     RtpReceiver_test.cpp
     PlayoutBuffer_test.cpp

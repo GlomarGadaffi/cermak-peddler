@@ -32,6 +32,7 @@
 #include "CallDetailRecord.hpp"
 #include "PcapCapture.hpp"
 #include "PbxConfig.hpp"
+#include "DialPlan.hpp"
 #include "RtpSender.hpp"
 #include "PbxEnv.hpp"
 #include "TransactionLayer.hpp"
@@ -170,6 +171,26 @@ public:
 	// returns {zoneExt, "m1,m2,..."} pairs for the dashboard.
 	void setPageZone(const std::string& zoneExt, const std::string& members);
 	std::vector<std::pair<std::string, std::string>> getPageZones();
+
+	// ── Dial plan (Issue #69) ─────────────────────────────────────────────────
+	// A bounded, ordered pattern → action rule table (see DialPlan.hpp for the
+	// pattern grammar and POCKETDIAL_MAX_DIAL_RULES for the cap). setDialRule
+	// upserts one rule: a rule whose pattern is already in the table is edited IN
+	// PLACE, keeping its evaluation position; a new pattern is appended, and is
+	// refused (logged, not applied) once the table is full. An empty `target`
+	// deletes the rule with that pattern. `action` is "group" | "page" | "park".
+	//
+	// The rule is validated here, not at dial time: the pattern and target must be
+	// NVS/JSON-safe tokens (DialPlan.hpp's isDialTokenSafe), the target must have
+	// the right shape for the action (980–989 for "page", a real orbit for
+	// "park"), and reserved virtual extensions are refused as patterns. Invalid
+	// input is logged and dropped — same contract as setRingGroup/setPageZone.
+	//
+	// Thread-safe (takes _mutex / _snapshotMutex) and NVS-persisted, exactly like
+	// setRingGroup. The getter returns {pattern, action, target} triples in TABLE
+	// ORDER — the order rules are evaluated in — for the dashboard and the API.
+	void setDialRule(const std::string& pattern, const std::string& action, const std::string& target);
+	std::vector<std::tuple<std::string, std::string, std::string>> getDialRules();
 
 	// ── Admin extension (Task 2B) ─────────────────────────────────────────────────
 	// NVS-persisted extension identity for the administrative endpoint.
@@ -435,6 +456,29 @@ private:
 	const pbx::PageZone* findPageZone(const std::string& extension) const;
 	bool isPageZoneDialog(const std::string& extension) const;
 
+	// ── Dial-plan dispatch (Issue #69) ────────────────────────────────────────
+	// The two "route this INVITE to an already-shipped action" bodies, lifted
+	// verbatim out of onInvite()'s built-in 98x / ring-group branches so the dial
+	// plan can reach the same code instead of duplicating it. Both take the action
+	// target EXPLICITLY rather than reading it back off the INVITE's To-number,
+	// because under a dial rule the dialed number and the group/zone extension are
+	// no longer the same string. Both always answer the caller (fork, 480, or
+	// 503) and so are terminal for the INVITE. Caller holds _mutex.
+	void routePageZone(const std::shared_ptr<SipMessage>& data,
+		const std::shared_ptr<SipClient>& caller,
+		const pbx::PageZone& zone);
+	void routeRingGroup(const std::shared_ptr<SipMessage>& data,
+		const std::shared_ptr<SipClient>& caller,
+		const std::string& groupExt, const pbx::RingGroup& group);
+
+	// Evaluate the dial plan against the dialed number. Returns true if a rule
+	// matched and the INVITE was fully handled (onInvite must return); false means
+	// no rule matched and routing falls through to the unchanged extension-lookup
+	// path. Caller holds _mutex.
+	bool routeDialPlan(const std::shared_ptr<SipMessage>& data,
+		const std::shared_ptr<SipClient>& caller,
+		const std::string& destNumber);
+
 	// Fan an INVITE out to a set of targets (the reusable core extracted from the
 	// 999 all-page path). `targets` are pre-selected registered clients; `intercom`
 	// adds the 999 auto-answer headers (true for 999, false for a ring group so it
@@ -577,6 +621,11 @@ private:
 		std::vector<std::tuple<std::string, std::string, std::string, int>> parkedCalls;
 		// Paging zones: {zoneExt, "m1,m2,..."}.
 		std::vector<std::pair<std::string, std::string>> pageZones;
+		// Dial-plan rules (Issue #69): {pattern, "group"|"page"|"park", target},
+		// in table order — the order they are evaluated in. Unlike pageZones this
+		// is rebuilt from _dialPlan every tick() alongside ringGroups, so it needs
+		// no out-of-band carry-over across the snapshot swap.
+		std::vector<std::tuple<std::string, std::string, std::string>> dialRules;
 		// Adopted devices (STAGE 2): {mac, ext, state, online}. Mirrored from the
 		// Registrar's registry under _mutex; copied out under _snapshotMutex.
 		std::vector<AdoptedDevice> devices;
@@ -620,6 +669,14 @@ private:
 	// Guarded by _mutex; mirrored into the snapshot and persisted to NVS.
 	std::unordered_map<std::string, pbx::PageZone> _pageZones;
 
+	// Dial-plan rule table (Issue #69). An ORDERED vector, not a map: first match
+	// wins, so evaluation order is the semantics. Hard-capped at
+	// POCKETDIAL_MAX_DIAL_RULES by DialPlan::upsert(). Guarded by _mutex; mirrored
+	// into the snapshot and persisted to NVS. Empty by default, and an empty table
+	// is a no-op on routing — every dialed number falls straight through to the
+	// pre-#69 extension-lookup path.
+	pbx::DialPlan _dialPlan;
+
 	// How long to wait between OPTIONS keepalive cycles, in minutes. Atomic so the
 	// TUI can read without taking _mutex. Persisted to NVS ("pbxcfg"/"rewarm_min").
 	std::atomic<uint16_t> _rewarmMinutes{60};
@@ -648,6 +705,7 @@ private:
 	void persistForwards();               // write-through after a setForward mutation
 	void persistRingGroups();             // write-through after a setRingGroup mutation
 	void persistPageZones();              // write-through after a setPageZone mutation
+	void persistDialPlan();               // write-through after a setDialRule mutation
 	bool _pbxConfigLoaded = false;
 
 	// Persistent CDR (Class A sweep). The CDR ring is flushed to the "cdrlog" NVS

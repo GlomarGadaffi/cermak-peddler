@@ -51,6 +51,64 @@
   while also pinning `#69b`: exactly one `CANCEL` is ever sent to the losing
   fork target across the whole hold/resume sequence.
 
+## Unreleased (issue-69-dial-plan) - 2026-08-28
+
+### Added — Dial-plan / hunt-group generalization (#69)
+
+- **`src/SIP/DialPlan.hpp`** (new, pure/header-only, same shape as `PbxConfig.hpp`):
+  a bounded, ordered `pattern → action` rule table. Each rule maps a dialed number
+  to one of the three actions already on `main` — ring/hunt **group**, **page**
+  zone (#66), or **park** orbit (#65). (#68's directed pickup is not merged and is
+  deliberately absent; adding it later is one enum value and one dispatch arm.)
+
+- **Pattern grammar** — deliberately tiny, no regex: literal characters, `X`/`x`
+  for exactly one digit, and a *trailing* `*` for a prefix match. A `*` in any
+  other position is a **literal** `*`, because star-codes (`*8`, `*4887`) are real
+  dialable strings here. Rules are evaluated **in table order, first match wins** —
+  order is the operator's, not a specificity heuristic — and editing an existing
+  pattern updates it in place rather than moving it to the end.
+
+- **No behavior change when nothing matches.** The plan is consulted *after* every
+  reserved virtual extension (`777`, `999`, `980`–`989`, `440`, `700`–`70N`) and
+  after the direct ring-group lookup, and *before* CFU/DND/extension lookup, so a
+  rule can only capture a number that would otherwise have reached the ordinary
+  extension lookup. Not even a catch-all `*` can shadow the echo test, a park
+  retrieval, or a configured group. An unmatched number routes exactly as before.
+
+- **Bounded**: `POCKETDIAL_MAX_DIAL_RULES` (default **16**, `src/SIP/PoolConfig.hpp`)
+  caps both the table's memory and the per-INVITE linear walk. Enforced inside
+  `DialPlan::upsert()` so the HTTP setter and the NVS replay both inherit it; a full
+  table stays editable, since an upsert on an existing pattern is not growth.
+
+- **Admin config surface**: `POST /api/dialplan` (`pattern` / `action` / `target`;
+  an empty `target` deletes) behind the same same-origin + `pd_session` gate as
+  `/api/group`, with the table echoed back in `GET /api/status` under `dialplan` in
+  evaluation order. NVS-persisted under key `dplan`, in table order. Documented in
+  `docs/API.md` (endpoint catalog, endpoint section, and status field schema).
+
+- **Refactor, no functional change**: `onInvite()`'s 98x page-zone and ring-group
+  bodies were lifted verbatim into `RequestsHandler::routePageZone()` /
+  `routeRingGroup()` so the built-in dial codes and the dial plan share one
+  implementation. `routeRingGroup()` takes the group extension *explicitly* rather
+  than reading it off the INVITE's To-number — under a dial rule those differ, and
+  `Session::setGroupExt()` feeds the hunt-exhausted CDR and the no-answer Contact.
+
+- **Hardening**: pattern and target are charset-validated (`[0-9A-Za-z#*]`) at
+  config time in both `setDialRule()` and the HTTP handler, because the persisted
+  record is tab/newline delimited and a smuggled separator would corrupt every rule
+  after it on reload. `777`/`999`/`440` are refused as literal patterns (they route
+  before the plan, so such a rule could never fire). A matched rule whose target no
+  longer resolves answers `404` rather than falling through — a stale rule must not
+  silently ring whichever real extension shares the dialed digits.
+
+- **Tests**: `tests/DialPlan_test.cpp` (32 new) — grammar; precedence from both
+  directions (exact-first wins, *and* wildcard-first shadows the exact rule below
+  it, the property a "sort most-specific-first" refactor would quietly delete); the
+  cap through both the pure class and `setDialRule`/`getDialRules`; fallthrough
+  driven through `handle()` against a *populated* table; dispatch into each of the
+  three actions; the stale-target `404`; and a real-socket round-trip of
+  `POST /api/dialplan` through `HttpServer`. Full host suite **233/233**.
+
 ## Unreleased (issue-106-104-108-112-misc-bugs) - 2026-08-19
 
 Four small, independently-filed correctness bugs plus one CI hygiene fix,

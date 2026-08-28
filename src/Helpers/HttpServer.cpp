@@ -1,6 +1,7 @@
 // HttpServer.cpp: Issues #23 and #28 resolved.
 #include "HttpServer.hpp"
 #include "RequestsHandler.hpp"
+#include "DialPlan.hpp"          // Issue #69: dial-rule validation shared with setDialRule
 #include "CallDetailRecord.hpp"
 #include "AdminAuth.hpp"
 #include "OtaUpdater.hpp"
@@ -567,6 +568,24 @@ void HttpServer::handleClient(int clientSock)
 			sendApiGroup(clientSock, req.body);
 		}
 	}
+	else if (req.method == "POST" && req.path == "/api/dialplan")
+	{
+		// Mutating: same gate as /api/group (same-origin + auth once provisioned).
+		if (!isSameOrigin(req))
+		{
+			sendResponse(clientSock, 403, "Forbidden", "application/json",
+			             "{\"error\":\"cross-origin request rejected\"}");
+		}
+		else if (AdminAuth::isProvisioned() && !isAuthed(req))
+		{
+			sendResponse(clientSock, 401, "Unauthorized", "application/json",
+			             "{\"error\":\"authentication required\"}");
+		}
+		else
+		{
+			sendApiDialPlan(clientSock, req.body);
+		}
+	}
 	else if (req.method == "GET" && req.path == "/api/wifi/scan")
 	{
 		sendApiWifiScan(clientSock);
@@ -872,6 +891,7 @@ void HttpServer::sendApiStatus(int sock)
 	std::vector<std::string> dndExtensions;
 	std::vector<std::tuple<std::string, std::string, std::string, std::string>> forwards;
 	std::vector<std::tuple<std::string, std::string, std::string>> ringGroups;
+	std::vector<std::tuple<std::string, std::string, std::string>> dialRules;
 	uint64_t packets = 0;
 	uint64_t dropped = 0;
 
@@ -883,6 +903,7 @@ void HttpServer::sendApiStatus(int sock)
 		dndExtensions = handler->getDndExtensions();
 		forwards = handler->getForwards();
 		ringGroups = handler->getRingGroups();
+		dialRules = handler->getDialRules();
 		packets = handler->getPacketsProcessed();
 		dropped = handler->getPacketsDropped();   // Issue #38
 	}
@@ -967,6 +988,18 @@ void HttpServer::sendApiStatus(int sock)
 		json << "{\"extension\":\"" << jsonEscape(std::get<0>(ringGroups[i]))
 		     << "\",\"mode\":\""     << jsonEscape(std::get<1>(ringGroups[i]))
 		     << "\",\"members\":\""  << jsonEscape(std::get<2>(ringGroups[i])) << "\"}";
+	}
+	json << "],";
+
+	// Dial-plan rules (Issue #69). Emitted in TABLE ORDER — this array's order is
+	// load-bearing (first match wins), unlike the sets above.
+	json << "\"dialplan\":[";
+	for (size_t i = 0; i < dialRules.size(); i++)
+	{
+		if (i > 0) json << ",";
+		json << "{\"pattern\":\"" << jsonEscape(std::get<0>(dialRules[i]))
+		     << "\",\"action\":\"" << jsonEscape(std::get<1>(dialRules[i]))
+		     << "\",\"target\":\"" << jsonEscape(std::get<2>(dialRules[i])) << "\"}";
 	}
 	json << "]";
 
@@ -1233,6 +1266,79 @@ void HttpServer::sendApiGroup(int sock, const std::string& body)
 	             "{\"status\":\"ok\",\"extension\":\"" + jsonEscape(ext) +
 	             "\",\"mode\":\"" + jsonEscape(mode) +
 	             "\",\"members\":\"" + jsonEscape(members) + "\"}");
+}
+
+void HttpServer::sendApiDialPlan(int sock, const std::string& body)
+{
+	// Issue #69. Params: pattern (the rule's key), action ("group"|"page"|"park"),
+	// target (the group/zone/orbit extension). An empty target deletes the rule.
+	// The dial plan is ORDERED and first-match-wins, so an existing pattern is
+	// edited in place (keeping its position) and a new one is appended — see
+	// RequestsHandler::setDialRule, which owns the full validation and the
+	// POCKETDIAL_MAX_DIAL_RULES cap.
+	std::string pattern = getFormParam(body, "pattern");
+	std::string action  = getFormParam(body, "action");
+	std::string target  = getFormParam(body, "target");
+
+	if (pattern.empty())
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"missing pattern parameter\"}");
+		return;
+	}
+	if (!pbx::isDialTokenSafe(pattern))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"pattern may contain only letters, digits, '#' and '*'\"}");
+		return;
+	}
+	if (pattern == "777" || pattern == "999" || pattern == "440")
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"cannot use a reserved extension as a dial-plan pattern\"}");
+		return;
+	}
+
+	// A delete only needs the pattern; everything else is validated for an upsert.
+	if (!target.empty())
+	{
+		if (action.empty()) action = "group";
+		pbx::DialActionType parsed;
+		if (!pbx::parseDialAction(action, parsed))
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"action must be group|page|park\"}");
+			return;
+		}
+		if (!pbx::isDialTokenSafe(target))
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"target may contain only letters, digits, '#' and '*'\"}");
+			return;
+		}
+		if (parsed == pbx::DialActionType::PageZone && !pbx::isPageZoneExt(target))
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"page target must be a paging zone (980-989)\"}");
+			return;
+		}
+		if (parsed == pbx::DialActionType::ParkOrbit && !pbx::isParkOrbitExt(target))
+		{
+			sendResponse(sock, 400, "Bad Request", "application/json",
+			             "{\"error\":\"park target must be a park orbit\"}");
+			return;
+		}
+	}
+
+	if (RequestsHandler* handler = _handler.load(std::memory_order_acquire))
+	{
+		handler->setDialRule(pattern, action, target);
+	}
+
+	sendResponse(sock, 200, "OK", "application/json",
+	             "{\"status\":\"ok\",\"pattern\":\"" + jsonEscape(pattern) +
+	             "\",\"action\":\"" + jsonEscape(action) +
+	             "\",\"target\":\"" + jsonEscape(target) + "\"}");
 }
 
 bool HttpServer::isSameOrigin(const HttpRequest& req) const

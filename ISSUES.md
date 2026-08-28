@@ -49,13 +49,6 @@ signaling and tracks state. See **Non-Goals** below for the hard scope boundary.
 * **Description**: Answer a ringing peer's call from your own phone via a pickup code (`*8` group pickup or `**<ext>` directed). Reuses the fork/`Session` machinery and the registrar's view of in-progress INVITEs; the call lands P2P on the picker — no server media.
 * **Acceptance**: while ext A rings, ext B dials the pickup code and connects to the caller with P2P SDP; only same-pickup-group calls eligible; race with A answering resolves cleanly (one wins, other `486`/cancel).
 
-### 🔵 Issue #69: [Feature] Dial-Plan / Hunt-Group Generalization
-* **Status**: ⏳ Open / Planned (Backlog)
-* **Labels**: `feature`, `sip`, `routing`
-* **Description**: Extend the existing `ringall`/`hunt` ring groups (`setRingGroup`/`getRingGroups`) into a small **pattern → action** dial plan for LAN routing (match an extension/prefix → group ring / hunt / page zone / park orbit / pickup). Table-driven, bounded, LAN-only.
-* **Acceptance**: a configurable rule table maps dialed patterns to existing actions, evaluated in order; bounded table size.
-* **Notes**: Promotes `FEATURE_ROADMAP.md` "Dial plan / hunt groups."
-
 ### ⚪ Non-Goals (hard scope boundary)
 pocket-dial's default call path stays **LAN-only, peer-to-peer media** — every feature above is
 signaling-only and needs none of the below. **Out of scope, intentionally not implemented here:**
@@ -150,6 +143,27 @@ the other is CANCELed), hold, then resume — and asserts the 200 OK for each ac
 reaches the held leg's peer, with the session state and `dest` tracked correctly
 throughout. It also pins `#69b`: exactly one `CANCEL` is ever sent to the losing fork
 target across the whole sequence, and the loser never receives any hold/resume traffic.
+
+---
+
+### 🟢 Issue #69: [Feature] Dial-Plan / Hunt-Group Generalization
+* **Status**: ✅ Shipped 2026-08-28 (`src/SIP/DialPlan.hpp` + `setDialRule`/`getDialRules`, `POST /api/dialplan`, cap `POCKETDIAL_MAX_DIAL_RULES` = 16)
+* **Labels**: `feature`, `sip`, `routing`
+
+#### Resolution
+The ring-group mechanism is now the special case of a general, bounded `pattern → action` rule table. `src/SIP/DialPlan.hpp` is a new pure, header-only module in the same shape as `PbxConfig.hpp` — an action enum, a `DialRule` record, a pure matcher, and an ordered `DialPlan` container — so the grammar, the precedence rule and the size cap are all unit-testable without linking the registrar.
+
+The pattern grammar is deliberately tiny (no regex, no backtracking, O(pattern length) per rule): literal characters, `X`/`x` for exactly one digit, and a **trailing** `*` for a prefix match. A `*` in any other position is a literal `*` — star-codes (`*8`, `*4887`) are real dialable strings on this box, so treating a leading star as a wildcard would have made a rule like `*8*` ambiguous with the codes it was meant to sit beside. Rules are walked in table order and the first match wins; order is the operator's and not a specificity heuristic, so a catch-all listed first really does shadow the exact rule below it (pinned by tests from both directions, because that is exactly the property a well-meaning "sort most-specific-first" refactor would quietly delete). Editing an existing pattern updates it in place rather than re-appending, since moving a rule changes which numbers it captures.
+
+Each rule selects one of the three actions already shipped on `main` — ring/hunt group (Class A sweep), paging zone (#66), park orbit (#65). #68's directed pickup is deliberately absent because it is not merged; adding it later is one enum value, one name string and one dispatch arm. To reach those actions without duplicating them, the 98x page-zone and ring-group bodies were lifted out of `onInvite()` verbatim into `routePageZone()` / `routeRingGroup()` and are now called from both the built-in dial codes and the dial plan. `routeRingGroup()` takes the group extension **explicitly** rather than reading it back off the INVITE's To-number: under a dial rule the dialed number and the group extension are no longer the same string, and `Session::setGroupExt()` feeds the hunt-exhausted CDR and the no-answer Contact, both of which want the group's identity, not the alias.
+
+Placement in `onInvite()` is what makes this additive rather than a behavior change. The plan is consulted **after** every reserved virtual extension (`777`, `999`, the `980`–`989` zones, `440`, the `700`–`70N` orbits) and after the direct ring-group lookup, but **before** CFU/DND/extension lookup. A rule can therefore only ever intercept a dialed number that would otherwise have reached the ordinary extension lookup (and, for an unknown number, `404`) — so no rule, not even a catch-all `*`, can shadow the echo test, a park retrieval, or a configured group. A dialed number matching no rule falls straight through with the pre-#69 routing untouched, asserted end-to-end against a *populated* table so the test proves "no rule matched" rather than "the feature is switched off". `777`, `999` and `440` are also refused as literal patterns at config time, so an operator writing a rule that could never fire gets a `400` instead of a dead entry.
+
+The table is hard-capped at **`POCKETDIAL_MAX_DIAL_RULES` = 16** (`src/SIP/PoolConfig.hpp`, documented there with its reasoning: the cap bounds both the table's memory and the per-INVITE linear walk on the SIP packet path). The ceiling is enforced inside `DialPlan::upsert()` itself so every entry point inherits it — the HTTP setter, and the NVS replay, which means a blob written by a build with a larger cap simply stops being applied at this build's ceiling instead of overflowing it. A full table stays *editable*: an upsert on an existing pattern is not a growth operation, so the operator can always fix the rule that filled the table.
+
+Two details worth naming. Pattern and target are charset-validated (`[0-9A-Za-z#*]`) at config time in both `setDialRule()` and the HTTP handler — the persisted record is tab/newline delimited, and a smuggled separator would have corrupted every rule after it on the next boot. And a rule whose target no longer resolves (a group or zone deleted after the rule was written) is answered `404` at dial time rather than falling through: falling through would silently ring whichever real extension happens to share the dialed digits, i.e. connect the caller to the wrong person, whereas a stale rule failing loudly is diagnosable from a single response.
+
+Exposed through the existing admin config surface exactly as ring groups are: `POST /api/dialplan` (`pattern`/`action`/`target`, empty target deletes) behind the same same-origin + `pd_session` gate as `/api/group`, with the table echoed back in `/api/status` under `dialplan` in evaluation order. NVS-persisted under key `dplan` in table order, since order is the semantics. Host-tested in `tests/DialPlan_test.cpp` (32 tests): grammar, precedence in both directions, the cap through both the pure class and `setDialRule`/`getDialRules`, fallthrough, dispatch into each of the three actions, the stale-target `404`, and a real-socket round-trip of `POST /api/dialplan` through `HttpServer`. Full suite 233/233. Docs: `docs/API.md` endpoint catalog + status schema.
 
 ---
 

@@ -38,7 +38,7 @@ this document is unreachable. An **unprovisioned** device listens unconditionall
 | `/api/admin/keepalive` | `POST` | Session | Extends the HTTP-open window by 3600 s. |
 
 Once provisioned, all state-mutating endpoints (`/api/kill`, `/api/dnd`,
-`/api/forward`, `/api/group`, `/api/wifi/*`, `/api/factory-reset`, OTA upload)
+`/api/forward`, `/api/group`, `/api/dialplan`, `/api/wifi/*`, `/api/factory-reset`, OTA upload)
 additionally require the `pd_session` cookie.
 
 ---
@@ -116,6 +116,7 @@ When booting into onboarding mode, the device intercepts client browser check do
 | [`/api/dnd`](#post-apidnd) | `POST` | High | Same-Origin (+session once provisioned) | Sets or clears Do-Not-Disturb on an extension. |
 | [`/api/forward`](#post-apiforward) | `POST` | High | Same-Origin (+session once provisioned) | Configures call forwarding (`always`/`busy`/`noanswer`) for an extension. |
 | [`/api/group`](#post-apigroup) | `POST` | High | Same-Origin (+session once provisioned) | Creates, updates, or deletes a ring/hunt group. |
+| [`/api/dialplan`](#post-apidialplan) | `POST` | High | Same-Origin (+session once provisioned) | Creates, updates, or deletes one dial-plan rule (pattern → action). |
 | [`/api/wifi/scan`](#get-apiwifiscan) | `GET` | Low | None | Triggers a scan of nearby Wi-Fi APs and returns their SSIDs and signal strengths. |
 | [`/api/wifi/connect`](#post-apiwificonnect) | `POST` | High | Same-Origin (+session once provisioned) | Saves Wi-Fi credentials to NVS and schedules an ESP32 system reboot into Station Mode. |
 | [`/api/wifi/mode_ap`](#post-apiwifimode_ap) | `POST` | High | Same-Origin (+session once provisioned) | Sets the device to Standalone Access Point Mode and schedules a system reboot. |
@@ -192,6 +193,10 @@ Returns a detailed JSON object representing the active state of the SIP registra
 | `sessions[].callee` | String | Target extension receiving the call. |
 | `sessions[].state` | String | Active session state: `Invited`, `Connected`, `Busy`, `Unavailable`, `Cancel`, `Bye`. |
 | `sessions[].duration` | String | Active call length formatted as `MM:SS` or `HH:MM:SS`. |
+| `dialplan` | Array | The dial-plan rule table (Issue #69), **in evaluation order** — first match wins, so this array's order is load-bearing. |
+| `dialplan[].pattern` | String | The dialed-number pattern (see [`POST /api/dialplan`](#post-apidialplan) for the grammar). |
+| `dialplan[].action` | String | `group`, `page`, or `park`. |
+| `dialplan[].target` | String | The group / paging-zone / park-orbit extension the rule routes to. |
 
 ---
 
@@ -535,6 +540,80 @@ Creates, updates, or deletes a ring/hunt group.
   "extension": "700",
   "mode": "ringall",
   "members": "1001,1002,1003"
+}
+```
+
+---
+
+### `POST /api/dialplan`
+Creates, updates, or deletes one rule in the dial plan (Issue #69) — the bounded,
+ordered `pattern → action` table that generalizes ring groups into LAN routing.
+
+Rules are evaluated **in table order, first match wins**. A pattern already in the
+table is edited **in place**, keeping its evaluation position; a new pattern is
+appended to the end. To reorder, delete a rule and re-add it. The table is hard-capped
+at `POCKETDIAL_MAX_DIAL_RULES` (**16** by default, see `src/SIP/PoolConfig.hpp`);
+once it is full a *new* pattern is rejected server-side (logged, still `200`), while
+existing rules stay editable.
+
+The plan is consulted **after** every reserved virtual extension (`777`, `999`,
+`440`, the `980`–`989` paging zones, the `700`–`70N` park orbits) and after a direct
+ring-group extension lookup, and **before** call-forwarding / DND / ordinary
+extension lookup. So a rule can only capture a number that would otherwise have
+reached the ordinary extension lookup — no rule, not even a catch-all `*`, can
+shadow the echo test, a park retrieval, or a configured group extension. **A dialed
+number that matches no rule routes exactly as it did before the dial plan existed.**
+
+**Pattern grammar** (deliberately tiny — no regex):
+
+| Token | Meaning |
+| :--- | :--- |
+| digits / letters / `#` / `*` | Match themselves, literally. |
+| `X` or `x` | Match exactly one digit (`0`–`9`). |
+| a **trailing** `*` | Match the rest of the dialed number, including nothing at all (prefix match). |
+
+A `*` anywhere but the last character is a **literal** `*`, because star-codes
+(`*8`, `*4887`) are real dialable strings on this device. Examples: `601` (exact),
+`6XX` (any three-digit number starting with 6), `6*` (any number starting with 6),
+`*` (catch-all), `*8` (the literal star-code).
+
+* **Requires Same-Origin Check**: Yes
+* **Requires `pd_session` cookie**: Once the device is provisioned (see §0)
+* **Request Content-Type**: `application/x-www-form-urlencoded`
+* **Request Parameters**:
+  * `pattern` (Required): The rule's dialed-number pattern, and its key in the table. May contain only letters, digits, `#` and `*`. Must not be `777`, `999` or `440` — those are routed before the dial plan, so such a rule could never fire.
+  * `action` (Optional, default `group`): `group` (ring/hunt group), `page` (paging zone), or `park` (park orbit).
+  * `target` (Optional): The extension the action routes to — a ring-group extension for `group`, a `980`–`989` zone for `page`, a `700`–`70N` orbit for `park`. **An empty `target` deletes the rule with that pattern.**
+* **Response Content-Type**: `application/json`
+* **Response Status Codes**:
+  * `200 OK`
+  * `400 Bad Request`: `pattern` missing, `pattern`/`target` contains a character outside `[0-9A-Za-z#*]`, `pattern` is a reserved extension, `action` is not `group`/`page`/`park`, or the `target` is the wrong shape for the action.
+  * `401 Unauthorized` / `403 Forbidden`: as above.
+
+> [!NOTE]
+> A rule whose target no longer resolves — a group or zone deleted after the rule
+> was written — is answered `404 Not Found` at dial time rather than falling
+> through, so a stale rule fails visibly instead of silently ringing whichever real
+> extension happens to share the dialed digits.
+
+#### Request Example (Form URL-Encoded)
+```http
+POST /api/dialplan HTTP/1.1
+Host: 192.168.4.1
+Origin: http://192.168.4.1
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 36
+
+pattern=2XX&action=group&target=610
+```
+
+#### Response Example (200 OK)
+```json
+{
+  "status": "ok",
+  "pattern": "2XX",
+  "action": "group",
+  "target": "610"
 }
 ```
 
