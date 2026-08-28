@@ -58,16 +58,6 @@ Expose an HTTP endpoint `/api/diagnostics/pcap` to dump a live ring-buffer of SI
 
 ---
 
-### 🔵 Issue #32: [Feature Request] Live SIP Tracer in the Web Terminal
-* **Status**: ⏳ Open / Planned (Backlog)
-* **Labels**: `feature-request`, `diagnostics`
-* **Severity**: Low
-
-#### Description
-Stream live SIP UDP signaling packets directly to the CRT console landing page using WebSockets.
-
----
-
 ## Feature-Parity Backlog (LAN PBX)
 
 Generic desk-PBX features to bring pocket-dial to parity with full-size PBXes. **All of these are
@@ -260,6 +250,36 @@ Deliberately did **not** take on the riskier admission-check relocation the firs
 Verified via a full rebuild of the production `SipServer.exe` target (the only build target that actually compiles `UdpServer.cpp`/`SipServer.cpp`/`SipMessageFactory.cpp` — `tests/CMakeLists.txt` does not link those three), which succeeds clean with MSVC, plus the full host suite (193/193 passing) covering every downstream type this refactor touches. ESP-IDF device compilation was not exercised (no activated `idf.py` environment this session); `main/`'s only touch points (`esp_main*.cpp`) construct `SipServer` and never reference `OnNewMessageEvent` directly, so they are unaffected by the signature change.
 
 Full detail: https://github.com/GlomarGadaffi/pocket-dial/issues/81
+### 🟢 Issue #32: [Feature Request] Live SIP Tracer in the Web Terminal
+* **Status**: ✅ Resolved 2026-08-24
+* **Labels**: `feature-request`, `diagnostics`, `dashboard`, `enhancement`
+
+#### Resolution
+The data half of this shipped earlier as `GET /api/trace` + a polling dashboard
+panel (see the `Issue #32` entries already in `CHANGELOG.md`), but this tracker
+entry stayed open because the literal ask — a `trace on`/`trace off`
+**command** in the terminal, not just a checkbox — was never built, and
+`ISSUES.md`'s own description (WebSockets) was stale against what had actually
+shipped (polling). Closing both gaps now:
+
+- Added a small command-line interpreter to the CGA CRT terminal's "SIP Trace"
+  card (`src/Helpers/index_html.h`): a `pd>` prompt input accepting `trace on`,
+  `trace off`, and `help`. Both commands call the *same* `startTrace()`/
+  `stopTrace()` functions the pre-existing checkbox already used, so there is
+  still exactly one live-update mechanism (1.5 s polling of `/api/trace`) —
+  the command surface is new, the transport is not. Command echoes render into
+  the same trace screen the packets stream into, sharing its existing 200-block
+  client-side cap so typing commands can't grow the DOM unbounded either.
+- Added `tests/HttpTraceCommand_test.cpp`, driving a real `HttpServer` +
+  `RequestsHandler` over a real socket with a synthetic SIP message carrying an
+  escaped quote/backslash (a realistic `Authorization: Digest ... nonce="a\"b"`
+  shape), and asserting the exact bytes `GET /api/trace` serves survive the
+  JSON round trip intact. Prior tests only ever checked the C++-side
+  `getTraceRecords()` accessor, never the actual wire bytes the terminal's
+  `trace on` command renders.
+- The terminal command interpreter itself is pure client-side JS with no new
+  C++ surface by design (see the comments beside `termExec()`), so it isn't
+  separately host-tested beyond the data-path test above.
 
 ---
 

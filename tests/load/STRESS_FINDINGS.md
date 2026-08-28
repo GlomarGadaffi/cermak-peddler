@@ -104,3 +104,104 @@ from multiple IPs to find the true concurrency ceiling (Issue #79).
 (`CONFIG_LWIP_TCPIP_RECVMBOX_SIZE` also set to 32). Not yet re-verified against
 a live burst re-run on hardware — that re-run (`sip_stress.py --clients 30`
 unpaced, confirming a materially higher success rate) is still open.
+
+---
+
+## Update — Issue #79: multi-source-IP ceiling, measured (host build, one box)
+
+`sip_stress.py` gained `--source-ips` / `--source-ip-base` / `--source-ip-count`
+(bind each virtual UA's own socket to a distinct local address instead of
+sharing the OS-picked default) and `--hold-ms` (keep an echo call open between
+ACK and BYE so concurrent calls actually overlap in the Session pool instead of
+each completing before the next INVITE lands). This is a real bypass of the
+Issue #38 limiter, not a workaround for a weaker check: `RequestsHandler::
+allowPacket`'s `_rateBuckets` is `unordered_map<uint32_t, RateBucket>` keyed on
+`sin_addr.s_addr` alone (`RequestsHandler.cpp`) — no port in the key — so any
+genuinely distinct source IP draws its own 40-burst/20-pkt/s bucket.
+
+### What was actually run
+
+**Host build** (`SipServer.exe`, Windows, defaults: `POCKETDIAL_MAX_CLIENTS=32`
+/ `POCKETDIAL_MAX_SESSIONS=8`), **one physical machine**, source IPs drawn from
+`127.0.0.2`–`127.0.0.41` — Windows treats the whole `127.0.0.0/8` block as
+loopback with zero configuration (unlike Linux, which by default brings up only
+`127.0.0.1`), so this needed no `ip addr add` / netns setup. This is **not** a
+real multi-host run: one NIC, one kernel network stack, one process under test.
+It answers the "does the registrar's own pool logic degrade cleanly past the
+per-IP limiter" question; it does **not** answer anything ESP32-specific
+(lwIP mailbox sizing, FreeRTOS task scheduling, the SoftAP association cap) or
+anything about real network latency/loss. See "What a real run still needs"
+below.
+
+```
+python tests/load/sip_stress.py --host 127.0.0.1 --port <sip-port> \
+  --clients 40 --register-only --source-ip-base 127.0.0. --source-ip-count 40
+```
+**Result: client-pool ceiling confirmed exactly at 32.**
+```
+REGISTER storm: 40 attempts, 32 ok (80%)
+status codes: 200:32, 503:8
+```
+`GET /api/status` afterward showed exactly 32 entries in `clients`, all with
+distinct `127.0.0.x` addresses. The server stayed up and the dashboard stayed
+responsive through and after the run — no crash, no watchdog-equivalent hang,
+which is the "clean 503 path" half of #79's acceptance criterion, confirmed for
+ordinary REGISTER/INVITE-to-a-real-extension traffic.
+
+```
+python tests/load/sip_stress.py --host 127.0.0.1 --port <sip-port> \
+  --clients 32 --echo-calls 16 --source-ip-base 127.0.0. --source-ip-count 32 \
+  --hold-ms 1000
+```
+**Result: session ceiling of 8 is real on the server side, but the `777`
+echo-test path does not surface it to the caller as a 503.** All 16 concurrent,
+held-open echo calls came back `200 OK` from the client's point of view. The
+server's own log told a different story: exactly 8 `Session Created between
+<ext> and 777` lines appeared (matching `POCKETDIAL_MAX_SESSIONS`), and
+**zero** log output at all for the other 8 attempted calls — `allocateSession()`
+returned `nullptr` for them and `RequestsHandler::onInvite`'s `777` branch
+silently skips the session bookkeeping in that case, having already enqueued
+the `180`/`200` responses *before* checking. Filed as **#115** (found while
+executing #79, not fixed here — see that issue for the root cause,
+`RequestsHandler.cpp` ~line 755, and why the fix isn't a one-liner: it needs a
+trace of what a BYE against an untracked Call-ID currently does).
+
+So the honest measured statement is: **peak tracked concurrent sessions = 8
+(matches `POCKETDIAL_MAX_SESSIONS`); the ordinary call-setup path 503s cleanly
+at that ceiling (verified by code inspection, `RequestsHandler.cpp` ~line
+1008); the `777` diagnostic/echo path does not enforce it and needs #115
+before it can be used to validate the session ceiling from the caller's side.**
+
+### Other things this run surfaced
+- **`_rateBuckets.size() >= 256` fail-safe** (`RequestsHandler.cpp`): past 256
+  distinct source IPs concurrently tracked, *new* IPs get dropped outright
+  regardless of their own token count. Caps how far the loopback-aliasing
+  technique above scales on one box — not hit at 40 IPs, worth knowing before
+  trying hundreds.
+- **OPTIONS-keepalive pruning interacts with quick successive runs.** Each
+  `sip_stress.py` invocation closes its UA sockets on exit; the server then
+  logs `Pruning client due to missed OPTIONS keepalive pings` for that whole
+  batch a little later, so polling `/api/status` shortly after starting a new
+  run against a server that still has a prior run's now-dead clients live can
+  read a confusingly low or transiently-zero client count. Not a bug — just a
+  timing trap when scripting back-to-back runs against one long-lived server.
+- **`--source-ips`/`--source-ip-count` vs. `--pace`:** `--pace` exists to stay
+  *under* the per-IP token bucket on a single-source run; the source-IP flags
+  exist to bypass that bucket entirely by giving every UA its own bucket. Using
+  both together works but is usually pointless — pick one goal per run.
+
+### What a real multi-host run still needs
+This environment had exactly one machine available. A production capacity
+claim (not just "the registrar's own pool bookkeeping is sound") still needs:
+- **Actual separate physical or VM hosts** (or, short of that, Linux network
+  namespaces / real secondary interface addresses via `ip addr add`) sending
+  from real, independent network stacks — the loopback-aliasing trick above
+  shares one kernel's UDP stack and one CPU with the process under test, so it
+  cannot surface anything about real NIC/driver behavior under load.
+- **The actual ESP32 firmware**, not the host build — the host build shares the
+  same `RequestsHandler`/`Registrar` C++ logic, so the pool-ceiling numbers
+  above are a legitimate stand-in for that logic specifically, but say nothing
+  about `CONFIG_LWIP_UDP_RECVMBOX_SIZE`, FreeRTOS task-stack pressure, or the
+  SoftAP association cap (`docs/SCALING.md` §5) — those need the real board.
+- **Real network conditions** (latency, jitter, loss) that a same-host loopback
+  run cannot produce.

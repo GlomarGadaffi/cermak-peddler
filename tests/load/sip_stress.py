@@ -8,14 +8,40 @@ and the static-pool / rate-limit ceilings. Also samples the HTTP /api/status
 endpoint for server-side packet & pool counters.
 
 NOTE: pocket-dial rate-limits per SOURCE IP (token bucket, ~40 burst / 20 pkt/s
-sustained, Issue #38). All virtual UAs here share one source IP, so a single
-host cannot exceed that budget no matter how many UAs you spin up -- that is by
-design (DoS protection). Pace accordingly; the tool reports drops so you can see
-the limiter engage. Real fleets register from many IPs.
+sustained, Issue #38 -- keyed purely on the IPv4 address, `RequestsHandler::
+allowPacket`'s `_rateBuckets` map is `unordered_map<uint32_t, RateBucket>` with
+no port in the key). Every virtual UA here defaults to one shared source IP
+(whatever the OS picks for the route to --host), so a single default run cannot
+exceed that budget no matter how many UAs you spin up -- that is by design (DoS
+protection), not a bug in this tool. Pace accordingly; the tool reports drops so
+you can see the limiter engage.
+
+Issue #79: to measure the registrar's ceiling *past* the per-IP limiter, drive
+UAs from multiple distinct source IPs with --source-ips / --source-ip-base +
+--source-ip-count (see --help). Because the bucket keys on address only (not
+port), this is a real bypass, not a workaround for a weaker check -- any of the
+following genuinely produce distinct buckets:
+  * separate physical/VM hosts (the real target for a production capacity claim)
+  * Linux network namespaces / extra interface addresses (`ip addr add`)
+  * multiple secondary IPs bound on ONE host's loopback range -- e.g. Windows
+    treats the entire 127.0.0.0/8 block as loopback with zero configuration
+    (unlike Linux, which by default only brings up 127.0.0.1), so
+    `--source-ip-base 127.0.0. --source-ip-count 40` works out of the box on a
+    single Windows box for a same-host sanity run. This still shares one NIC,
+    one kernel network stack, and one physical host with the process under
+    test, so it is NOT a substitute for a real multi-host run when the question
+    is production capacity under real network conditions -- see
+    docs/SCALING.md / STRESS_FINDINGS.md for what was actually measured this
+    way vs. what a real multi-host run still needs to confirm.
 
 Usage:
   python sip_stress.py --host 192.168.12.159 --clients 30 --echo-calls 8
   python sip_stress.py --host pocketdial.local --register-only --clients 40
+  # Bypass the per-IP limiter using 40 loopback-range source addresses:
+  python sip_stress.py --host 127.0.0.1 --clients 40 --echo-calls 12 \\
+      --source-ip-base 127.0.0. --source-ip-count 40 --hold-ms 300
+  # Or an explicit list (real interface IPs / netns addresses for a real run):
+  python sip_stress.py --host 10.0.0.1 --clients 4 --source-ips 10.0.1.1,10.0.1.2
 """
 import argparse, socket, threading, time, random, re, statistics, sys, json
 import urllib.request
@@ -31,12 +57,31 @@ def local_ip_for(host, port):
     finally:
         s.close()
 
+def resolve_source_ips(args, default_ip):
+    """Returns the list of local source IPs to round-robin virtual UAs across.
+
+    Explicit --source-ips wins; otherwise --source-ip-base/--source-ip-count
+    auto-generates addresses (base + str(2), base + str(3), ... -- skipping
+    '1' since that's commonly the host's own primary address); with neither,
+    falls back to the single implicit `default_ip` (today's behavior,
+    unchanged, so a plain run without these flags is bit-for-bit the same
+    single-source test it always was).
+    """
+    if args.source_ips:
+        return [ip.strip() for ip in args.source_ips.split(',') if ip.strip()]
+    if args.source_ip_count > 0:
+        return [f"{args.source_ip_base}{i + 2}" for i in range(args.source_ip_count)]
+    return [default_ip]
+
 class UA:
-    """One virtual SIP user-agent on its own UDP port."""
+    """One virtual SIP user-agent on its own UDP port, optionally bound to a
+    specific local source IP (Issue #79) so it draws from its own per-IP token
+    bucket rather than sharing the OS-chosen default source address."""
     def __init__(self, ext, host, port, local_ip, timeout=4.0):
         self.ext, self.host, self.port, self.lip = ext, host, port, local_ip
         self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.s.bind(('', 0)); self.s.settimeout(timeout)
+        self.s.bind((local_ip if local_ip != '0.0.0.0' else '', 0))
+        self.s.settimeout(timeout)
         self.lport = self.s.getsockname()[1]
         self.callid = f"{_hex(16)}@{local_ip}"
         self.tag = _hex(8); self.cseq = 0
@@ -88,8 +133,13 @@ class UA:
                 f"m=audio {10000 + (self.lport % 5000)} RTP/AVP 0 8 101\r\n"
                 f"a=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\n")
 
-    def echo_call(self):
-        """INVITE the 777 echo extension -> expect 200 -> ACK -> BYE. Returns (setup_status, ms)."""
+    def echo_call(self, hold_ms=0.0):
+        """INVITE the 777 echo extension -> expect 200 -> ACK -> [hold] -> BYE.
+        `hold_ms`, if >0, sleeps between ACK and BYE so this session actually
+        occupies a Session-pool slot concurrently with other UAs' calls --
+        without a hold, a fast localhost round trip completes and frees the
+        slot before other threads' INVITEs even land, which would understate
+        real concurrent-session pressure (Issue #79). Returns (setup_status, ms)."""
         self.cseq += 1
         cid = f"{_hex(16)}@{self.lip}"
         sdp = self._sdp()
@@ -113,6 +163,7 @@ class UA:
                    f"CSeq: {self.cseq - 1} ACK\r\nContent-Length: 0\r\n\r\n")
             try: self.s.sendto(ack.encode(), (self.host, self.port))
             except Exception: pass
+            if hold_ms > 0: time.sleep(hold_ms / 1000.0)
             self.cseq += 1
             bye = (f"BYE sip:777@{self.host} SIP/2.0\r\n"
                    f"Via: {self._via()}\r\nMax-Forwards: 70\r\n"
@@ -156,13 +207,32 @@ def main():
     ap.add_argument("--ext-base", type=int, default=1000)
     ap.add_argument("--register-only", action="store_true")
     ap.add_argument("--pace", type=float, default=0.0, help="seconds between launches (0 = full parallel)")
+    ap.add_argument("--source-ips", default="",
+                     help="Issue #79: comma-separated local IPs to round-robin UAs across, "
+                          "bypassing the per-source-IP token bucket (Issue #38). For a real "
+                          "measurement these should be genuinely distinct hosts/netns/interface "
+                          "addresses -- see the module docstring.")
+    ap.add_argument("--source-ip-base", default="127.0.0.",
+                     help="Prefix used with --source-ip-count to auto-generate source IPs "
+                          "(default targets Windows's unconfigured 127.0.0.0/8 loopback range).")
+    ap.add_argument("--source-ip-count", type=int, default=0,
+                     help="Auto-generate this many source IPs as <source-ip-base><2..N+1> "
+                          "instead of the single default OS-chosen source address. 0 (default) "
+                          "keeps the original single-source behavior.")
+    ap.add_argument("--hold-ms", type=float, default=0.0,
+                     help="Hold each echo call open this long between ACK and BYE, so "
+                          "concurrent calls actually overlap in the Session pool instead of "
+                          "each completing before the next INVITE lands (Issue #79).")
     args = ap.parse_args()
 
-    lip = local_ip_for(args.host, args.port)
-    print(f"pocket-dial SIP stress  ->  {args.host}:{args.port}   (source {lip})")
+    default_lip = local_ip_for(args.host, args.port)
+    source_ips = resolve_source_ips(args, default_lip)
+    print(f"pocket-dial SIP stress  ->  {args.host}:{args.port}")
+    print(f"source IPs ({len(source_ips)}): {source_ips}")
     print(f"before: {api_status(args.host)}")
 
-    uas = [UA(str(args.ext_base + i), args.host, args.port, lip) for i in range(args.clients)]
+    uas = [UA(str(args.ext_base + i), args.host, args.port, source_ips[i % len(source_ips)])
+           for i in range(args.clients)]
 
     # ---- Phase 1: registration storm ----
     reg_lat, reg_codes = [], []
@@ -186,7 +256,7 @@ def main():
     if not args.register_only and args.echo_calls > 0:
         call_lat, call_codes = [], []
         def do_call(ua):
-            st, ms = ua.echo_call()
+            st, ms = ua.echo_call(hold_ms=args.hold_ms)
             with lock:
                 call_codes.append(st)
                 if st: call_lat.append(ms)

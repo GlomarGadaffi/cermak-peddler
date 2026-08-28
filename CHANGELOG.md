@@ -379,6 +379,129 @@ themed pass: a signaling-capture fidelity bug (#105), a build-system footgun
 - Not covered: ESP-IDF device build (no activated `idf.py` environment this
   session — see #111's verification note above) and an on-hardware/real-socket
   run of the `UdpServer` receive path.
+## Unreleased (issue-79-multi-source-load-test) - 2026-08-25
+
+Addresses Issue #79 (partial): tooling landed and a real measurement was taken
+on one host; a genuine multi-host run is still open (see below).
+
+### Summary
+
+Root cause of #79 not being previously measurable: `tests/load/sip_stress.py`
+gave every virtual UA the OS's single default source address, so no single-box
+run could ever push past `RequestsHandler::allowPacket`'s per-source-IP token
+bucket (Issue #38's DoS protection — confirmed by reading it that the bucket
+key, `_rateBuckets`'s `unordered_map<uint32_t, RateBucket>`, is the raw
+`sockaddr_in::sin_addr.s_addr` with **no port**, so any genuinely distinct IP
+draws its own bucket).
+
+- Added `--source-ips` (explicit comma list), `--source-ip-base` +
+  `--source-ip-count` (auto-generate `<base>2..<base>N+1`), and `--hold-ms`
+  (keep an echo call open between ACK and BYE so concurrent calls actually
+  overlap a Session-pool slot instead of each completing before the next
+  INVITE lands) to `tests/load/sip_stress.py`. Every UA now binds its own
+  socket to its assigned source IP; with none of the new flags passed, behavior
+  is unchanged (single implicit source, exactly today's script).
+- Ran it for real against the **host build** (`SipServer.exe`, default
+  `POCKETDIAL_MAX_CLIENTS=32`/`POCKETDIAL_MAX_SESSIONS=8`) on **one Windows
+  machine**, using 32–40 distinct `127.0.0.x` source addresses — Windows
+  treats the whole `127.0.0.0/8` block as loopback with no configuration
+  needed (unlike Linux, which by default only brings up `127.0.0.1`). This is
+  a real bypass of the per-IP limiter (confirmed above the key is IP-only), but
+  it is **not** a multi-host run: one NIC, one kernel network stack, one
+  process under test — see `tests/load/STRESS_FINDINGS.md` for exactly what it
+  does and doesn't validate.
+- **Measured: client-pool ceiling is exactly 32**, with a clean `503` on the
+  8 overflow REGISTERs and no crash/hang — the general graceful-degradation
+  claim in `docs/SCALING.md` §4 is now backed by an actual run, not just code
+  reading.
+- **Measured: the session pool does cap at 8 server-side** (confirmed via
+  server logs, `Session Created between <ext> and 777` appeared exactly 8
+  times across 16 concurrent held-open echo calls), **but the `777`
+  echo-test path never returns the 503 that behavior should produce** — all
+  16 calls got `200 OK` from the caller's point of view, because
+  `RequestsHandler::onInvite`'s `777` branch (`RequestsHandler.cpp` ~line 755)
+  enqueues the `180`/`200` responses *before* calling `allocateSession()`, and
+  silently skips the session bookkeeping (no log line either) if that returns
+  `nullptr`. This is a real, independently-diagnosed defect in the `777`
+  diagnostic path specifically — the ordinary call-to-call INVITE path a few
+  hundred lines down correctly gates on `allocateSession()` first and 503s
+  cleanly. Filed as **#115**, not fixed in this change (out of scope for a
+  load-test-tooling issue — the fix needs a trace of what a BYE against an
+  untracked Call-ID currently does, which belongs with the fix, not the
+  measurement).
+
+### Docs
+
+- `tests/load/STRESS_FINDINGS.md`: new "Issue #79" section with the exact
+  commands run, the exact output, the `_rateBuckets.size() >= 256` fail-safe
+  noted as a ceiling on how far this technique scales, the OPTIONS-keepalive
+  pruning timing trap observed when scripting back-to-back runs, and an
+  explicit "what a real multi-host run still needs" list (separate physical/VM
+  hosts or real netns addresses, the actual ESP32 firmware — not just the
+  shared host-build C++ logic — and real network conditions).
+- `docs/SCALING.md` §4: pointer note summarizing the measured ceilings and
+  linking to STRESS_FINDINGS.md and #115.
+
+No concurrency numbers are reported for anything not actually run above; the
+production-capacity question (real hosts, real firmware, real network) remains
+open per the issue's own framing.
+
+---
+
+## Unreleased (issue-32-terminal-trace-command) - 2026-08-24
+
+Closes Issue #32.
+
+### Summary
+
+The tracker entry stayed open after `GET /api/trace` + the dashboard's polling
+"SIP Trace" checkbox panel shipped (see the existing Issue #32 entry further
+down this file), because the literal ask — a `trace on`/`trace off`
+**command** typed into the terminal, not a checkbox — was never built, and
+`ISSUES.md`'s description had drifted (it still said "using WebSockets," which
+was the original proposal, not what shipped). This change adds the command
+surface without adding a second live-update mechanism:
+
+- `src/Helpers/index_html.h`: a `pd>` command-line prompt under the SIP Trace
+  card. `trace on` / `trace off` / `help` are parsed by a small `termExec()`
+  interpreter that calls the *same* `startTrace()`/`stopTrace()` functions the
+  pre-existing checkbox already drove — both paths still funnel through one
+  1.5 s poll of `/api/trace`. Command echoes render into the same trace-screen
+  the packets stream into and share its existing 200-block client-side DOM
+  cap, so typing commands can't grow memory/DOM usage unbounded any more than
+  the packet stream already could. The checkbox keeps working unchanged.
+  Verified end to end against the real host build in a real browser: `trace
+  on` streams live REGISTER/INVITE traffic as raw ASCII into the terminal,
+  `trace off` stops it, an unrecognized command echoes `unknown command: ...`,
+  and the checkbox and terminal commands stay in sync in both directions.
+- `src/Helpers/index_html.h`'s giant `CGA_INDEX_HTML` raw-string literal had to
+  be split one more time (`R"html2(...)html2" R"html2a(...)html2a"`) — MSVC
+  caps a single narrow string literal at ~16 KB, and the JS added here pushed
+  the existing `html2` segment over that limit (`error C2026: string too big,
+  trailing characters truncated`, which does not fail the build, it silently
+  drops page content — caught by rebuilding and noticing the compiler warning,
+  not by any test). No content changed, only where one literal boundary falls.
+- `tests/HttpTraceCommand_test.cpp` (new): the command interpreter itself is
+  pure client-side JS with no C++ surface by design (see the comment beside
+  `termExec()`), so this instead pins the data path both the checkbox and the
+  new commands consume — a real `HttpServer` + `RequestsHandler` pair over a
+  real socket, fed a synthetic SIP message with an escaped quote/backslash in
+  an `Authorization` header (the shape a real digest challenge response
+  produces), asserting the exact bytes `GET /api/trace` puts on the wire
+  round-trip through `jsonEscape()`/JSON-parsing intact. Prior tests
+  (`PcapCapture_test.cpp`, `RequestsHandler_pool_test.cpp`) only ever asserted
+  against the C++-side `getTraceRecords()` accessor, never the actual response
+  body a browser's `trace on` would receive.
+
+### Verification
+
+- Host suite: **192/192** passing, including the new
+  `HttpTraceCommand.ApiTraceRoundTripsRawSipTextWithQuotesAndBackslashes`.
+- Manual: built and ran the real `SipServer.exe` + dashboard, drove real SIP
+  traffic at it, and exercised `trace on`/`trace off`/an unknown command from
+  the terminal input in a real browser session.
+
+---
 
 ## Unreleased (issue-101-closeout) - 2026-08-17
 
