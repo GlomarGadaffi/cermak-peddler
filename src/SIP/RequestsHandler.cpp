@@ -769,9 +769,48 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	std::string destNumber(data->getToNumber());
 	if (destNumber == "777")
 	{
-		// SDP loopback echo test
+		// SDP loopback echo test. Issue #115: allocateSession() must be called
+		// FIRST, before any 180/200 is built, mirroring the ordinary call-to-call
+		// INVITE path below (and the hunt-group path above) — otherwise a full
+		// session pool still gets a "successful" 200 OK with no _sessions entry
+		// backing it, silently bypassing POCKETDIAL_MAX_SESSIONS.
+		auto newSession = allocateSession(std::string(data->getCallID()), caller.value());
+		if (!newSession)
+		{
+			auto responseObj = getMessageFromPool(*data);
+			if (!responseObj) return;   // pool exhausted: drop, peer retransmits (#101A)
+			responseObj->setHeader("SIP/2.0 503 Service Unavailable");
+			responseObj->clearBody();
+			responseObj->setContact(buildContact(caller.value()->getNumber()));
+			_outbox.emplace_back(data->getSource(), std::move(responseObj));
+			return;
+		}
+
+		// Draw BOTH responses before publishing the session (mirrors the 440 media
+		// path's "OK drawn before the session is published" comment above
+		// onMediaInvite): once _sessions.emplace()+Connected below has run, a
+		// message-pool refusal here would abandon a dialog with no 180/200 ever
+		// sent and no clean way back (the retransmission guard at the top of this
+		// function would then silently drop the caller's retry). Refusing now, before
+		// either mutation, leaves nothing behind — allocateSession() already reset
+		// newSession's Call-ID but never published it to _sessions, so the next
+		// allocateSession() call reclaims this same slot as free (see its scan for a
+		// slot whose Call-ID is absent from _sessions).
 		auto ringing = getMessageFromPool(*data);
 		if (!ringing) return;   // pool exhausted: drop, peer retransmits (#101A)
+		auto okResponse = getMessageFromPool(*data);
+		if (!okResponse) return;   // pool exhausted: drop, peer retransmits (#101A)
+
+		// Per-session dummy dest (never the old shared _dummyClient): a concurrent
+		// 777/440 call must not overwrite this session's destination identity. The
+		// shared_ptr lives as long as the session references it (released on
+		// teardown / pool reuse) — bounded by the session pool, not the packet path.
+		auto dummy777 = std::make_shared<SipClient>();
+		dummy777->reset("777", data->getSource(), 3600);
+		newSession->setDest(dummy777);
+		_sessions.emplace(data->getCallID(), newSession);
+		newSession->setState(Session::State::Connected);
+
 		ringing->setHeader("SIP/2.0 180 Ringing");
 		ringing->clearBody();
 		std::string activeIp = _localIp;
@@ -781,28 +820,12 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		ringing->setContact(buildContact("777"));
 		_outbox.emplace_back(data->getSource(), std::move(ringing));
 
-		auto okResponse = getMessageFromPool(*data);
-		if (!okResponse) return;   // pool exhausted: drop, peer retransmits (#101A)
 		okResponse->setHeader(SipMessageTypes::OK);
 		okResponse->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		okResponse->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 		okResponse->setContact(buildContact("777"));
 		okResponse->enforceG711();
 		_outbox.emplace_back(data->getSource(), std::move(okResponse));
-
-		// Per-session dummy dest (never the old shared _dummyClient): a concurrent
-		// 777/440 call must not overwrite this session's destination identity. The
-		// shared_ptr lives as long as the session references it (released on
-		// teardown / pool reuse) — bounded by the session pool, not the packet path.
-		auto dummy777 = std::make_shared<SipClient>();
-		dummy777->reset("777", data->getSource(), 3600);
-		auto newSession = allocateSession(std::string(data->getCallID()), caller.value());
-		if (newSession)
-		{
-			newSession->setDest(dummy777);
-			_sessions.emplace(data->getCallID(), newSession);
-			newSession->setState(Session::State::Connected);
-		}
 		return;
 	}
 

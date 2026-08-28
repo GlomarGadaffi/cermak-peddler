@@ -502,6 +502,82 @@ surface without adding a second live-update mechanism:
   the terminal input in a real browser session.
 
 ---
+## Unreleased (issue-115-777-session-pool) - 2026-08-28
+
+### Fixed — 777 echo-test INVITE answers 200 OK even when the Session pool is full (#115)
+
+- Found while executing #79's multi-source-IP load test: driving 16 concurrent
+  `777` SDP-loopback echo calls against `POCKETDIAL_MAX_SESSIONS=8` produced
+  exactly 8 `Session Created` log lines but **16/16 200 OK** at the client — 8
+  calls were never tracked server-side yet still looked successful.
+
+  `RequestsHandler::onInvite`'s `destNumber == "777"` branch built and
+  enqueued the `180 Ringing` / `200 OK` responses **unconditionally**, and
+  only afterward called `allocateSession()`. When the session pool was
+  already full, `allocateSession()` returned `nullptr` and the bookkeeping
+  `if` body was simply skipped — but the caller had already gotten its
+  `200 OK`, with no `_sessions` entry ever created to back it. The ordinary
+  call-to-call INVITE path (`RequestsHandler.cpp` ~line 1009) already got
+  this right: `allocateSession()` first, `503 Service Unavailable` before
+  any success response is built.
+
+  Fixed by reordering the `777` branch to match: `allocateSession()` runs
+  first; on `nullptr` it now sends a real `SIP/2.0 503 Service Unavailable`
+  (same shape as the hunt-group path's 503 — sent directly to
+  `data->getSource()`, since `777` is a virtual extension, not a registered
+  client looked up by number) and returns before building anything.
+
+  Both `180`/`200` messages are then drawn from the message pool **before**
+  `_sessions.emplace()` + `setState(Connected)` run, not after — mirroring the
+  comment on the `440` media path's own `allocateSession()` gate ("the OK is
+  drawn before the session is published... past `_sessions.emplace()` +
+  `Connected` there is no clean way back"). Publishing the session first and
+  drawing messages after would trade the original bug for a smaller one: a
+  message-pool refusal mid-branch would abandon a `Connected` session with no
+  `180`/`200` ever sent, and the retransmission guard a few lines above this
+  branch would then silently drop the caller's retry for that Call-ID.
+  Refusing before either mutation leaves nothing behind: `allocateSession()`
+  already reset the pooled `Session`'s Call-ID via `reset()`, but since it was
+  never published to `_sessions`, the next `allocateSession()` call treats
+  that slot as free again (its scan matches any slot whose Call-ID isn't a
+  key in `_sessions`).
+
+- **BYE-for-untracked-Call-ID traced before landing the fix, per the issue's
+  own requirement.** `RequestsHandler::onBye`'s `777` branch unconditionally
+  replies `200 OK` and calls `endCall()` regardless of whether a session was
+  found — the spoofed-teardown authorization check is skipped when there's
+  no session to authorize against, but nothing downstream assumes one
+  exists. `endCall()` is fully defensive against an unknown Call-ID:
+  `_dtmfState.erase`/`_txLayer.freeForCallId`/`_park.freeForCallId`/
+  `_rtpSender.stop` are no-ops for an ID they don't hold, `_sessions.erase`
+  returning 0 skips the CDR record and disconnect log, and the
+  `_sessionPool` scan finds no match to release. A BYE for a Call-ID that
+  was correctly refused with a 503 under this fix is therefore already
+  handled sanely — 200 OK, silent no-op teardown, no crash, no phantom CDR —
+  and nothing else in the codebase leaves a session referenced without a
+  corresponding `_sessions` entry, so this fix introduces no new
+  inconsistency for the BYE path to trip over.
+
+  New test in `tests/Invite777SessionPool_test.cpp`: drives a real
+  `RequestsHandler` through `handle()`, fills every `POCKETDIAL_MAX_SESSIONS`
+  slot with ordinary calls (checked live via `getSession()` — the
+  dashboard's `getSessionCount()`/`getClientCount()` only refresh their
+  snapshot inside `tick()`, not synchronously per packet, so they can't
+  observe mid-`handle()` state), then sends a `777` INVITE and asserts the
+  response is `503` with no `200`/`180`, and that no `_sessions` entry was
+  created for the refused Call-ID or disturbed for the pre-existing ones.
+  Confirmed the test fails against the pre-fix code
+  (`saw503=false, saw200=true, saw180=true`) before confirming it passes
+  against the fix.
+
+### Verification
+
+- Host suite: **192/192 passing** (Windows, MSVC 19.44, Release), including
+  the new `Invite777SessionPool` test.
+- The new test was run against the reverted (pre-fix) `RequestsHandler.cpp`
+  and confirmed to fail with the exact pre-fix symptom (false `200 OK` +
+  `180 Ringing`, no `503`) before the fix was restored and the suite
+  re-confirmed green.
 
 ## Unreleased (issue-101-closeout) - 2026-08-17
 
