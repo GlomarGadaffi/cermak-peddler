@@ -125,3 +125,57 @@ TEST(BlfSubscriptions, ConfirmedCallOnWatchedTargetNotifiesConfirmed)
 	EXPECT_NE(notify.find("<state>confirmed</state>"), std::string::npos) << notify;
 	EXPECT_NE(notify.find("direction=\"initiator\""), std::string::npos) << notify;
 }
+
+// Issue #106: forEachSessionInvolving used to be an if/else-if chain, so a
+// session whose src AND dest are the same watched extension (self-call) only
+// ever reported the Caller leg — the Callee leg was silently dropped. Both
+// checks must be independent so a self-call invokes the callback twice, once
+// per role.
+TEST(BlfSubscriptions, ForEachSessionInvolvingFiresBothRolesForSelfCall)
+{
+	FakePbxEnv env;
+	const sockaddr_in phoneAddr = FakePbxEnv::addr("192.168.1.50", 5060);
+
+	auto self = std::make_shared<SipClient>("101", phoneAddr);
+	auto session = std::make_shared<Session>("call-self", self);
+	session->setDest(self);
+	env.sessions.emplace("call-self", session);
+
+	std::vector<PbxEnv::DialogRole> rolesSeen;
+	env.forEachSessionInvolving("101",
+		[&](const std::string& callID, const Session&, PbxEnv::DialogRole role)
+	{
+		EXPECT_EQ(callID, "call-self");
+		rolesSeen.push_back(role);
+	});
+
+	ASSERT_EQ(rolesSeen.size(), 2u);
+	EXPECT_EQ(rolesSeen[0], PbxEnv::DialogRole::Caller);
+	EXPECT_EQ(rolesSeen[1], PbxEnv::DialogRole::Callee);
+}
+
+// End-to-end through the real BlfSubscriptions::computeDialogState: with the
+// bug, a ringing self-call only ever reported the Caller leg ("trying"/
+// initiator); with both roles firing, the higher-ranked Callee leg ("early"/
+// recipient) wins, since dest is visited after src.
+TEST(BlfSubscriptions, SelfCallRingingReportsCalleeLegNotJustCaller)
+{
+	FakePbxEnv env;
+	BlfSubscriptions blf(env);
+	const sockaddr_in watcherAddr = FakePbxEnv::addr("192.168.1.60", 5060);
+	const sockaddr_in phoneAddr   = FakePbxEnv::addr("192.168.1.50", 5060);
+
+	auto self = std::make_shared<SipClient>("101", phoneAddr);
+	auto session = std::make_shared<Session>("call-self", self);
+	session->setDest(self);
+	session->setState(Session::State::Invited);
+	env.sessions.emplace("call-self", session);
+
+	blf.onSubscribe(subscribe("200", "101", "watch-6@192.168.1.60", "Event: dialog", 3600,
+		watcherAddr));
+
+	ASSERT_EQ(env.sent.size(), 2u);
+	const std::string notify = env.sentRaw(1);
+	EXPECT_NE(notify.find("<state>early</state>"), std::string::npos) << notify;
+	EXPECT_NE(notify.find("direction=\"recipient\""), std::string::npos) << notify;
+}

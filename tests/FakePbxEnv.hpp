@@ -156,7 +156,7 @@ public:
 			if (!session) continue;
 			if (session->getSrc() && session->getSrc()->getNumber() == aor)
 				fn(callID, *session, DialogRole::Caller);
-			else if (session->getDest() && session->getDest()->getNumber() == aor)
+			if (session->getDest() && session->getDest()->getNumber() == aor)
 				fn(callID, *session, DialogRole::Callee);
 		}
 	}
