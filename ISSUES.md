@@ -38,16 +38,6 @@ Since physical target hardware (smart display JC3248W535EN, POE boards, etc.) is
 
 ---
 
-### 🔵 Issue #35: [Feature Request] Zero-Touch Phone Auto-Provisioning (HTTP)
-* **Status**: ⏳ Open / Planned (Backlog)
-* **Labels**: `feature-request`, `provisioning`
-* **Severity**: Low
-
-#### Description
-Add a background HTTP directory service to push auto-provisioning configs directly to standard SIP phone handsets (Polycom, Yealink, Cisco).
-
----
-
 ### 🔵 Issue #33: [Feature Request] PCAP Dump Endpoint for Wireshark analysis
 * **Status**: ⏳ Open / Planned (Backlog)
 * **Labels**: `feature-request`, `diagnostics`
@@ -145,12 +135,25 @@ until a fork (or a future pass here) adds the routing policy.
 
 ## Resolved Issues
 
-### 🟡 Issue #112: Pin cppcheck in CI: version floats with ubuntu-latest, and 2.21 already finds 4 issues 2.13 doesn't
-* **Status**: 🟡 Partially resolved 2026-08-19 — all findings suppressed/fixed and verified against a real 2.21.0 build, but the `ci.yml` pin itself couldn't be pushed this session (missing `workflow` OAuth scope — see below) and needs a follow-up push
+### 🟢 Issue #35 / #113: Zero-Touch Phone Auto-Provisioning (HTTP) — scope clarified to onboarding/admin-window reachability
+* **Status**: ✅ Resolved 2026-08-28 (documentation clarification; no code change — the behavior was already correct)
+* **Labels**: `feature-request`, `dashboard`, `bug`
+
+#### Resolution
+`GET /config/<mac>.cfg` (implemented in `b79570c`) is real and works, but #113 found that once a device has an admin PIN set, it's reachable only during the admin-http-only plane's open window (DTMF trigger, provisioning grace, or an authenticated keepalive) — the dark-by-default gate closes the *entire* HTTP listener, not just admin routes. `docs/API.md`'s own endpoint section for `/config/<mac>.cfg` already documented this exactly ("Like every other endpoint, it's still subject to the dark-by-default transport gate... exactly as OTA upload requires") — the gap was in this issue's and #35's framing, which described an always-on background auto-provisioner.
+
+Decision (owner call, not a code change): keep the security posture as-is — exempting the config endpoint from the gate would make a device's SIP account password permanently fetchable by anything on the LAN, which is a worse trade than requiring an admin-opened window. #35 is redefined as **onboarding-time and admin-window zero-touch**, not an always-reachable background service: the very first phone provisions during the initial (unprovisioned) onboarding window with no PIN set yet, and every subsequent phone/re-provision needs the admin to either be mid-onboarding (grace window) or to open the plane (dial `*4887` from the admin extension, or hit `/api/admin/keepalive` while logged in) first. That already matches shipped behavior and existing docs; nothing to fix.
+
+Both issues closed with this clarification; no further tracker entries needed. Full detail: https://github.com/GlomarGadaffi/pocket-dial/issues/35, https://github.com/GlomarGadaffi/pocket-dial/issues/113
+
+---
+
+### 🟢 Issue #112: Pin cppcheck in CI: version floats with ubuntu-latest, and 2.21 already finds 4 issues 2.13 doesn't
+* **Status**: ✅ Resolved 2026-08-28 — the `ci.yml` pin (below) was pushed once a token with the `workflow` scope became available; the CI job now runs the pinned 2.21.0 build described below
 * **Labels**: `cleanup`
 
 #### Resolution
-Wrote and verified the CI workflow change that pins the host job's cppcheck to **2.21.0**, built from its own tagged source (no official Linux binary, and pip's `cppcheck` package is an unrelated 1.5.1-vintage wrapper) rather than the `apt` package that floats with `ubuntu-latest`, cached by version via `actions/cache` — but this session's `gh` token lacks the `workflow` scope GitHub requires to push a `.github/workflows/*` change, so that diff could not be pushed to the PR branch. It sits, committed, on the local `backup-with-ci-workflow-change` branch and needs someone with that scope to push it or cherry-pick it onto the PR. Everything the pin would newly surface is already fixed/suppressed in source (below) and merged into the PR, so applying the pin once pushed should be a no-op against a clean CI run — it is not blocked on anything further.
+Wrote and verified the CI workflow change that pins the host job's cppcheck to **2.21.0**, built from its own tagged source (no official Linux binary, and pip's `cppcheck` package is an unrelated 1.5.1-vintage wrapper) rather than the `apt` package that floats with `ubuntu-latest`, cached by version via `actions/cache`.
 
 Before pinning, the issue's claimed 4 findings were verified rather than trusted — both 2.13.0 and 2.21.0 were built from source and run twice: once cross-compiled on Windows (surfaced a discrepancy), and once on a real Linux build via WSL Debian (gcc 14) to confirm it wasn't a Windows-build artifact. On Linux: 2.13.0 finds **zero** issues on `main`; 2.21.0 finds **13**, across six categories. The other nine beyond the issue's four are the identical false-positive shape as its own `SipStatus.cpp` example (plain aggregates now flagged per-scalar-member even though every construction site brace-initializes or immediately overwrites the field), plus a third, previously-unreported `ESP_IDF_VERSION_VAL` `syntaxError` site inside `RequestsHandler.cpp`, and one `performance` suggestion. All thirteen resolved — pinning without addressing all of them would have made the pin itself the next red-CI surprise:
 
