@@ -296,3 +296,21 @@ TEST(MediaAnswer, SingleStreamCap) {
     // Idempotent: stopping an idle sender is a no-op.
     EXPECT_FALSE(tx.stop("callA"));
 }
+
+// Issue #108: on the Linux media path, only stop() joined the sender thread —
+// no destructor was visible in that patch. std::thread's destructor calls
+// std::terminate on a still-joinable thread, so destroying an RtpSender while
+// a stream is active (process shutdown mid-diagnostic-call, or any future
+// owner with a shorter lifetime than RequestsHandler) would crash the process.
+// Reaching the end of this test at all — rather than the binary aborting — is
+// the assertion; ~RtpSender() must stop (and, on Linux, join) any live stream.
+TEST(MediaAnswer, DestructorStopsActiveStreamWithoutCrash) {
+    {
+        RtpSender tx;
+        EXPECT_TRUE(tx.start("192.168.4.22", 4004, "callD"));
+        EXPECT_TRUE(tx.isActive());
+        // No stop() call: ~RtpSender() runs here, at scope exit, on a live
+        // stream.
+    }
+    SUCCEED();
+}
