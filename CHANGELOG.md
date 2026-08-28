@@ -223,6 +223,42 @@ linked, unsigned test binaries partway through this session:
 - **cppcheck 2.21.0**, built from source on both a Windows cross-compile and a
   real WSL/Linux build, run against the final tree with the workflow's exact
   invocation: `EXIT=0`, zero findings, on both.
+## Unreleased (issue-41-80-verification) - 2026-08-19
+
+Verification pass on two "verification needed" tracker issues, neither of which had
+a committed bug repro. No firmware code changed — see the linked GitHub comments for
+the full writeups.
+
+### Docs
+
+- `docs/HARDWARE.md` §2 (Guition JC3248W535): added the microSD pin table
+  (Issue #80's blocker). SD_MMC (SDIO) 1-bit mode, CLK/CMD/D0 = GPIO 12/11/13,
+  cross-referenced against the vendor's own Arduino demo `pincfg.h`, the sibling
+  `jc3248-display-driver` bring-up repo, and this repo's own hardware-verified
+  `esp_main_display.cpp` comment (three independent sources, all agreeing) — and
+  checked for GPIO conflicts against the panel/touch/battery pins already in the
+  table (none found). Left open: whether the physical slot is populated on a given
+  board (the vendor spec sheet calls it "reserved" and its rear-connector photo
+  shows no slot), so no `esp_vfs_fat_*` mounting code was written against this —
+  see the GitHub comment on #80 for the recommended next step (a continuity probe).
+
+- Issue #41 (Arduino IDE platform-detection guards): re-audited every `#if`/`#ifdef`
+  touched by the original change (`src/Helpers/UdpServer.hpp/.cpp`,
+  `src/SIP/RequestsHandler.hpp`, `src/SIP/SipClient.hpp`, `src/SIP/SipMessage.hpp`)
+  plus the guards a prior audit (see `ISSUES.md`) already fixed elsewhere
+  (`SipMessage.hpp`, `TelephonyApiConfig.cpp`). No new bug found: the
+  `#undef INADDR_NONE` in `SipClient.hpp`/`SipMessage.hpp` is preprocessor-scoped to
+  the translation unit that includes it (confirmed nothing in `src/`, `main/`, or
+  `sketches/` reads `INADDR_NONE` afterward), and `SipServer.cpp`'s
+  `#if defined(ARDUINO) ... #elif defined(ESP_PLATFORM)` mDNS-header selection
+  correctly prioritizes `ARDUINO` (needed because Arduino-ESP32 3.x builds through
+  the IDF build system and can define both). Host build re-verified clean
+  (`cmake --build`, no warnings); `ctest` could not be executed in this environment
+  (a Device Guard / application-control policy blocks running newly-built,
+  unsigned executables here — confirmed with the exact toolchain-build binary, not
+  a stale cache). Arduino IDE / `arduino-cli` compile and physical-hardware runtime
+  test remain unverified, as before — full details posted as a GitHub comment on
+  #41 rather than duplicated here.
 
 ## Unreleased (issue-101-closeout) - 2026-08-17
 

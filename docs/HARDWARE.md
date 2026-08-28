@@ -62,6 +62,42 @@ The Guition JC3248W535 is an all-in-one Smart Display powered by an ESP32-S3. It
 > [!TIP]
 > **PSRAM Configuration**: This board uses an ESP32-S3R8 chip containing 8MB of Octal PSRAM. In `sdkconfig`, PSRAM **must** be enabled in Octal mode at 80MHz, and LVGL double-frame buffers (320 * 480 * 2 bytes = 307.2 KB each) must be allocated in `MALLOC_CAP_SPIRAM` to prevent internal SRAM exhaustion.
 
+### microSD (Issue #80 — pinout research)
+
+The board's microSD slot is **SD_MMC (SDIO), 1-bit mode only** — CLK/CMD/D0 are the
+only lines broken out (D1–D3 aren't wired, which is fortunate: on this board they'd
+land on GPIO 48/40/39, the QSPI panel's `TFT_D1`/`TFT_D2`/`TFT_D3`). Not SPI mode.
+
+| Signal | ESP32-S3 GPIO |
+| :--- | :---: |
+| `SD_MMC_CLK` | **GPIO 12** |
+| `SD_MMC_CMD` | **GPIO 11** |
+| `SD_MMC_D0`  | **GPIO 13** |
+
+**Sources** (three independent, all agreeing): the vendor's own Arduino demo bundle
+(`NorthernMan54/JC3248W535EN`, `.../Demo_Arduino/DEMO_PIC/pincfg.h`:
+`SD_MMC_CLK`/`SD_MMC_CMD`/`SD_MMC_D0` = 12/11/13); the `GlomarGadaffi/jc3248-display-
+driver` bring-up repo's `main/board.h` + `docs/Pinout-and-Hardware.md` (same three
+pins, documented as "verified against the board's own pinout sheet"); and this
+repo's own `main/esp_main_display.cpp` comment (added in `17459fa`, hardware-flashed
+on COM4), which independently arrived at GPIO 11/12 being the microSD CMD/CLK lines
+while fixing an unrelated touch-pin mis-assignment.
+
+**Conflict check against this table**: clean. GPIO 11/12/13 don't collide with
+`TFT_*` (45/47/21/48/40/39/1/38), `TOUCH_*` (4/8), or `BATTERY_ADC` (5).
+
+**Still open** (needs the physical board — this is the issue's blocker, narrowed but
+not closed):
+- The vendor spec sheet (`JC3248W535C_I_Y`) describes the TF card interface as
+  *"reserve[d]"* and its labeled rear-connector photo shows no SD slot at all
+  (Boot, Reset, Type-C, battery/power JSTs, 8P IO, HC1.0 4P, Speak — no card slot).
+  Whether the slot is actually populated on a given unit needs a look at the board.
+- `pincfg.h` and the sibling repo disagree with this repo's touch pin comment on one
+  unrelated line (`TOUCH_PIN_NUM_INT` 3 vs. this board's documented NC) — a reminder
+  that these are a close but not necessarily identical board revision, so a
+  continuity check (multimeter, slot pads to GPIO 12/11/13) before wiring is still
+  the safer first step, per the issue.
+
 ---
 
 ## 3. Waveshare ESP32-S3-ETH + PoE Module
