@@ -38,16 +38,6 @@ Since physical target hardware (smart display JC3248W535EN, POE boards, etc.) is
 
 ---
 
-### 🔵 Issue #33: [Feature Request] PCAP Dump Endpoint for Wireshark analysis
-* **Status**: ⏳ Open / Planned (Backlog)
-* **Labels**: `feature-request`, `diagnostics`
-* **Severity**: Low
-
-#### Description
-Expose an HTTP endpoint `/api/diagnostics/pcap` to dump a live ring-buffer of SIP packets in PCAP format for quick network troubleshooting.
-
----
-
 ## Feature-Parity Backlog (LAN PBX)
 
 Generic desk-PBX features to bring pocket-dial to parity with full-size PBXes. **All of these are
@@ -134,6 +124,20 @@ until a fork (or a future pass here) adds the routing policy.
 ---
 
 ## Resolved Issues
+
+### 🟢 Issue #33: [Feature Request] PCAP Dump Endpoint for Wireshark analysis
+* **Status**: ✅ Resolved 2026-08-28
+* **Labels**: `feature-request`, `diagnostics`
+* **Severity**: Low
+
+#### Resolution
+The underlying ask — a live ring-buffer of SIP packets downloadable in real libpcap format for Wireshark — was already fully built out by `607bd91` (`GET /api/pcap`) and hardened by Issue #105 (exact wire bytes, not a re-serialization): `PcapCapture::toPcapFile()` already emits a standard 24-byte global header (magic `0xa1b2c3d4`, `LINKTYPE_ETHERNET`) followed by one 16-byte per-packet record header + a synthesized Ethernet+IPv4+UDP frame per captured entry, straight off the same bounded ring `/api/trace`'s JSON view reads. What this issue's own text asked for was specifically the path `/api/diagnostics/pcap`, which didn't exist — the tracker had drifted out of sync with what actually shipped under `/api/pcap`.
+
+Closed by adding `GET /api/diagnostics/pcap` in `HttpServer.cpp` as a second route to the exact same `sendApiPcap()` handler `/api/pcap` already uses — same `PcapCapture` ring, same session gate, same `application/vnd.tcpdump.pcap` response — rather than an HTTP redirect, so a plain `curl -o dump.pcap http://<device>/api/diagnostics/pcap` works without `-L` and opens directly in Wireshark. No second capture mechanism and no new allocation path: both routes read the one ring `RequestsHandler` already maintains. `docs/API.md`'s endpoint catalog and the `/api/pcap` section now note the alias.
+
+Covered by a new test in `tests/PcapCapture_test.cpp`, `ApiDiagnosticsPcapServesValidGlobalHeaderAndOneRecordOverRealSocket`: drives a real `HttpServer`+`RequestsHandler` pair over an actual TCP socket (mirroring `HttpTraceCommand_test.cpp`'s pattern), sends a REGISTER through the handler, then fetches `GET /api/diagnostics/pcap` and asserts on the wire bytes — the global header's magic number and `LINKTYPE_ETHERNET`, and the first record header's `incl_len`/`orig_len` agreement and that its declared frame length actually fits the response body and contains the captured SIP text verbatim. Full host suite passing. Full detail: https://github.com/GlomarGadaffi/pocket-dial/issues/33
+
+---
 
 ### 🟢 Issue #35 / #113: Zero-Touch Phone Auto-Provisioning (HTTP) — scope clarified to onboarding/admin-window reachability
 * **Status**: ✅ Resolved 2026-08-28 (documentation clarification; no code change — the behavior was already correct)

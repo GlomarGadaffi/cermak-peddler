@@ -495,6 +495,24 @@ void HttpServer::handleClient(int clientSock)
 			sendApiTrace(clientSock);
 		}
 	}
+	else if (req.method == "GET" && req.path == "/api/diagnostics/pcap")
+	{
+		// Issue #33: the path the original feature request actually asked for.
+		// Deliberately a second route to the SAME handler as /api/pcap rather
+		// than an HTTP redirect — a plain `curl -o dump.pcap .../pcap` should
+		// work without `-L`, and there is no second capture mechanism here:
+		// sendApiPcap() reads the same PcapCapture ring either way. Same
+		// sensitivity/gate as /api/pcap for the same reason.
+		if (AdminAuth::isProvisioned() && !isAuthed(req))
+		{
+			sendResponse(clientSock, 401, "Unauthorized", "application/json",
+			             "{\"error\":\"authentication required\"}");
+		}
+		else
+		{
+			sendApiPcap(clientSock);
+		}
+	}
 	else if (req.method == "POST" && req.path == "/api/dnd")
 	{
 		// Mutating: same gate as /api/kill (same-origin + auth once provisioned).

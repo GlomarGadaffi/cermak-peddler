@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased (issue-33-pcap-dump-endpoint) - 2026-08-28
+
+### Added — `GET /api/diagnostics/pcap` (#33)
+
+- Added `GET /api/diagnostics/pcap`, the path Issue #33's feature request
+  actually asked for. It's a second route to the exact same `sendApiPcap()`
+  handler `GET /api/pcap` already uses (shipped in `607bd91`, hardened for
+  wire-byte fidelity by #105) — same bounded `PcapCapture` ring, same session
+  gate, same `application/vnd.tcpdump.pcap` response with a
+  `Content-Disposition: attachment` header — so no second capture mechanism
+  and no new allocation path were introduced. A real 24-byte libpcap global
+  header (magic `0xa1b2c3d4`, `LINKTYPE_ETHERNET`) followed by one 16-byte
+  record header + synthesized Ethernet/IPv4/UDP frame per captured packet, so
+  `curl -o dump.pcap http://<device>/api/diagnostics/pcap` opens directly in
+  Wireshark without following a redirect.
+- `docs/API.md`'s endpoint catalog and `/api/pcap` section now note the alias.
+- New test in `tests/PcapCapture_test.cpp`,
+  `ApiDiagnosticsPcapServesValidGlobalHeaderAndOneRecordOverRealSocket`: drives
+  a real `HttpServer` + `RequestsHandler` pair over an actual TCP socket,
+  captures a REGISTER, then fetches the new endpoint and checks the actual
+  bytes on the wire — global header magic/linktype, and the first record's
+  `incl_len`/`orig_len` agreement, frame-fits-in-body, and verbatim SIP payload.
+
 ## Unreleased (issue-106-104-108-112-misc-bugs) - 2026-08-19
 
 Four small, independently-filed correctness bugs plus one CI hygiene fix,
