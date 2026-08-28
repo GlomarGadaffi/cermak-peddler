@@ -23,6 +23,34 @@
   bytes on the wire — global header magic/linktype, and the first record's
   `incl_len`/`orig_len` agreement, frame-fits-in-body, and verbatim SIP payload.
 
+## Unreleased (issue-74-broadcast-hold) - 2026-08-28
+
+### Fixed — Hold/resume on broadcast (ring-group) calls silently discarded (#74)
+
+- `RequestsHandler::onOk`'s mid-dialog re-INVITE relay (the block that forwards
+  a hold/resume `200 OK` to the opposite leg once a session is `Connected` or
+  `Held`) explicitly excluded broadcast/ring-group sessions with
+  `!isBroadcast()`. Since the broadcast-specific block below it only runs the
+  first-answer connect path when `state == Invited`, a hold/resume `200 OK`
+  arriving in `Connected`/`Held` state matched neither branch and was silently
+  dropped — the offer reached the held leg fine (`onReinvite` never checked
+  `isBroadcast()`), but the answer never made it back, so the re-INVITE
+  transaction timed out client-side and the phone reported hold as failed.
+
+  Fixed by dropping the `!isBroadcast()` restriction: once a broadcast session
+  is `Connected`, `getSrc()`/`getDest()` name exactly the two live legs (the
+  original caller and the one target that answered) the same way a unicast
+  session's do, so the same source-address peer lookup now relays a
+  hold/resume `200 OK` for either. The `#69b` non-destructive guard
+  (`state == Invited` gating the connect/cancel path) is unaffected — it and
+  the relay block above it are disjoint on session state.
+
+  New coverage in `tests/BroadcastHoldResume_test.cpp` drives a full 999
+  broadcast call end-to-end through connect → hold → resume and asserts the
+  relay actually reaches the held leg's peer (not just that nothing crashes),
+  while also pinning `#69b`: exactly one `CANCEL` is ever sent to the losing
+  fork target across the whole hold/resume sequence.
+
 ## Unreleased (issue-106-104-108-112-misc-bugs) - 2026-08-19
 
 Four small, independently-filed correctness bugs plus one CI hygiene fix,

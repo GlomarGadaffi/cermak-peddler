@@ -42,6 +42,11 @@ add_executable(sip_parser_tests
     ArpLookup_test.cpp
     Pbx_test.cpp
     PageZone_test.cpp
+    # Issue #74: broadcast/ring-group hold-resume relay. onOk()'s Connected/Held
+    # relay used to explicitly exclude broadcast sessions, so a hold re-INVITE's
+    # 200 OK was silently dropped instead of reaching the held leg. Drives a full
+    # 999 broadcast call through connect -> hold -> resume via handle().
+    BroadcastHoldResume_test.cpp
     Rtp_test.cpp
     RtpReceiver_test.cpp
     PlayoutBuffer_test.cpp
