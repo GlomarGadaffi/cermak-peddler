@@ -168,6 +168,43 @@ namespace pbx
 		}
 		return out;
 	}
+
+	// ── Directed / group call pickup (Issue #68) ──────────────────────────────
+	//
+	// Design choice: pickup groups are NOT a new config table. They reuse
+	// ring-group membership (RingGroup::members, above) exactly as-is: two
+	// extensions are pickup-eligible for each other iff they are both members
+	// of at least one configured ring group — regardless of that group's mode
+	// (RingAll or Hunt; pickup only cares who's in the list, not how it rings).
+	// An operator who already set up a "sales" or "support" ring group gets a
+	// pickup group for free, with no new dashboard/NVS surface to add or keep
+	// in sync. The acceptance criteria for this feature ("only same-pickup-
+	// group calls eligible") is written without carving out directed pickup,
+	// so BOTH *8 (group) and **<ext> (directed) are restricted to the picker's
+	// own ring-group co-members — see RequestsHandler::pickupPeersOf().
+	//
+	// *8 is the group-pickup code; **<ext> is directed pickup of a specific
+	// extension. Both are dialed as the To user-part of an INVITE, exactly
+	// like the 700-709 park orbits and 980-989 page zones (isValidAor already
+	// allows '*' in an AOR for this reason).
+
+	// True iff `ext` is the group-pickup star code.
+	inline bool isGroupPickupCode(const std::string& ext)
+	{
+		return ext == "*8";
+	}
+
+	// Extracts the target extension from a directed-pickup code ("**204" ->
+	// "204"). Returns "" for anything not prefixed "**" and for "**" with no
+	// extension following it — both are treated as "no target" by the caller.
+	inline std::string directedPickupTarget(const std::string& ext)
+	{
+		if (ext.size() > 2 && ext[0] == '*' && ext[1] == '*')
+		{
+			return ext.substr(2);
+		}
+		return {};
+	}
 }
 
 #endif

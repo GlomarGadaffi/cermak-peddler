@@ -88,6 +88,28 @@ TEST(Pbx, JoinRoundTripsSplit) {
     EXPECT_EQ(pbx::joinMembers(m), "600,601,602");
 }
 
+// ── Call pickup codes (Issue #68) ─────────────────────────────────────────────
+
+TEST(Pbx, IsGroupPickupCodeMatchesOnlyStarEight) {
+    EXPECT_TRUE(pbx::isGroupPickupCode("*8"));
+    EXPECT_FALSE(pbx::isGroupPickupCode("*80"));
+    EXPECT_FALSE(pbx::isGroupPickupCode("8"));
+    EXPECT_FALSE(pbx::isGroupPickupCode(""));
+}
+
+TEST(Pbx, DirectedPickupTargetExtractsExtensionAfterDoubleStar) {
+    EXPECT_EQ(pbx::directedPickupTarget("**204"), "204");
+    EXPECT_EQ(pbx::directedPickupTarget("**100"), "100");
+}
+
+TEST(Pbx, DirectedPickupTargetEmptyForNonMatchingInput) {
+    EXPECT_EQ(pbx::directedPickupTarget("**"), "");      // no extension named
+    EXPECT_EQ(pbx::directedPickupTarget("*8"), "");       // that's the group code
+    EXPECT_EQ(pbx::directedPickupTarget("*204"), "");     // single star, not directed pickup
+    EXPECT_EQ(pbx::directedPickupTarget("204"), "");      // plain extension
+    EXPECT_EQ(pbx::directedPickupTarget(""), "");
+}
+
 // ── Call-forward config value type ───────────────────────────────────────────
 
 TEST(Pbx, ForwardConfigEmptyByDefault) {

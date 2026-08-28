@@ -43,12 +43,6 @@ signaling and tracks state. See **Non-Goals** below for the hard scope boundary.
 * **Acceptance**: a phone subscribed to ext X gets NOTIFY on X ringing/answered/idle; subscription table is capacity-capped; expiry refresh handled; no unbounded fan-out. A real-hardware smoke-test pass on a BLF-capable phone is tracked separately above (`hardware-testing` label).
 * **Notes**: Promotes `FEATURE_ROADMAP.md` P2 "BLF / presence." Pairs with provisioning (BLF keys are provisionable).
 
-### 🔵 Issue #68: [Feature] Directed Call Pickup (pickup groups)
-* **Status**: ⏳ Open / Planned (Backlog)
-* **Labels**: `feature`, `sip`, `call-control`
-* **Description**: Answer a ringing peer's call from your own phone via a pickup code (`*8` group pickup or `**<ext>` directed). Reuses the fork/`Session` machinery and the registrar's view of in-progress INVITEs; the call lands P2P on the picker — no server media.
-* **Acceptance**: while ext A rings, ext B dials the pickup code and connects to the caller with P2P SDP; only same-pickup-group calls eligible; race with A answering resolves cleanly (one wins, other `486`/cancel).
-
 ### ⚪ Non-Goals (hard scope boundary)
 pocket-dial's default call path stays **LAN-only, peer-to-peer media** — every feature above is
 signaling-only and needs none of the below. **Out of scope, intentionally not implemented here:**
@@ -218,6 +212,25 @@ the N conference `RtpSender`s share the fixed server media port, so the first bi
 fall back to ephemeral source ports. Note that #75 is one of the entries where this tracker's
 numbering has diverged from GitHub's — GitHub issue 75 is an unrelated, closed Phase-1 item. Full
 detail: https://github.com/GlomarGadaffi/pocket-dial/pull/124
+
+---
+
+### 🟢 Issue #68: [Feature] Directed Call Pickup (pickup groups)
+* **Status**: ✅ Resolved 2026-08-28 (`*8` group pickup, `**<ext>` directed pickup)
+* **Labels**: `feature`, `sip`, `call-control`
+
+#### Resolution
+Implemented as a new virtual-extension intercept in `onInvite`, following the exact `onParkInvite` (#65) / `isPageZoneExt`/`findPageZone` (#66) pattern: `*8` and `**<ext>` are dialed as the To user-part of an INVITE, just like the `700`-`709` park orbits and `980`-`989` page zones (`isValidAor` already allowed `*` in an AOR for this reason).
+
+**Pickup groups reuse ring-group membership as-is** — a deliberate reuse, not a new config table. Two extensions are pickup-eligible for each other iff `setRingGroup`/`getRingGroups` already has them as co-members of the same group (RingAll or Hunt; pickup only cares who's in the list, not how it rings). An operator who already set up a "sales" or "support" ring group gets a pickup group for free, with no new dashboard/NVS surface to add or keep in sync. Both `*8` and `**<ext>` are restricted to the picker's own group — the acceptance criteria ("only same-pickup-group calls eligible") don't carve out directed pickup, so an unrestricted-directed-pickup design (closer to some commercial PBXes) was considered and rejected in favor of matching the written criteria exactly.
+
+Picking up a call: `RequestsHandler::findRingingSessionAmong` scans `_sessions` for the oldest `Invited` session ringing one of the eligible candidate extensions (a direct call's target comes from its now-always-retained original INVITE; a broadcast/ring-all/hunt call's from its `pendingTargets`). `onPickup` then draws the picker's `Session` and both 200 OK messages *before* any mutation (the pool-exhaustion discipline `#101A`/`#71` established), completes the caller's still-open INVITE transaction with the picker's SDP as the answer, answers the picker's own INVITE with the caller's original SDP, and sends a CANCEL to every other still-ringing fork of that call (`buildCancel`, already used by the hunt-group timeout path) — picking up any one member of a ring-all/hunt group ends the whole group ring, exactly like a normal answer does.
+
+The two resulting SIP dialogs (different Call-IDs — the picker dialed a brand-new INVITE) are bridged via `Session::peerCallID` + `setDialogHeaders`, mirroring the pattern `sweepSessionTimers` already uses to BYE both legs of a single session, generalized across two. `onBye` gained a `peerCallID`-aware branch: a hangup on either bridged leg is translated into a freshly-built, correctly-addressed BYE on the *other* leg's own dialog (`buildServerBye`) rather than a raw relay, which would carry the wrong Call-ID and get rejected `481` by the peer's phone. The branch reuses #72's exact guard (skip a BYE built from an empty From/To rather than emit the malformed packet #72 was filed against) — `ParkOrbit`'s retrieve/ring-back paths also set `peerCallID` but never call `setDialogHeaders()`, so this relay is a no-op for them today; a park leg still gets the `endCall()`/CDR cleanup, just not a peer-phone BYE, which is strictly better than the previous behavior (a stray BYE 404'd back at the sender) without pickup's PR reaching into park's own state machine to wire up headers it doesn't otherwise need.
+
+**The race** ("whichever side answers first wins, the other never both connects"): `onOk` now drops a late 200 OK for a session that's already connected to someone else (state no longer `Invited`, and the responder isn't the already-connected `dest`) instead of blindly overwriting the winner — a CANCEL and a 2xx can legally cross on the wire per RFC 3261. Losing the race gets `486 Busy Here` in both directions: the target answering first leaves pickup nothing to find (486, target's dest untouched); pickup answering first and then a late answer from the CANCELed fork is silently dropped (matches the existing precedent for a post-connect broadcast answer).
+
+New tests: `tests/CallPickup_test.cpp` — directed pickup (target CANCELed, swapped-SDP 200 OKs, both sessions bridged), group pickup (oldest ringing call wins, the newer one is left alone), a non-peer picker (486, target undisturbed), the race in both directions, the cross-dialog BYE bridge teardown (asserted at the wire level: the picker's BYE carries the *picker's own* Call-ID, never the caller's), and a Park-retrieve BYE pinning the #72-style guard (session cleanup happens, but no malformed empty-header BYE is ever sent). Plus `tests/Pbx_test.cpp` coverage for the pure `isGroupPickupCode`/`directedPickupTarget` parsers. Host-tested (211 tests passing, one pre-existing unrelated timing-flaky `AdminHttpGate` test excluded).
 
 ---
 

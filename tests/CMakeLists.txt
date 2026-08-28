@@ -80,6 +80,13 @@ add_executable(sip_parser_tests
     # build their requests by hand, so only a byte-level assertion catches header
     # defects like a doubled "Call-ID:" in the park retrieve re-INVITE.
     ParkOrbit_test.cpp
+    # Issue #68: directed (**<ext>) and group (*8) call pickup — reuses ring-
+    # group membership as the pickup-group table (see PbxConfig.hpp). Drives
+    # RequestsHandler::handle() end to end (REGISTER/INVITE/OK/BYE) so the
+    # CANCEL-the-loser fork, the swapped-SDP 200 OKs, the answer-first-wins
+    # race in both directions, and the cross-dialog BYE bridge are all
+    # asserted at the wire level.
+    CallPickup_test.cpp
     RegisterBeeper_test.cpp
     BlfSubscriptions_test.cpp
     DashboardSnapshot_test.cpp
