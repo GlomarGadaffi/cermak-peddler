@@ -59,6 +59,10 @@ add_executable(sip_parser_tests
     AnchorClient_test.cpp
     MediaBridge_test.cpp
     MixBus_test.cpp
+    # Issue #75: MixBus wired into MediaBridge (BUS mode) and made dialable as the
+    # 888 meet-me room. Covers the N-way minus-self mix end-to-end through the real
+    # µ-law rim, a leg leaving mid-conference, and the RequestsHandler 888 intercept.
+    ConferenceRoom_test.cpp
     # Phase 0 of docs/PLAN_ADMIN_HTTP_ONLY.md: dark-by-default HTTP admin plane
     # test contract. Pulls in HttpServer.cpp for the first time in this target.
     AdminHttpGate_test.cpp
@@ -124,6 +128,11 @@ add_executable(sip_parser_tests
     # the ESP32-S3 PIE vector kernels (src/SIP/pie/) are opt-in and not built here.
     ../src/SIP/MixBus.cpp
     ../src/SIP/mix_kernels_scalar.cpp
+    # The meet-me room that makes the bus dialable (Issue #75): one MixBus, N
+    # {RtpReceiver, RtpSender, MediaBridge} legs, and the ONE periodic mix-tick
+    # driver. Host-compilable — the driver is a std::thread off-device and the
+    # tests step the clock with tickOnce() instead of starting it.
+    ../src/SIP/ConferenceRoom.cpp
     ../src/SIP/RequestsHandler.cpp
     ../src/SIP/TransactionLayer.cpp
     ../src/SIP/Registrar.cpp

@@ -164,6 +164,18 @@
 #define POCKETDIAL_MAX_DIAL_RULES 16
 #endif
 
+// Number of legs the local N-way conference room (virtual extension 888) accepts —
+// see ConferenceRoom.hpp and docs/CONFERENCE_MIXER.md. Must be ≤ MixBus::MAX_PORTS (8).
+//
+// Unlike the peer-to-peer call paths, a conference leg IS server media: it costs one
+// Session slot, one RTP receive task, one RTP send task and two MixBus rings (~6 KB)
+// per participant, all on top of the room's own mix-tick task. Four legs is a desk-PBX
+// meet-me room that comfortably fits the constrained node; raise it only alongside
+// POCKETDIAL_MAX_SESSIONS and a look at free heap.
+#ifndef POCKETDIAL_CONF_LEGS
+#define POCKETDIAL_CONF_LEGS 4
+#endif
+
 // Maximum concurrent RFC 3261 §17 transaction records tracked for retransmit
 // timers.  Each InviteClient slot tracks one outgoing INVITE fork (Timer A/B):
 // retransmit interval doubles from T1 until a provisional stops it, or Timer B

@@ -109,6 +109,64 @@
   three actions; the stale-target `404`; and a real-socket round-trip of
   `POST /api/dialplan` through `HttpServer`. Full host suite **233/233**.
 
+## Unreleased (issue-75-mixbus-conference) - 2026-08-28
+
+Local N-way conferencing: `MixBus` is wired into `MediaBridge` and dialable.
+Full host suite: 216/216 passing; cppcheck 2.21.0 clean; ESP-IDF `esp32s3`/`eth`
+firmware build clean.
+
+### Added — `MixBus` wired into `MediaBridge`, conference extension `888` (#75)
+
+- **`MediaBridge` BUS mode.** `init()` takes an optional `MixBus*`. With a bus,
+  the two media callbacks swap at their far end: decoded handset µ-law goes to
+  `MixBus::inputFrame()` instead of `AnchorClient::writeAudio()`, and the sender
+  pulls `MixBus::outputFrame()` — the saturated sum of every *other* port —
+  instead of draining `_playoutBuffer`. `startBridge()` claims the port with
+  `attach()` before opening any socket (a full bus fails with nothing to unwind);
+  every later failure path and `stopBridge()` `detach()` it, non-blocking, so the
+  mix tick reclaims the rings and the remaining legs are never disturbed. The
+  callback bodies moved out of their lambdas into named `onHandsetRtp()` /
+  `fillHandsetTx()` members so the host suite can drive the real code path (on
+  host `RtpReceiver`/`RtpSender::start()` are stubs that never invoke a callback).
+  Passing no bus keeps the historical 1:1 anchor behaviour unchanged; in BUS mode
+  `feedRx()` now returns `false` rather than writing into a buffer nothing reads
+  (giving the anchor leg its own port is follow-up work, see CONFERENCE_MIXER.md §7).
+
+- **`ConferenceRoom`** (`src/SIP/ConferenceRoom.*`): one `MixBus`,
+  `POCKETDIAL_CONF_LEGS` (default 4) legs of `{RtpReceiver, RtpSender,
+  MediaBridge}`, and **exactly one** 20 ms mix-tick driver — a Core-0 FreeRTOS
+  task at `RtpSender`'s media priority on device, a `std::thread` off it. Not hung
+  off a leg's sender cadence: N senders against one bus would be N clocks racing to
+  drain the same rings. `tickOnce()` steps the clock for tests.
+
+- **Virtual extension `888`**, intercepted in `onInvite()` alongside
+  `777`/`999`/`440`/`700`–`709`. The server answers 200 OK advertising *that leg's*
+  RTP receive port with a `sendrecv` SDP (`buildMediaSdp()` gained a direction
+  flag; `440` stays `sendonly`) and joins the caller — N callers dialing `888` are
+  N legs of one conference. Ordering mirrors the 440 path (#115): join → session →
+  message pool → publish, unwinding the leg on any earlier failure. A dial past the
+  cap gets 486 Busy Here and consumes no session slot. `endCall()` releases the leg,
+  making it the single teardown point for BYE, CANCEL, session-timer expiry and the
+  orphan sweep; `888` also joins the reserved list forwards and ring groups may not
+  shadow. The room is created on first dial-in and then kept alive (its rings are
+  ~50 KB, and churning the tick task under live legs is the race `Draining` exists
+  to avoid).
+
+- **`tests/ConferenceRoom_test.cpp`** (15 tests): 3- and 4-leg mixes end-to-end
+  through the real µ-law rim (expectations round-tripped through G.711, not
+  hardcoded sums), the over-saturation counterexample asserted through the bridges,
+  a leg leaving mid-conference, port reclaim/reuse, the room cap and
+  one-leg-per-Call-ID, proof the tick driver actually ticks, and the `888` intercept
+  driven through a real `RequestsHandler` (including a hold re-INVITE, declined 488).
+
+- `onReinvite()`/`onUpdate()`'s virtual-leg guard now covers `888` alongside `777`:
+  a conference leg's session "dest" carries the *caller's own* address, so relaying a
+  hold offer would send the phone its own re-INVITE back. Declined 488 instead.
+
+- `RequestsHandler::getConferenceLegs()` exposes the live leg count.
+  `POCKETDIAL_CONF_LEGS` added to `PoolConfig.hpp`. The PIE vector path
+  (`POCKETDIAL_MIXBUS_PIE`, `src/SIP/pie/`) is untouched and still opt-in.
+
 ## Unreleased (issue-106-104-108-112-misc-bugs) - 2026-08-19
 
 Four small, independently-filed correctness bugs plus one CI hygiene fix,
