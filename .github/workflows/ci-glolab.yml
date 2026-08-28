@@ -1,0 +1,190 @@
+name: Post-Merge Host Verification (glolab)
+
+# Runs the host build/test job a second time on the self-hosted 'glolab' runner,
+# purely as a fast post-merge confidence check (measured ~4min vs ~8-9min on
+# ubuntu-latest). Deliberately NOT triggered on pull_request: this workflow only
+# fires on push to main (i.e. after a PR has already merged) or manual dispatch,
+# so code from an untrusted fork PR can never execute on this runner. The
+# pull_request-triggered ci.yml on ubuntu-latest remains the actual PR gate.
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: glolab-host-verify
+  cancel-in-progress: true
+
+jobs:
+  build-and-test-host-glolab:
+    name: Host Build & Simulation Testing (glolab, post-merge)
+    runs-on: [self-hosted, glolab]
+    env:
+      # Kept in sync with the CPPCHECK_VERSION pin in ci.yml (Issue #112).
+      CPPCHECK_VERSION: 2.21.0
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # No "Install System Dependencies" step here: this runner is a persistent,
+      # non-ephemeral host and the ghrunner service account has no sudo access
+      # by design, so dependencies (cmake, build-essential, clang-tidy, jq,
+      # curl) are provisioned once out-of-band instead of via apt-get in CI.
+
+      - name: Cache pinned cppcheck build
+        id: cppcheck-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/cppcheck-install
+          key: ${{ runner.os }}-${{ runner.arch }}-cppcheck-${{ env.CPPCHECK_VERSION }}
+
+      - name: Build & Install cppcheck (pinned version)
+        if: steps.cppcheck-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -sSL -o cppcheck.tar.gz \
+            "https://github.com/danmar/cppcheck/archive/refs/tags/${CPPCHECK_VERSION}.tar.gz"
+          tar xzf cppcheck.tar.gz
+          cmake -S "cppcheck-${CPPCHECK_VERSION}" -B cppcheck-build \
+                -DCMAKE_BUILD_TYPE=Release -DUSE_MATCHCOMPILER=ON \
+                -DBUILD_TESTS=OFF -DBUILD_GUI=OFF \
+                -DCMAKE_INSTALL_PREFIX="$HOME/cppcheck-install"
+          cmake --build cppcheck-build -j"$(nproc)"
+          cmake --install cppcheck-build
+
+      - name: Run Static Analysis (cppcheck)
+        run: |
+          export PATH="$HOME/cppcheck-install/bin:$PATH"
+          cppcheck --version
+          cppcheck --error-exitcode=1 \
+                   --enable=warning,performance \
+                   --inline-suppr \
+                   --suppress=missingIncludeSystem \
+                   --suppress=unmatchedSuppression \
+                   --suppress=*:main/ui/qrcode.c \
+                   --suppress=*:main/ui/qrcode.h \
+                   --suppress=unknownMacro:main/ui/ui.cpp \
+                   -I src/Helpers -I src/SIP -I main \
+                   src/ main/
+
+      - name: Configure CMake (Host Build)
+        run: |
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Build Host Binary
+        run: |
+          cmake --build build --config Release
+
+      - name: Static Analysis (clang-tidy over src/**)
+        continue-on-error: true
+        run: |
+          echo "Running clang-tidy over first-party sources (src/**)..."
+          CHECKS="-*,bugprone-*,performance-*,clang-analyzer-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions"
+          : > clang-tidy.log
+          while IFS= read -r f; do
+            echo "--- $f ---"
+            clang-tidy -p build --quiet \
+                       --header-filter='.*/src/.*' \
+                       --checks="$CHECKS" \
+                       "$f" 2>&1 | tee -a clang-tidy.log || true
+          done < <(find src -name '*.cpp' | sort)
+          COUNT=$(grep -cE "warning:|error:" clang-tidy.log || true)
+          echo "clang-tidy total diagnostics: ${COUNT} (pre-existing baseline ~59)"
+
+      - name: Run Unit Test Suite (GoogleTest via CTest)
+        run: |
+          ctest --test-dir build/tests --output-on-failure
+
+      - name: Verify Partition Table (dual-OTA layout guard)
+        run: |
+          python3 - <<'PYEOF'
+          import re, sys
+          PATH = "partitions.csv"
+          FLASH = 16 * 1024 * 1024  # ESP32-S3 16 MB
+
+          def parse_num(s):
+              s = s.strip()
+              m = re.fullmatch(r'(0[xX][0-9a-fA-F]+|\d+)([KkMm]?)', s)
+              if not m:
+                  raise ValueError("cannot parse number %r" % s)
+              base = int(m.group(1), 0)
+              suf = m.group(2).lower()
+              if suf == 'k': base *= 1024
+              elif suf == 'm': base *= 1024 * 1024
+              return base
+
+          rows = []
+          with open(PATH) as f:
+              for line in f:
+                  line = line.strip()
+                  if not line or line.startswith('#'):
+                      continue
+                  parts = [p.strip() for p in line.split(',')]
+                  if len(parts) < 5:
+                      continue
+                  name, ptype, subtype, off, size = parts[:5]
+                  rows.append((name, ptype, subtype, parse_num(off), parse_num(size)))
+
+          names = {r[0] for r in rows}
+          errors = []
+          for required in ("ota_0", "ota_1", "otadata"):
+              if required not in names:
+                  errors.append("missing required partition '%s'" % required)
+          if "factory" in names:
+              errors.append("partition 'factory' present — layout regressed to single-slot (OTA disabled)")
+          for name, ptype, subtype, off, size in rows:
+              if off + size > FLASH:
+                  errors.append("partition '%s' ends at 0x%x, exceeds 16MB (0x%x)" % (name, off + size, FLASH))
+          slots = {r[0]: r for r in rows if r[0] in ("ota_0", "ota_1")}
+          if "ota_0" in slots and "ota_1" in slots:
+              if slots["ota_0"][4] != slots["ota_1"][4]:
+                  errors.append("ota_0 size (0x%x) != ota_1 size (0x%x)" % (slots["ota_0"][4], slots["ota_1"][4]))
+              for s in ("ota_0", "ota_1"):
+                  if slots[s][1] != "app":
+                      errors.append("%s is type '%s', expected 'app'" % (s, slots[s][1]))
+
+          if errors:
+              print("PARTITION GUARD: FAIL")
+              for e in errors:
+                  print("  - " + e)
+              sys.exit(1)
+          print("PARTITION GUARD: PASS (dual-OTA layout intact)")
+          for name, ptype, subtype, off, size in rows:
+              print("  %-10s type=%-5s sub=%-8s off=0x%x size=0x%x end=0x%x" % (name, ptype, subtype, off, size, off + size))
+          PYEOF
+
+      - name: Execute HTTP API Smoke Suite (host)
+        run: |
+          echo "Starting simulated SIP & HTTP Server (5060 SIP / 8080 dashboard)..."
+          ./build/SipServer --ip 127.0.0.1 --port 5060 --web 8080 </dev/null &
+          SERVER_PID=$!
+          export SERVER_PID
+
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/ || echo 000)
+            [ "$code" = "200" ] && break
+            sleep 0.5
+          done
+
+          if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+            echo "Error: SipServer failed to start or crashed on boot."
+            exit 1
+          fi
+          echo "Simulated Server is active (PID: $SERVER_PID). Running test_api.sh..."
+
+          set +e
+          bash tests/http/test_api.sh 127.0.0.1:8080
+          RC=$?
+          set -e
+
+          echo "Shutting down Simulated Server..."
+          kill -9 "$SERVER_PID" 2>/dev/null || true
+
+          if [ "$RC" -ne 0 ]; then
+            echo "HTTP API smoke suite FAILED (exit $RC)."
+            exit "$RC"
+          fi
+          echo "HTTP API smoke suite PASSED."
