@@ -33,6 +33,12 @@
 // ETH_W5500_DEFAULT_CONFIG, esp_eth_mac_new_w5500, esp_eth_phy_new_w5500) is
 // declared by esp_eth.h above, and these headers do not exist — including them
 // unconditionally is what broke the `eth` CI matrix on v5.1.2/v5.2.1.
+//
+// cppcheck (Issue #112): the host lint job's include path (-I src/Helpers
+// -I src/SIP -I main) has no ESP-IDF tree on it, so it can't see the real
+// `esp_idf_version.h` that defines ESP_IDF_VERSION_VAL — a genuine ESP-IDF
+// build (idf.py, Job 2 of this workflow) has it and evaluates this #if fine.
+// cppcheck-suppress syntaxError
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
 #include "esp_eth_mac_w5500.h"
 #include "esp_eth_phy_w5500.h"

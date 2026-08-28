@@ -110,6 +110,11 @@ void DnsServer::dns_task(void* pvParameters) {
     tv.tv_usec = 500000;   // 500 ms
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+    // Standard BSD-sockets idiom: bind()/recvfrom() take `struct sockaddr *`,
+    // and casting the concrete `sockaddr_in` up to it is how every sockets API
+    // is used in C/C++ -- not the raw-memory reinterpretation dangerousTypeCast
+    // is built to catch. False positive.
+    // cppcheck-suppress dangerousTypeCast
     int err = bind(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
     if (err < 0) {
         ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
@@ -138,6 +143,9 @@ void DnsServer::dns_task(void* pvParameters) {
     }
 
     while (self->_running.load(std::memory_order_acquire)) {
+        // Same BSD-sockets idiom as the bind() above -- recvfrom() also takes
+        // `struct sockaddr *`. False positive.
+        // cppcheck-suppress dangerousTypeCast
         int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer), 0, (struct sockaddr *)&source_addr, &socklen);
         if (len < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {

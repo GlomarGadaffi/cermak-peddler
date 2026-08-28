@@ -120,6 +120,10 @@ public:
 	struct ProvisioningInfo
 	{
 		std::string extension;
+		// cppcheck flags this as uninitMemberVarNoCtor. False positive:
+		// ProvisioningInfo's only construction site (findProvisioningInfo's
+		// return) always brace-initialises both fields.
+		// cppcheck-suppress uninitMemberVarNoCtor
 		bool authRequired;
 	};
 	std::optional<ProvisioningInfo> findProvisioningInfo(const std::string& mac);
@@ -157,6 +161,15 @@ public:
 	// ── Admin extension (Task 2B) ─────────────────────────────────────────────────
 	// NVS-persisted extension identity for the administrative endpoint.
 	// Default "1001". Loaded from NVS namespace "pbxcfg", key "admin_ext" at boot.
+	// cppcheck suggests returning `const std::string&` here (returnByReference).
+	// Deliberately not applied: _adminExt is mutated by saveAdminExt()/
+	// loadAdminExt() from other call paths with no lock of its own (callers of
+	// this getter are not required to hold _mutex — dashboard/HTTP reads go
+	// through here off the SIP thread). Returning by value at least keeps the
+	// caller's copy independent once this call returns; a reference would
+	// additionally dangle/tear if a concurrent save reallocates the string
+	// while the caller still holds it.
+	// cppcheck-suppress returnByReference
 	std::string getAdminExt() const;
 
 	// ── Admin HTTP-open deadline (PLAN_ADMIN_HTTP_ONLY.md Phase 2) ────────────────
@@ -640,6 +653,11 @@ private:
 	// Issue #38: token bucket keyed by source IPv4 (network-order s_addr).
 	struct RateBucket
 	{
+		// cppcheck flags this as uninitMemberVarNoCtor. False positive: every
+		// RateBucket is created via `_rateBuckets[ip] = { 40.0, now }` (below),
+		// so `tokens` is overwritten immediately and is never read from the
+		// briefly-default-constructed instance operator[] creates first.
+		// cppcheck-suppress uninitMemberVarNoCtor
 		double tokens;
 		std::chrono::steady_clock::time_point last;
 	};

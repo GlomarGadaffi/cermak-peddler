@@ -116,10 +116,16 @@ public:
 	// tracer, which polls GET /api/trace and appends whatever it hasn't already
 	// shown (`seq` is monotonic and never reused, so the client can track a
 	// high-water mark instead of the server tracking per-client state).
+	// cppcheck flags the scalar members below (uninitMemberVarNoCtor). False
+	// positive: TraceRecord is a plain aggregate, and its one construction
+	// site (traceRecords() below) always brace-initialises every field.
 	struct TraceRecord
 	{
+		// cppcheck-suppress uninitMemberVarNoCtor
 		uint64_t    seq;
+		// cppcheck-suppress uninitMemberVarNoCtor
 		uint64_t    tsUs;
+		// cppcheck-suppress uninitMemberVarNoCtor
 		bool        outbound;
 		std::string peer;   // "ip:port", via sipwire::addrToIpPort
 		std::string text;
@@ -170,12 +176,20 @@ public:
 	}
 
 private:
+	// cppcheck flags the scalar members below (uninitMemberVarNoCtor). False
+	// positive: recordInto() above is Entry's only populator, and every field
+	// (seq/outbound/peer/tsUs) is assigned there immediately after the
+	// emplace_back()/reuse that default-constructs the slot, before any of
+	// them is ever read.
 	struct Entry
 	{
+		// cppcheck-suppress uninitMemberVarNoCtor
 		uint64_t    seq;
+		// cppcheck-suppress uninitMemberVarNoCtor
 		bool        outbound;
 		sockaddr_in peer;
 		std::string bytes;
+		// cppcheck-suppress uninitMemberVarNoCtor
 		uint64_t    tsUs;
 	};
 	// Ring buffer. Grows to POCKETDIAL_PCAP_RING_SIZE and then stops: entries are

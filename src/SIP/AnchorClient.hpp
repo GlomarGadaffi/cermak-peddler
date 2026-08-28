@@ -22,6 +22,10 @@ public:
 		// via makeCall). Incoming is the inverse: an external system is delivering an
 		// inbound call to a DN this device monitors; ring a local extension, then call
 		// answerCall() to accept it. callerId carries the caller's number/name (best-effort).
+		// cppcheck flags `type` as uninitMemberVarNoCtor. False positive: every
+		// CallEvent is constructed at its call sites (LoopbackAnchorClient.cpp)
+		// with all four fields brace-initialised.
+		// cppcheck-suppress uninitMemberVarNoCtor
 		enum Type { Ringing, Answered, Dropped, Dtmf, Incoming } type;
 		std::string participantId;
 		std::string dtmfDigit;
