@@ -167,6 +167,47 @@ firmware build clean.
   `POCKETDIAL_CONF_LEGS` added to `PoolConfig.hpp`. The PIE vector path
   (`POCKETDIAL_MIXBUS_PIE`, `src/SIP/pie/`) is untouched and still opt-in.
 
+## Unreleased (issue-68-call-pickup) - 2026-08-28
+
+### Added — Directed (`**<ext>`) and group (`*8`) call pickup (#68)
+
+- New virtual dial codes, intercepted in `onInvite` alongside the existing
+  700-709 park orbits and 980-989 page zones: `*8` answers the **oldest**
+  ringing call among the picker's ring-group co-members; `**<ext>` answers a
+  **named** extension's ringing call. Both are restricted to the picker's own
+  pickup group — pickup groups are **reused ring-group membership**
+  (`setRingGroup`/`getRingGroups`), not a new config table: two extensions are
+  pickup-eligible for each other iff they're both members of the same ring
+  group (see `PbxConfig.hpp`'s `isGroupPickupCode`/`directedPickupTarget` doc
+  comment for the rationale).
+- Picking up a call completes the caller's still-open INVITE transaction with
+  the picker's SDP as the answer, answers the picker's own INVITE with the
+  caller's original SDP, and CANCELs every other still-ringing fork of that
+  call (the whole target, not just one leg, for a ring-all/hunt group pickup).
+  The two resulting dialogs (different Call-IDs) are bridged via
+  `Session::peerCallID`, whose relay `onBye()` now actually implements
+  (reusing #72's empty-From/To guard so a session with no captured dialog
+  headers is skipped rather than sent a malformed BYE) — previously set by
+  `ParkOrbit`'s retrieve/ring-back paths but never wired up, so a hangup on
+  either bridged leg now also cleans up Park's retrieved-call session
+  bookkeeping (CDR, pool slot) instead of leaking it; Park doesn't capture
+  dialog headers yet, so its bridged peer still doesn't get a wire BYE.
+- Race handling: `onOk()` now drops a late 200 OK from a call's
+  already-superseded (CANCELed) fork instead of resurrecting/stealing an
+  already-connected session — a CANCEL and a 2xx can legally cross on the
+  wire. Whichever side answers first wins; the other gets `486 Busy Here` (no
+  ringing call to pick up) or is CANCELed, never both.
+- `RequestsHandler::onInvite`'s direct (non-group) call path now always
+  retains the original INVITE on its `Session` (previously only when a
+  conditional forward was configured) — needed so pickup can tell which
+  extension a direct call is ringing without answering it first.
+- New tests: `tests/CallPickup_test.cpp` (directed pickup, group pickup
+  picking the oldest ringing call, the race in both directions, the
+  cross-dialog BYE bridge teardown, and a Park-retrieve BYE confirming the
+  #72-style guard prevents a malformed empty-header BYE) and
+  `tests/Pbx_test.cpp` (the pure `isGroupPickupCode`/`directedPickupTarget`
+  parsers).
+
 ## Unreleased (issue-106-104-108-112-misc-bugs) - 2026-08-19
 
 Four small, independently-filed correctness bugs plus one CI hygiene fix,

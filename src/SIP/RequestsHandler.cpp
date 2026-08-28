@@ -904,6 +904,25 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		}
 	}
 
+	// Directed / group call pickup (Issue #68): *8 answers the oldest ringing
+	// call among the picker's ring-group co-members; **<ext> answers a named
+	// extension's ringing call. Both are restricted to the picker's own
+	// pickup group (same ring-group co-membership check) — see
+	// PbxConfig.hpp's doc comment for why directed pickup isn't exempted.
+	if (pbx::isGroupPickupCode(destNumber))
+	{
+		onPickup(data, caller.value(), pickupPeersOf(caller.value()->getNumber()));
+		return;
+	}
+	if (std::string target = pbx::directedPickupTarget(destNumber); !target.empty())
+	{
+		auto peers = pickupPeersOf(caller.value()->getNumber());
+		bool eligible = target != caller.value()->getNumber() &&
+			std::find(peers.begin(), peers.end(), target) != peers.end();
+		onPickup(data, caller.value(), eligible ? std::vector<std::string>{ target } : std::vector<std::string>{});
+		return;
+	}
+
 	// Ring / hunt groups (Class A sweep): a configured group extension (e.g. 6xx)
 	// maps to an ordered member list. Ring-all reuses the broadcast fork (without the
 	// intercom auto-answer headers, so members ring normally); hunt rings members one
@@ -1006,16 +1025,14 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	}
 	_sessions.emplace(data->getCallID(), newSession);
 
-	// Retain the original INVITE on the session if the callee has ANY conditional
-	// forward (busy or no-answer), so onBusy()/tick() can re-drive it to the forward
-	// target. CFB (busy) is handled in onBusy(); CFNA arms a one-shot ring timer that
-	// tick() fires after NO_ANSWER_TIMEOUT (CANCEL original leg, INVITE the target).
+	// Retain the original INVITE on every direct-call session — not only when
+	// the callee has a conditional forward (busy/no-answer) configured.
+	// onBusy()/tick() already relied on this for CFB/CFNA; it's now also how
+	// isSessionRingingExt() finds "who's ringing" for call pickup (Issue #68)
+	// without needing to pre-populate Session::dest before an answer exists.
+	newSession->setInviteMessage(data);
 	std::string cfb  = getForwardTarget(destNumber, "busy");
 	std::string cfna = getForwardTarget(destNumber, "noanswer");
-	if (!cfb.empty() || !cfna.empty())
-	{
-		newSession->setInviteMessage(data);
-	}
 	if (!cfna.empty() && cfna != destNumber)
 	{
 		newSession->setNoAnswerTarget(cfna);
@@ -1537,6 +1554,50 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// Cross-dialog bridge teardown (Issue #68 call pickup — and, as a
+	// byproduct, ParkOrbit's retrieve/ring-back legs, which set peerCallID
+	// too but had no relay wired up for it before this). A BYE here ends ONE
+	// of two independently-dialogued legs that only the server's own
+	// bookkeeping links together; relaying the raw BYE as-is (its own
+	// Call-ID) would be rejected 481 by the peer's phone (wrong dialog), so a
+	// peer-addressed BYE has to be built fresh from the PEER session's own
+	// dialog identifiers — exactly what sweepSessionTimers() already does for
+	// a single session's own two legs, generalized here across two sessions.
+	if (session.has_value() && !session.value()->getPeerCallID().empty())
+	{
+		std::string peerCallId = session.value()->getPeerCallID();
+		if (auto peerSession = getSession(peerCallId); peerSession.has_value())
+		{
+			auto peer = peerSession.value();
+			// Issue #72's guard, reused: a BYE with an empty From or To is
+			// malformed and phones drop it. onPickup() always captures both
+			// via setDialogHeaders(), but ParkOrbit's retrieve/ring-back legs
+			// (the other peerCallID-setting path) don't yet — so a park leg
+			// still gets the endCall() cleanup below, just not a peer-phone
+			// BYE, rather than emitting a "From: \r\nTo: \r\n" packet.
+			if (auto notify = peer->getSrc();
+				notify && !peer->getDialogFrom().empty() && !peer->getDialogTo().empty())
+			{
+				auto bye = buildServerBye(notify->getNumber(), notify->getAddress(),
+					peerCallId, peer->getDialogTo(), peer->getDialogFrom());
+				if (bye) _outbox.emplace_back(notify->getAddress(), std::move(bye));
+			}
+			endCall(peerCallId, peer->getSrc() ? peer->getSrc()->getNumber() : "",
+				peer->getDest() ? peer->getDest()->getNumber() : "", "peer leg ended (bridged call)");
+		}
+
+		auto response = getMessageFromPool(*data);
+		if (response)
+		{
+			response->setHeader(SipMessageTypes::OK);
+			response->setVia(std::string(data->getVia()) + ";received=" + _localIp);
+			response->clearBody();
+			_outbox.emplace_back(data->getSource(), std::move(response));
+		}
+		endCall(data->getCallID(), data->getFromNumber(), data->getToNumber(), "bridged call ended");
+		return;
+	}
+
 	setCallState(data->getCallID(), Session::State::Bye);
 	endHandle(data->getToNumber(), data);
 }
@@ -1691,6 +1752,21 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 
 			auto client = findClient(data->getToNumber());
 			if (!client.has_value())
+			{
+				return;
+			}
+
+			// Issue #68 pickup race: once this session is already connected to
+			// someone ELSE (a directed/group pickup answered first), a late
+			// 200 OK from this call's now-superseded (CANCELed) fork must not
+			// resurrect/steal the session — a CANCEL and a 2xx can legally
+			// cross on the wire. Silently drop it, same treatment the
+			// isBroadcast() branch above already gives a post-connect answer.
+			// A genuine retransmit of the WINNING answer (dest already ==
+			// this responder) still falls through to the normal path below.
+			if (session.value()->getState() != Session::State::Invited &&
+				!(session.value()->getDest() &&
+					session.value()->getDest()->getNumber() == client.value()->getNumber()))
 			{
 				return;
 			}
@@ -4701,6 +4777,209 @@ const pbx::PageZone* RequestsHandler::findPageZone(const std::string& extension)
 bool RequestsHandler::isPageZoneDialog(const std::string& extension) const
 {
 	return pbx::isPageZoneExt(extension) && _pageZones.find(extension) != _pageZones.end();
+}
+
+// ── Directed / group call pickup (Issue #68) ──────────────────────────────────
+// See PbxConfig.hpp's isGroupPickupCode/directedPickupTarget doc comment: pickup
+// groups are ring-group membership, reused as-is.
+
+std::vector<std::string> RequestsHandler::pickupPeersOf(const std::string& ext) const
+{
+	std::vector<std::string> peers;
+	for (const auto& [groupExt, group] : _ringGroups)
+	{
+		bool isMember = false;
+		for (const auto& m : group.members)
+		{
+			if (m == ext) { isMember = true; break; }
+		}
+		if (!isMember) continue;
+
+		for (const auto& m : group.members)
+		{
+			if (m == ext) continue;
+			if (std::find(peers.begin(), peers.end(), m) == peers.end())
+			{
+				peers.push_back(m);
+			}
+		}
+	}
+	return peers;
+}
+
+bool RequestsHandler::isSessionRingingExt(const std::shared_ptr<Session>& session, const std::string& ext) const
+{
+	if (!session || session->getState() != Session::State::Invited)
+	{
+		return false;
+	}
+	if (session->isBroadcast())
+	{
+		// Ring-all / hunt: the currently-ringing member(s) live in
+		// pendingTargets (hunt keeps exactly one entry there at a time).
+		for (const auto& t : session->getPendingTargets())
+		{
+			if (t && t->getNumber() == ext) return true;
+		}
+		return false;
+	}
+	// Direct (proxied 1:1) call: the callee extension is the stored original
+	// INVITE's own To user-part — always retained now (see onInvite's direct-
+	// call branch), not only when a conditional forward is configured.
+	auto inv = session->getInviteMessage();
+	return inv && inv->getToNumber() == ext;
+}
+
+std::shared_ptr<Session> RequestsHandler::findRingingSessionAmong(const std::vector<std::string>& candidates,
+	std::string& outCallId, std::string& outExt) const
+{
+	std::shared_ptr<Session> best;
+	std::chrono::steady_clock::time_point bestStart;
+	for (const auto& [callId, session] : _sessions)
+	{
+		if (!session) continue;
+		for (const auto& ext : candidates)
+		{
+			if (!isSessionRingingExt(session, ext)) continue;
+			if (!best || session->getStartTime() < bestStart)
+			{
+				best = session;
+				bestStart = session->getStartTime();
+				outCallId = callId;
+				outExt = ext;
+			}
+			break;   // this session matched; no need to try its other candidates
+		}
+	}
+	return best;
+}
+
+void RequestsHandler::onPickup(const std::shared_ptr<SipMessage>& data, const std::shared_ptr<SipClient>& picker,
+	const std::vector<std::string>& candidates)
+{
+	auto reject486 = [&]()
+	{
+		auto resp = getMessageFromPool(*data);
+		if (!resp) return;   // pool exhausted: drop, peer retransmits (#101A)
+		resp->setHeader(SipMessageTypes::BUSY);
+		resp->clearBody();
+		resp->setVia(std::string(data->getVia()) + ";received=" + _localIp);
+		resp->setContact(buildContact(picker->getNumber()));
+		_outbox.emplace_back(data->getSource(), std::move(resp));
+	};
+
+	std::string ringingCallId, ringingExt;
+	auto ringing = candidates.empty() ? nullptr
+		: findRingingSessionAmong(candidates, ringingCallId, ringingExt);
+	if (!ringing)
+	{
+		// Nothing eligible is ringing right now (wrong/no pickup group, no
+		// ringing call for a directed target, or the race already lost — see
+		// onOk's late-answer guard). Acceptance criterion: 486, never a hang.
+		reject486();
+		return;
+	}
+
+	auto originalCaller = ringing->getSrc();
+	auto invite = ringing->getInviteMessage();
+	if (!originalCaller || !invite || !invite->hasSdp() || !data->hasSdp())
+	{
+		// Can't build a valid P2P O/A without both SDPs — decline cleanly
+		// rather than half-connect the call.
+		reject486();
+		return;
+	}
+
+	// Draw the picker's session and BOTH 200 OKs before mutating anything
+	// (#101A / #71 discipline): a refusal here must leave the original call
+	// still ringing, not half-torn-down.
+	auto pickerSession = allocateSession(std::string(data->getCallID()), picker);
+	if (!pickerSession)
+	{
+		auto resp = getMessageFromPool(*data);
+		if (resp)
+		{
+			resp->setHeader("SIP/2.0 503 Service Unavailable");
+			resp->clearBody();
+			resp->setContact(buildContact(picker->getNumber()));
+			_outbox.emplace_back(data->getSource(), std::move(resp));
+		}
+		return;
+	}
+	auto okToCaller = getMessageFromPool(*invite);
+	if (!okToCaller) return;   // pool exhausted: drop, original call keeps ringing (#101A)
+	auto okToPicker = getMessageFromPool(*data);
+	if (!okToPicker) return;   // pool exhausted: drop, original call keeps ringing (#101A)
+
+	// ── Cancel every other still-ringing fork of the picked-up call ─────────
+	if (ringing->isBroadcast())
+	{
+		for (const auto& t : ringing->getPendingTargets())
+		{
+			auto cancel = buildCancel(invite, t);
+			if (cancel) _outbox.emplace_back(t->getAddress(), std::move(cancel));
+		}
+		ringing->setPendingTargets({});
+	}
+	else if (auto target = findClient(ringingExt); target.has_value())
+	{
+		auto cancel = buildCancel(invite, target.value());
+		if (cancel) _outbox.emplace_back(target.value()->getAddress(), std::move(cancel));
+	}
+	ringing->clearRingTimer();
+
+	// ── Complete the caller's original (still-open) INVITE transaction with
+	// the picker's SDP as the answer ────────────────────────────────────────
+	const std::string callerToTag = IDGen::GenerateID(9);
+	std::string callerTo(invite->getTo());
+	callerTo += ";tag=" + callerToTag;
+
+	okToCaller->setHeader(SipMessageTypes::OK);
+	okToCaller->setVia(std::string(invite->getVia()) + ";received=" + _localIp);
+	okToCaller->setTo(callerTo);
+	okToCaller->setContact(buildContact(picker->getNumber()));
+	okToCaller->setBody(std::string(data->getBody()));
+	okToCaller->enforceG711();
+	okToCaller->syncContentLength();
+
+	// ── Answer the picker's own INVITE with the caller's original SDP ───────
+	const std::string pickerToTag = IDGen::GenerateID(9);
+	std::string toForPicker(data->getTo());
+	toForPicker += ";tag=" + pickerToTag;
+
+	okToPicker->setHeader(SipMessageTypes::OK);
+	okToPicker->setVia(std::string(data->getVia()) + ";received=" + _localIp);
+	okToPicker->setTo(toForPicker);
+	okToPicker->setContact(buildContact(ringingExt));
+	okToPicker->setBody(std::string(invite->getBody()));
+	okToPicker->enforceG711();
+	okToPicker->syncContentLength();
+
+	// ── Bridge the two independent dialogs. Both legs are REAL registered
+	// clients (unlike ParkOrbit's orbit stand-in), so neither session needs a
+	// virtual peer — but the Call-IDs still differ, so peerCallID + the
+	// dialog headers captured here are what let onBye's peerCallID branch
+	// translate a hangup on one leg into a correctly-addressed BYE on the
+	// other's own dialog. ──────────────────────────────────────────────────
+	ringing->setDest(picker);
+	ringing->setLocalTag(callerToTag);
+	ringing->setState(Session::State::Connected);
+	ringing->setPeerCallID(std::string(data->getCallID()));
+	ringing->setDialogHeaders(std::string(invite->getFrom()), callerTo);
+
+	pickerSession->setDest(originalCaller);
+	pickerSession->setInviteMessage(data);
+	pickerSession->setLocalTag(pickerToTag);
+	pickerSession->setPeerCallID(ringingCallId);
+	pickerSession->setDialogHeaders(std::string(data->getFrom()), toForPicker);
+	pickerSession->setState(Session::State::Connected);
+	_sessions.emplace(data->getCallID(), pickerSession);
+
+	_outbox.emplace_back(originalCaller->getAddress(), std::move(okToCaller));
+	_outbox.emplace_back(data->getSource(), std::move(okToPicker));
+
+	queueLog("Pickup: " + picker->getNumber() + " picked up " + ringingExt +
+		"'s ringing call from " + originalCaller->getNumber());
 }
 
 void RequestsHandler::setPageZone(const std::string& zoneExt, const std::string& members)

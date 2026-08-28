@@ -487,6 +487,40 @@ private:
 		const std::shared_ptr<SipClient>& caller,
 		const std::string& destNumber);
 
+	// ── Directed / group call pickup (Issue #68) ──────────────────────────────
+	// See PbxConfig.hpp's isGroupPickupCode/directedPickupTarget doc comment for
+	// why pickup groups reuse ring-group membership rather than adding a new
+	// config table. All four assume the caller holds _mutex (called from
+	// onInvite()/onOk()/onBye(), which already do).
+
+	// Every OTHER extension co-membered with `ext` in any configured ring
+	// group, deduped and order-preserving. Empty if `ext` is in no group.
+	std::vector<std::string> pickupPeersOf(const std::string& ext) const;
+
+	// True iff `session` is currently ringing `ext` (state == Invited AND
+	// either it's `ext`'s stored direct-call invite, or `ext` is one of its
+	// broadcast/ring-all/hunt pendingTargets).
+	bool isSessionRingingExt(const std::shared_ptr<Session>& session, const std::string& ext) const;
+
+	// Scans _sessions for the OLDEST Invited session ringing any of
+	// `candidates` (directed pickup passes a single-element vector; group
+	// pickup passes the picker's full peer list). On a match, fills
+	// `outCallId`/`outExt` with the winning session's Call-ID and which
+	// candidate it was ringing. Returns nullptr if none match.
+	std::shared_ptr<Session> findRingingSessionAmong(const std::vector<std::string>& candidates,
+		std::string& outCallId, std::string& outExt) const;
+
+	// Shared core for *8 and **<ext>: picks up the oldest Invited session
+	// ringing any of `candidates` (empty means "not eligible" — the caller
+	// already resolved eligibility/self-pickup before calling this), answers
+	// `picker`'s INVITE with the ringing call's SDP (and vice versa), cancels
+	// every other still-ringing fork of that call, and bridges the two
+	// resulting dialogs via Session::peerCallID (see onBye's peerCallID
+	// branch for teardown). 486 Busy Here on no match / pool exhaustion (the
+	// original call is left untouched either way).
+	void onPickup(const std::shared_ptr<SipMessage>& data, const std::shared_ptr<SipClient>& picker,
+		const std::vector<std::string>& candidates);
+
 	// Fan an INVITE out to a set of targets (the reusable core extracted from the
 	// 999 all-page path). `targets` are pre-selected registered clients; `intercom`
 	// adds the 999 auto-answer headers (true for 999, false for a ring group so it
