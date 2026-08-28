@@ -259,6 +259,126 @@ the full writeups.
   a stale cache). Arduino IDE / `arduino-cli` compile and physical-hardware runtime
   test remain unverified, as before — full details posted as a GitHub comment on
   #41 rather than duplicated here.
+## Unreleased (issue-105-111-81-network-build) - 2026-08-19
+
+Three network/build-correctness issues found by code review, bundled as one
+themed pass: a signaling-capture fidelity bug (#105), a build-system footgun
+(#111), and a per-packet allocation on the SIP receive hot path (#81).
+
+### Fixed — `/api/pcap` inbound capture stored re-serialized SIP, not wire bytes (#105)
+
+- `RequestsHandler::handle()`'s inbound capture point called
+  `request->toString()` — a re-serialization of the **parsed** message — not the
+  bytes `recvfrom()` actually delivered. `SipMessage::toString()` always writes
+  CRLF line endings and rejoins the parsed pieces; it does not restore whatever
+  line-ending convention or malformed-but-tolerated layout the wire bytes
+  actually used, so a bare-LF message, a compact-header form (`v:`/`f:`/`t:`/
+  `i:`), or a blank line the parser silently drops (SEC-02 tolerance) all
+  captured differently than what arrived. The outbound side was never affected —
+  those messages are server-minted, so `toString()` genuinely is the wire bytes.
+- `handle()` now takes an optional `std::string_view rawBytes` and, when the
+  caller has wire bytes to offer, writes them into the pcap ring slot verbatim
+  instead of calling `toString()`. `SipServer::onNewMessage()` is the only
+  production caller and always supplies it — the received bytes flow through
+  `SipMessageFactory::createMessage()` and `RequestsHandler::getMessageFromPool()`
+  by view (see #81 below) with nothing copying or discarding them before they
+  reach the capture point. Every pre-existing `handle(msg)` call site (all of
+  `tests/`) keeps compiling unchanged and keeps its old `toString()`-based
+  capture, since `rawBytes` defaults to empty.
+- `docs/API.md`'s "exact SIP bytes" claim for `/api/pcap` (and `/api/trace`'s
+  "raw SIP message bytes, exactly as captured") is now actually true for both
+  directions in production — no qualification needed, no doc change required.
+- Covered by 2 new tests in `tests/PcapCapture_test.cpp`: one fixture with
+  bare-LF endings and compact headers where `toString()` demonstrably
+  re-serializes to different bytes (asserting the capture equals the *original*
+  raw text, not the re-render), and one confirming the no-`rawBytes` fallback
+  still matches pre-#105 behavior exactly.
+
+### Fixed — `SIP_TRANSPORT=lan8720` on a non-esp32 target failed ~1400 objects into the build instead of at configure time (#111)
+
+- LAN8720 drives the classic ESP32's **internal EMAC** — ESP32-S3 and every
+  other target has no internal EMAC, so the combination cannot work at runtime
+  either. Nothing in `main/CMakeLists.txt` rejected it up front: the
+  `lan8720` branch selected `esp_main_eth_lan8720.cpp` and added
+  `REQUIRES espressif__lan87xx` based on `SIP_TRANSPORT` alone, with no target
+  guard, while `main/idf_component.yml`'s component-manager rule (`target ==
+  esp32`) correctly declined to fetch the PHY driver on any other target — so
+  the eventual failure was a missing header 1400+ objects into the build,
+  reading like an ESP-IDF version mismatch rather than an unsupported
+  target/transport pairing.
+- `main/CMakeLists.txt`'s `lan8720` branch now checks `IDF_TARGET` (the same
+  CMake cache variable the component manager's own `target ==` rule resolves
+  against, set well before component registration — confirmed against
+  `esp-idf/tools/cmake/targets.cmake`) and fails with `message(FATAL_ERROR ...)`
+  at configure time when it isn't `"esp32"`, naming `SIP_TRANSPORT=eth` (W5500)
+  as the alternative. Turns the repro in the issue into a one-line configure
+  error instead of a confusing compile failure.
+- Verified in isolation: a standalone `cmake -P` script reproducing the exact
+  `if(NOT IDF_TARGET STREQUAL "esp32")` guard fails immediately for
+  `IDF_TARGET=esp32s3` and passes through cleanly for `IDF_TARGET=esp32`. A full
+  `idf.py` configure run was not exercised (no activated ESP-IDF environment in
+  this session) — the shipped `esp32` LAN8720 path and every other
+  `SIP_TRANSPORT` branch are untouched by this change.
+
+### Changed — zero-allocation network ingestion, `UdpServer` → `RequestsHandler` (#81)
+
+- `UdpServer::receiveLoop()` heap-allocated a `std::string` copy of every
+  incoming packet's bytes before the parser or message pool ever saw them —
+  `_onNewMessageEvent(std::string(buffer, bytesReceived), ...)`. Whether that
+  allocation actually bought anything downstream depended on the exact shape of
+  the call chain: an earlier pass through this issue found that, as of `main`
+  at the time, everything below `onNewMessage` already took the string **by
+  value** and moved it through unconditionally with nothing intercepting in
+  between — so swapping the event to `std::string_view` would only have
+  *relocated* the same one allocation, not removed it, and flagged the change
+  as not worth the risk on that basis.
+- The #105 fix above changes that basis: `SipMessageFactory::createMessage()`
+  and `RequestsHandler::getMessageFromPool()` now take the message **by
+  reference** (so `SipServer::onNewMessage()` can still hand the original bytes
+  to `handle()` afterwards), and `SipMessage::reset()` already only ever reads
+  through its `message` parameter — `splitMessage()` copies what it needs
+  (`substr` into the owned `_startLine`/`_headerLines`/`_body`) and nothing
+  retains the parameter itself. With that in place, the chain below
+  `receiveLoop()` is reference-only end to end, so the original allocation had
+  no downstream consumer left to justify it.
+- `UdpServer::OnNewMessageEvent` is now
+  `std::function<void(std::string_view, sockaddr_in)>`, `receiveLoop()` passes
+  a `string_view` over its own stack-local receive buffer (unchanged
+  allocation-wise — still per-task, still not `static`, so no shared-buffer race
+  between instances is introduced), and every link in the chain
+  (`SipServer::onNewMessage`, `SipMessageFactory::createMessage`,
+  `RequestsHandler::getMessageFromPool`, `SipMessage::reset`/`splitMessage`) was
+  updated to pass the view through rather than an owned string. Every consumer
+  that needs the bytes to outlive the call already copies them out
+  synchronously before returning — `splitMessage()` into the parsed message,
+  and the #105 pcap-capture line into the ring slot — so nothing holds the view
+  past the single synchronous call chain `receiveLoop()` → ... → `handle()`
+  that produced it.
+- Scoped deliberately smaller than the alternative the earlier pass floated
+  (moving the Issue #38 rate-limit admission check out of `RequestsHandler::
+  handle()` to skip allocation for rejected packets before parsing): that would
+  have meant duplicating or relocating defense-in-depth admission logic away
+  from the one function every test in the suite calls directly
+  (`handler.handle(msg)`), which is a defense-in-depth regression risk this
+  change does not take on. `handle()`'s existing rate-limit/validity checks are
+  untouched.
+- Host-level functional coverage of the actual `UdpServer`/`SipServer` socket
+  layer remains a pre-existing gap (noted in the original issue discussion) —
+  not added here to keep this change scoped to the data-plumbing types it
+  actually touches, which host tests already cover in `RequestsHandler.cpp`/
+  `SipMessage.cpp` (the pool/parse layer every one of these views ultimately
+  flows into). Left as a good follow-up.
+
+### Verification
+
+- Host suite: **193/193** passing (191 before this work; 2 new tests added for
+  #105). Full rebuild of the production `SipServer.exe` target (which is what
+  actually compiles `UdpServer.cpp`/`SipServer.cpp`/`SipMessageFactory.cpp` —
+  `tests/CMakeLists.txt` does not link those three) succeeds clean with MSVC,
+  confirming the `string_view` plumbing type-checks end to end.
+- Not covered: ESP-IDF device build (no activated `idf.py` environment this
+  session — see #111's verification note above) and an on-hardware/real-socket
+  run of the `UdpServer` receive path.
 
 ## Unreleased (issue-101-closeout) - 2026-08-17
 
