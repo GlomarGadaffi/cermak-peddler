@@ -48,6 +48,12 @@ public:
 	RequestsHandler(std::string serverIp, int serverPort,
 		OnHandledEvent onHandledEvent);
 
+	// RETURNS NULL under sustained pressure — check it. The pool is bounded and
+	// its heap fallback is now bounded too (Issue #101(A)); once both are spent
+	// this refuses rather than allocating without limit. The contract for a
+	// caller that gets nullptr is to DROP: it cannot answer 503, because building
+	// the 503 would need a message out of the same empty pool. SIP over UDP
+	// retransmits, so a dropped packet costs latency, not the call.
 	static std::shared_ptr<SipMessage> getMessageFromPool(std::string message, sockaddr_in src);
 	// Clones an already-parsed message into a free pool slot via a direct field
 	// copy (SipMessage's copy assignment is a plain owned-string/vector copy —
@@ -58,8 +64,12 @@ public:
 	static std::shared_ptr<SipMessage> getMessageFromPool(const SipMessage& source);
 
 private:
-	// Returns a free (use_count()==1) pool slot, or nullptr if the pool is exhausted.
-	static std::shared_ptr<SipMessage> findFreePoolSlot();
+	// Hands out an uninitialized message the caller exclusively owns: a free
+	// (use_count()==1) pool slot, else a bounded heap fallback, else nullptr once
+	// POCKETDIAL_MSG_HEAP_FALLBACK_MAX are already alive (Issue #101(A)).
+	// Internally synchronized on a leaf mutex — the pool is reachable from the
+	// UDP receive task and the tick task at once. See the definition.
+	static std::shared_ptr<SipMessage> acquirePooledMessage();
 
 public:
 	// ── Media beachhead static helpers (pure; host-unit-tested) ──────────────────
@@ -266,6 +276,12 @@ private:
 	// holds _mutex, same as the direct members they forward to.
 	void enqueue(const sockaddr_in& to, std::shared_ptr<SipMessage> msg) override
 	{
+		// A null here means messageFromPool() refused (pool + bounded heap
+		// fallback both spent, Issue #101(A)). Dropping it centrally keeps the
+		// decomposed machines' `enqueue(addr, messageFromPool(...))` one-liners
+		// safe without a check at each, and guarantees drainOutbox() — which
+		// dereferences every entry — never sees a null.
+		if (!msg) return;
 		_outbox.emplace_back(to, std::move(msg));
 	}
 	std::shared_ptr<SipMessage> messageFromPool(std::string raw, sockaddr_in src) override
@@ -406,7 +422,9 @@ private:
 	// Build and queue a single INVITE fork toward one target, re-pointing the
 	// request line / To at that target. `intercom` toggles the auto-answer headers.
 	// Caller holds _mutex.
-	void buildInviteFork(const std::shared_ptr<SipMessage>& invite,
+	// false when the message pool refused: no INVITE was sent, so the caller must
+	// not report success on its behalf (#101A).
+	bool buildInviteFork(const std::shared_ptr<SipMessage>& invite,
 		const std::shared_ptr<SipClient>& caller,
 		const std::shared_ptr<SipClient>& target,
 		bool intercom);

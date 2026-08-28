@@ -128,6 +128,26 @@ SipMessage::SipMessage(const std::string& message, sockaddr_in src) : _src(src)
 	splitMessage(message, _startLine, _headerLines, _body);
 }
 
+// Member-wise copy of everything EXCEPT _bodyGen, which advances instead — see
+// the comment on _bodyGen. Keep this in sync if a member is ever added; the
+// alternative (`= default`) silently reintroduces the stale-cache bug the
+// generation counter exists to prevent.
+// cppcheck flags _bodyGen as unassigned in operator=; the bump above IS the
+// correct semantics, so the check is suppressed rather than satisfied.
+// cppcheck-suppress operatorEqVarError
+SipMessage& SipMessage::operator=(const SipMessage& other)
+{
+	if (this == &other) return *this;   // no body change, so no generation bump
+
+	_hasSdp      = other._hasSdp;
+	_startLine   = other._startLine;
+	_headerLines = other._headerLines;
+	_body        = other._body;
+	_src         = other._src;
+	++_bodyGen;
+	return *this;
+}
+
 void SipMessage::reset(const std::string& message, sockaddr_in src)
 {
 	_src = src;
@@ -135,6 +155,7 @@ void SipMessage::reset(const std::string& message, sockaddr_in src)
 	// splitMessage() clear()s _headerLines rather than reassigning it, so a
 	// pooled message's vector capacity survives across reset() calls.
 	splitMessage(message, _startLine, _headerLines, _body);
+	++_bodyGen;   // this is the pool-recycle path — see bodyGeneration()
 }
 
 // NOTE (audit #68): setType() was removed. It was dead code (zero call sites,
@@ -230,6 +251,7 @@ void SipMessage::enforceG711()
 	}
 	// Rewriting the codec list changed the SDP body size; resync Content-Length
 	// so the answer isn't dropped as malformed on UDP.
+	++_bodyGen;   // unconditional: cheaper than tracking whether the m= line matched
 	syncContentLength();
 }
 
@@ -250,6 +272,7 @@ void SipMessage::syncContentLength()
 void SipMessage::clearBody()
 {
 	_body.clear();
+	++_bodyGen;
 	syncContentLength();
 }
 
@@ -287,12 +310,25 @@ std::string_view SipMessage::getBody() const
 void SipMessage::setBody(const std::string& body)
 {
 	_body = body;
+	++_bodyGen;
 	syncContentLength();   // keep Content-Length honest (the 777-bug class)
 }
 
 std::string SipMessage::toString() const
 {
 	std::string out;
+	toString(out);
+	return out;
+}
+
+// Issue #101(D): serialize into a caller-owned buffer so a caller that
+// serializes the same message repeatedly — or one per packet on the hot path,
+// like the /api/pcap capture — can reuse one allocation instead of paying for a
+// fresh temporary every time. `out` is cleared first; clear() keeps its capacity,
+// which is the whole point.
+void SipMessage::toString(std::string& out) const
+{
+	out.clear();
 	out.reserve(_startLine.size() + 2 + _body.size() + 64);
 	out += _startLine;
 	out += "\r\n";
@@ -303,7 +339,6 @@ std::string SipMessage::toString() const
 	}
 	out += "\r\n";
 	out += _body;
-	return out;
 }
 
 bool SipMessage::isValidMessage() const

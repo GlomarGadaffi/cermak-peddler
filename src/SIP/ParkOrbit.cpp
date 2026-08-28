@@ -36,6 +36,7 @@ void ParkOrbit::onInvite(const std::shared_ptr<SipMessage>& data,
 		// ── PARK ── answer with an a=inactive hold SDP so the parked party is held.
 		const std::string holdSdp = sipwire::makeInactiveHoldSdp(activeIp);
 		auto ok = _env.messageFromPool(data->toString(), data->getSource());
+		if (!ok) return;   // pool exhausted: drop, peer retransmits (#101A)
 		ok->setHeader(SipMessageTypes::OK);
 		ok->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 		ok->setTo(std::string(data->getTo()) + ";tag=" + toTag);
@@ -58,8 +59,12 @@ void ParkOrbit::onInvite(const std::shared_ptr<SipMessage>& data,
 		slot.parkedAt   = std::chrono::steady_clock::now();
 		_parkChanged    = true;
 
+		// Both the stand-in peer and the session are required to track the parked
+		// dialog; if either pool refuses, skip creating the session rather than
+		// registering one with no dest (#101A). Same tolerance the allocSession
+		// check already had — the slot is still parked and sweep() will time it out.
 		auto virt = _env.allocVirtualPeer(orbit, data->getSource());
-		if (auto session = _env.allocSession(std::string(data->getCallID()), caller))
+		if (auto session = virt ? _env.allocSession(std::string(data->getCallID()), caller) : nullptr)
 		{
 			session->setDest(virt);
 			session->setLocalTag(toTag);
@@ -79,10 +84,14 @@ void ParkOrbit::onInvite(const std::shared_ptr<SipMessage>& data,
 	const std::string retrieverSdp(data->getBody());
 
 	auto virt = _env.allocVirtualPeer(slot.parkedExt, slot.parkedAddr);
-	auto rsession = _env.allocSession(std::string(data->getCallID()), caller);
+	auto rsession = virt ? _env.allocSession(std::string(data->getCallID()), caller) : nullptr;
+	// `virt` folded into the same rejection as a missing session (#101A): a
+	// retrieve with no stand-in peer would bridge to nothing. Both are acquired
+	// before any state changes, per #71 — the orbit slot is left intact.
 	if (!rsession)
 	{
 		auto resp = _env.messageFromPool(data->toString(), data->getSource());
+		if (!resp) return;   // pool exhausted: drop, peer retransmits (#101A)
 		resp->setHeader("SIP/2.0 503 Service Unavailable");
 		resp->clearBody();
 		resp->syncContentLength();
@@ -92,6 +101,7 @@ void ParkOrbit::onInvite(const std::shared_ptr<SipMessage>& data,
 	}
 
 	auto ok = _env.messageFromPool(data->toString(), data->getSource());
+	if (!ok) return;   // pool exhausted: drop, peer retransmits (#101A)
 	ok->setHeader(SipMessageTypes::OK);
 	ok->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 	ok->setTo(std::string(data->getTo()) + ";tag=" + toTag);
@@ -146,6 +156,7 @@ void ParkOrbit::sendReinvite(ParkSlot& slot, const std::string& sdp)
 	   << sdp;
 
 	auto inv = _env.messageFromPool(ss.str(), slot.parkedAddr);
+	if (!inv) return;   // pool exhausted: drop, peer retransmits (#101A)
 	inv->enforceG711();
 	inv->syncContentLength();
 	_env.enqueue(slot.parkedAddr, std::move(inv));
@@ -197,6 +208,7 @@ void ParkOrbit::startRingback(ParkSlot& slot, const std::shared_ptr<SipClient>& 
 	   << slot.parkedSdp;
 
 	auto inv = _env.messageFromPool(ss.str(), addr);
+	if (!inv) return;   // pool exhausted: drop, peer retransmits (#101A)
 	inv->enforceG711();
 	inv->syncContentLength();
 	_env.enqueue(addr, std::move(inv));
@@ -255,7 +267,7 @@ bool ParkOrbit::handleOk(const std::shared_ptr<SipMessage>& data)
 			if (auto parker = _env.findRegistered(slot.parker))
 			{
 				auto virt = _env.allocVirtualPeer(slot.parkedExt, slot.parkedAddr);
-				if (auto rb = _env.allocSession(slot.rbCallID, parker))
+				if (auto rb = virt ? _env.allocSession(slot.rbCallID, parker) : nullptr)
 				{
 					rb->setDest(virt);
 					rb->setPeerCallID(slot.callID);

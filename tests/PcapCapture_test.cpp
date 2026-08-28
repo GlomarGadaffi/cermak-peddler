@@ -212,3 +212,105 @@ TEST(PcapCapture, RequestsHandlerGetTraceRecordsMirrorsGetPcapCapture)
 	EXPECT_EQ(recs[0].peer, "192.168.4.50:5060");
 	EXPECT_NE(recs[0].text.find("REGISTER sip:server"), std::string::npos);
 }
+
+// ── Issue #101(D): the capture path must stop allocating once the ring is full ──
+//
+// Capture is unconditional and runs under RequestsHandler::_mutex, so a
+// per-packet malloc/free sat inside the SIP critical section. The fix recycles
+// each evicted entry's buffer in place. These tests assert that recycling
+// directly rather than trusting the comment: a freshly-constructed std::string
+// would come back with small-string capacity and a different data pointer.
+
+TEST(PcapCapture, RecordIntoRecyclesEvictedBufferInsteadOfReallocating) {
+	PcapCapture cap;
+	const sockaddr_in peer = addr("10.0.0.9", 5060);
+	// Comfortably past any small-string optimization, so the buffer is a real
+	// heap allocation whose identity we can track.
+	const std::string big(1200, 'x');
+
+	// Fill the ring exactly once.
+	for (size_t i = 0; i < POCKETDIAL_PCAP_RING_SIZE; ++i)
+	{
+		cap.recordInto(false, peer).assign(big);
+	}
+	ASSERT_EQ(cap.size(), POCKETDIAL_PCAP_RING_SIZE);
+
+	// The next record wraps onto the oldest slot. Its buffer must be the one that
+	// slot already owned: emptied, but with its capacity — and its address — kept.
+	std::string& wrapped = cap.recordInto(false, peer);
+	const char* recycledData = wrapped.data();
+	EXPECT_EQ(wrapped.size(), 0u);
+	EXPECT_GE(wrapped.capacity(), big.size());
+	wrapped.assign(big);
+
+	// Come all the way around again: the same slot, hence the same buffer, with
+	// no reallocation in between.
+	for (size_t i = 0; i < POCKETDIAL_PCAP_RING_SIZE - 1; ++i)
+	{
+		cap.recordInto(false, peer).assign(big);
+	}
+	std::string& sameSlot = cap.recordInto(false, peer);
+	EXPECT_EQ(sameSlot.data(), recycledData);
+	EXPECT_GE(sameSlot.capacity(), big.size());
+}
+
+// The ring must not grow past its cap, and must not shrink back either — a slot
+// that has been used keeps its buffer for the next packet that lands there.
+TEST(PcapCapture, RingSizeSaturatesAtCapacityAndClearResetsOrdering) {
+	PcapCapture cap;
+	const sockaddr_in peer = addr("10.0.0.9", 5060);
+
+	for (size_t i = 0; i < POCKETDIAL_PCAP_RING_SIZE * 3; ++i)
+	{
+		cap.record(false, peer, "PING " + std::to_string(i));
+	}
+	EXPECT_EQ(cap.size(), POCKETDIAL_PCAP_RING_SIZE);
+
+	// Still oldest-first after multiple wraps, and holding the LAST ring-size
+	// packets — storage order and capture order have diverged by now, so this is
+	// really checking that every reader goes through the ring head.
+	auto recs = cap.traceRecords();
+	ASSERT_EQ(recs.size(), POCKETDIAL_PCAP_RING_SIZE);
+	const size_t firstKept = POCKETDIAL_PCAP_RING_SIZE * 3 - POCKETDIAL_PCAP_RING_SIZE;
+	for (size_t i = 0; i < recs.size(); ++i)
+	{
+		EXPECT_EQ(recs[i].text, "PING " + std::to_string(firstKept + i)) << "index " << i;
+		if (i > 0) EXPECT_GT(recs[i].seq, recs[i - 1].seq) << "index " << i;
+	}
+
+	// clear() has to reset the head too, or the next fill reads out rotated.
+	cap.clear();
+	EXPECT_EQ(cap.size(), 0u);
+	cap.record(false, peer, "AFTER-CLEAR-0");
+	cap.record(false, peer, "AFTER-CLEAR-1");
+	auto after = cap.traceRecords();
+	ASSERT_EQ(after.size(), 2u);
+	EXPECT_EQ(after[0].text, "AFTER-CLEAR-0");
+	EXPECT_EQ(after[1].text, "AFTER-CLEAR-1");
+}
+
+// The pcap file itself must also come out in capture order after a wrap: the
+// serializer walks the same ring and writes one record per entry, oldest first.
+TEST(PcapCapture, PcapFileStaysInCaptureOrderAfterWrap) {
+	PcapCapture cap;
+	const sockaddr_in peer = addr("10.0.0.9", 5060);
+	for (size_t i = 0; i < POCKETDIAL_PCAP_RING_SIZE + 3; ++i)
+	{
+		cap.record(false, peer, "SEQ" + std::to_string(i) + "-payload");
+	}
+
+	const std::string file = cap.toPcapFile("10.0.0.1", 5060);
+	// Oldest surviving packet is #3; it must appear before #4, and so on.
+	size_t prev = 0;
+	for (size_t i = 3; i < POCKETDIAL_PCAP_RING_SIZE + 3; ++i)
+	{
+		const std::string needle = "SEQ" + std::to_string(i) + "-payload";
+		const size_t at = file.find(needle);
+		ASSERT_NE(at, std::string::npos) << needle << " missing from pcap";
+		EXPECT_GT(at, prev) << needle << " out of capture order";
+		prev = at;
+	}
+	// And the evicted ones are gone.
+	EXPECT_EQ(file.find("SEQ0-payload"), std::string::npos);
+	EXPECT_EQ(file.find("SEQ2-payload"), std::string::npos);
+}

@@ -33,7 +33,13 @@ public:
 	// member-wise copy of the owned start line / header lines / body is already
 	// correct.
 	SipMessage(const SipMessage& other) = default;
-	SipMessage& operator=(const SipMessage& other) = default;
+	// NOT `= default`, for one reason: _bodyGen must advance rather than be
+	// adopted from `other`. See the comment on _bodyGen — assigning a different
+	// message over this one replaces the body, and a derived class's body cache
+	// has to be able to notice that. Defaulting this operator broke exactly that
+	// (see tests/SipSdpMessage_cache_test.cpp, the pool-style base-subobject
+	// assignment case).
+	SipMessage& operator=(const SipMessage& other);
 
 	// setType() removed (audit #68): dead, and conflated a header-relative offset
 	// with a replace() length. Use setHeader() to rewrite the full start line.
@@ -108,10 +114,32 @@ public:
 	virtual bool hasSdp() const { return _hasSdp; }
 
 	std::string toString() const;
+	// Same serialization into a caller-owned buffer, so a per-packet caller can
+	// reuse one allocation instead of a fresh temporary each time (Issue #101(D)).
+	// `out` is cleared first, retaining its capacity.
+	void toString(std::string& out) const;
 	bool isValidMessage() const;
 
 protected:
 	std::string_view extractNumber(std::string_view header) const;
+
+	// Issue #101(B): monotonic counter bumped by every mutation of _body, so a
+	// derived class can cache a parse of the body and know when it went stale
+	// WITHOUT this class having to know that any such cache exists. Messages are
+	// pooled and recycled (reset() on a slot handed back out), so "the body I
+	// parsed" and "the body this object holds now" can differ across calls that
+	// look identical from the outside — the counter is what makes that visible.
+	// Deliberately not a dirty *flag*: a flag would have to be cleared by the
+	// cache owner, which puts the base class and every derived cache in a
+	// two-way handshake. A number only ever goes up, so a stale reader can only
+	// ever conclude "re-parse", never "still fresh".
+	//
+	// Starts at 1, never 0: a cache initialized to generation 0 is therefore
+	// stale on first use without needing a separate valid/empty flag.
+	//
+	// Not atomic, and not internally synchronized: like the rest of SipMessage,
+	// a given message is only ever touched under RequestsHandler::_mutex.
+	uint64_t bodyGeneration() const { return _bodyGen; }
 
 	bool _hasSdp = false;
 
@@ -122,9 +150,39 @@ private:
 	// in sync: named getters look their header up by name on every call (a
 	// handful of short string compares against _headerLines, not a rescan of
 	// the whole message), so nothing needs a reparse step after a mutation.
+	//
+	// The body is the one exception, and it is a derived-class concern: an SDP
+	// body IS worth parsing once (SipSdpMessage, Issue #101(B)). This class does
+	// not hold that cache — it only publishes _bodyGen via bodyGeneration() so
+	// the cache's owner can tell when its parse went stale.
 	std::string              _startLine;
 	std::vector<std::string> _headerLines;
 	std::string              _body;
+	// Bumped by every _body mutation — see bodyGeneration().
+	//
+	// This value is meaningful only WITHIN one object: it is that object's
+	// private, monotonically-increasing body timeline, never a global version.
+	// Two different messages sharing the value 7 means nothing.
+	//
+	// Which is why operator= bumps it instead of copying it. The pool assigns
+	// through a base reference (`*msg = source` on a shared_ptr<SipMessage>,
+	// RequestsHandler.cpp), so ONLY this subobject is assigned and a derived
+	// cache is left untouched — if the destination also adopted the source's
+	// generation, the two could coincide and the stale cache would look fresh.
+	// Bumping keeps the invariant local and airtight: a cache's recorded
+	// generation only ever holds a value from ITS OWN object's timeline, so
+	// "recorded == current" can only mean "parsed from exactly these bytes".
+	//
+	// The copy CONSTRUCTOR does copy it, which is correct — there is no
+	// pre-existing cache in a brand-new object to go stale, and the copied body
+	// and copied cache describe the same bytes.
+	// 64-bit, not 32: it only ever increments, and a pooled slot on a
+	// long-lived device bumps it several times per handled message. A 32-bit
+	// counter would eventually wrap onto a value a derived cache had already
+	// recorded — reviving a stale SDP parse against a different call's body, the
+	// exact hazard this exists to prevent — or onto 0, the fresh-cache sentinel.
+	// At even 10k bumps/second a 64-bit counter outlives the hardware.
+	uint64_t                 _bodyGen = 1;
 
 	sockaddr_in _src{};
 

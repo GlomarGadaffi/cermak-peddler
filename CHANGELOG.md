@@ -1,5 +1,193 @@
 # Changelog
 
+## Unreleased (issue-101-closeout) - 2026-08-17
+
+Closes Issue #101: items **A**, **B**, **D** and **E** are fixed, **C** is
+formally declined and recorded as such.
+
+### Fixed — data race in the message-pool handout (#101(E), found by the audit)
+
+- `findFreePoolSlot()` scanned the **static** `_messagePool` for `use_count()==1`
+  and then copied the `shared_ptr` — a check-then-take with no synchronization,
+  reachable concurrently from two tasks: the UDP receive task
+  (`UdpServer.cpp:134` → `SipServer::onNewMessage` →
+  `SipMessageFactory::createMessage` → `getMessageFromPool`), which holds **no
+  lock** because `handle()` only takes `_mutex` afterwards on the
+  already-allocated message; and the tick task (`esp_main.cpp:192`, or
+  `SipServer::tickLoop` on desktop) via `TransactionLayer::sweep`, under
+  `_mutex`.
+
+  Both could observe `use_count()==1` on the same slot and both take it, then
+  `reset()` it concurrently — two owners writing one `SipMessage` and
+  reallocating its strings under each other. Holding `_mutex` on one side does
+  not help: a lock only excludes other holders of that same lock. It fires under
+  exactly the load that item A exists to harden against.
+
+  Fixed with a dedicated **leaf** mutex around the scan-and-take (nothing inside
+  its critical section may take another lock, so it is safe regardless of whether
+  the caller already holds `_mutex`). Message initialization stays outside the
+  critical section, which is by then exclusively owned. The fallback deleter is
+  documented as never taking that mutex — the last reference can drop while it is
+  held, so a locking deleter could self-deadlock.
+
+### Fixed — pool-exhaustion backpressure (#101(A))
+
+- `getMessageFromPool()` and `allocateVirtualPeer()` fell back to **unbounded**
+  heap allocation once their pools were drawn down. Both now allow a bounded
+  number of heap fallbacks alive at once — `POCKETDIAL_MSG_HEAP_FALLBACK_MAX` (8)
+  and `POCKETDIAL_VPEER_HEAP_FALLBACK_MAX` (4) in `PoolConfig.hpp` — tracked by
+  an atomic in-flight counter that the `shared_ptr` deleter decrements, and
+  return `nullptr` past that. It is a ceiling on concurrent use, not a rate, so a
+  burst is absorbed and only sustained over-subscription is refused.
+
+  On refusal the contract is **drop, not 503**: building a 503 would need a
+  message out of the very pool that just came up empty, so `allocateSession()`'s
+  reject-and-503 pattern is not available here. SIP over UDP retransmits
+  (RFC 3261 §17), so a dropped packet costs latency rather than the call. The
+  allocation is also exception-balanced — see the comments; the ownership rules
+  around a throwing `shared_ptr` constructor are easy to get wrong in both
+  directions.
+
+- 67 call sites updated (55 `getMessageFromPool` in `RequestsHandler.cpp`, 12
+  `messageFromPool` across the decomposed machines), with the failure action
+  matched to context: `return` in void handlers, `continue` in fork/sweep loops
+  so one refusal skips a target rather than aborting a broadcast, and `nullptr`
+  propagation out of builders. Resources are acquired before state is mutated, so
+  a refusal never leaves a half-built session — the ordering discipline Issue #71
+  established for the park path.
+
+  Two things kept that from being 67 hand-written checks. `enqueue()` now drops a
+  null centrally, covering every inline `enqueue(addr, messageFromPool(...))` and
+  guaranteeing `drainOutbox()` — which dereferences every entry — never sees one.
+  And the highest-volume path needed **no** new code: `createMessage()` already
+  returned `nullopt` on null and `handle()` already dropped it, so an inbound
+  packet that cannot be represented is discarded at the earliest possible point.
+
+- `BlfSubscriptions` no longer records `lastState`/`version` when the NOTIFY it
+  just built was refused. Banking a state that was never sent would suppress the
+  retry and strand that watcher's busy-lamp until the target's state changed
+  *again*; leaving it untouched means the next `refresh()` retries.
+
+### Declined — `maybeTrack()` duplication (#101(C))
+
+- Re-examined and deliberately **not** changed, matching the original call. The
+  four blocks each copy a different `string_view` into a different fixed `char[]`
+  member and share only their shape; folding them into a helper trades four
+  obvious bounds-safe copies for one indirection, on the retransmit path, for no
+  behavioral gain. Recorded in `ISSUES.md` so it is not re-litigated.
+
+### Fixed — PcapCapture allocation under the caller's lock (#101(D))
+
+- The ring no longer pops and pushes. Once full it overwrites the oldest entry in
+  place and recycles that entry's buffer, so the steady-state capture path
+  allocates nothing; it still grows lazily, so a quiet node never pays for slots
+  it has not used. Readers now walk from the ring head, since storage order stops
+  matching capture order after a wrap.
+- `recordInto()` hands the slot's buffer to the caller and a new
+  `SipMessage::toString(std::string&)` serializes straight into it, removing the
+  per-packet temporary that both capture sites built *before* `record()` even
+  copied it. Worth doing properly because capture is unconditional — there is no
+  enable flag, so this ran on every inbound and outbound message under `_mutex`.
+
+### Verification
+
+- Host suite: **188/188** passing (168 before this work). The new tests are
+  mutation-verified — with each fix reverted in turn they fail, including the two
+  that initially did not: same-shape SDP bodies let stale offsets land on correct
+  text, and assigning two `SipSdpMessage` lvalues does not reproduce the pool's
+  base-subobject assignment.
+- Device: all seven edited translation units compile clean for ESP32-S3
+  (`xtensa-esp32s3-elf-g++`) under `-Wall -Wextra`, and the full `idf.py build`
+  links for the esp32s3 target.
+- Not covered: no on-hardware or QEMU run. The concurrency fix in particular is
+  argued from the code and pinned by a host-thread test; it has not been observed
+  under real dual-task load on a device.
+
+### #101(E) audit — remaining findings, all clean
+
+- **Endianness / packed structs**: `RtpSender::buildRtpHeader` writes every
+  multi-byte RTP field byte-by-byte in big-endian and `RtpReceiver` parses the
+  same way — no packed structs, no buffer-to-header casts, so no strict-aliasing
+  exposure and no host-endianness assumption. `SipWireUtil.hpp` is clean.
+- **Blocking calls on the retransmit-timer path**: `sweep()` does no socket I/O
+  (sends are deferred to the outbox and drained after unlock, per Issue #51), no
+  NVS, no sleep, and already null-checked its pool draw.
+- **Watchdog starvation**: every long-lived loop blocks or yields each iteration
+  — `recvfrom()` with `SO_RCVTIMEO` in both receive loops, `vTaskDelayUntil` /
+  `sleep_until` in the RTP send loops, `vTaskDelay` backoff in the bind-retry
+  loops. No spin-waits.
+
+---
+
+## Unreleased (issue-101-B-sdp-parse-cache) - 2026-08-17
+
+Issue #101 item **B**.
+
+### Fixed
+
+- `SipSdpMessage`: the six SDP accessors re-parsed the entire body on every
+  call — `getRtpPort()` alone walked it twice, and call setup touches several
+  of them per INVITE. They now share one single-pass parse, cached until the
+  body changes (Issue #101.B).
+
+- `SipMessage`: added a private `_bodyGen` counter, bumped by every `_body`
+  mutation (`reset()`, `setBody()`, `clearBody()`, `enforceG711()`) and
+  published to derived classes as `bodyGeneration()`. This is what makes the
+  cache above safe on a **pooled** message: `RequestsHandler` recycles the same
+  `SipSdpMessage` objects across unrelated calls via `reset()` and
+  `*msg = source`, so a cache keyed on a plain valid/dirty flag would serve the
+  previous call's `c=`/`m=` lines to the next call — wrong media endpoint, not
+  merely a stale read.
+
+  The cache stores `(offset, length)` spans rather than `string_view`s, so the
+  copy used by the pool's `*msg = source` recycle stays correct instead of
+  leaving the destination pointing into the source's body. This preserves the
+  "no `string_view` to fix up after a copy" property `SipMessage` already
+  documents.
+
+- `SipMessage::operator=` is no longer `= default`: it now copies every member
+  except `_bodyGen`, which it advances instead. The pool assigns through a base
+  reference — `getMessageFromPool(const SipMessage&)` does `*msg = source` on a
+  `shared_ptr<SipMessage>`, so only the `SipMessage` subobject is assigned and a
+  derived class's cache is left untouched. With the generation copied, the
+  destination's stale cache could match the incoming generation and be treated
+  as fresh. Bumping keeps the counter a strictly per-object timeline, so
+  "recorded generation == current generation" can only ever mean "parsed from
+  exactly these bytes". Implicit move operations were already suppressed (both
+  copy operations were previously user-declared as `= default`), so this is not
+  a change in value-category behavior.
+
+- `SipSdpMessage::operator=` is likewise hand-written, for the same reason one
+  level down: the implicit one advanced this object's body generation through
+  the base operator and then overwrote its *cache* generation with the source's,
+  crossing two objects' private counters. When those collided, a stale cache
+  read as current against a body it was never parsed from. Assignment now drops
+  the cache instead of copying it. The copy *constructor* stays defaulted and is
+  correct as-is — it takes both counters from the same object, so a fresh cache
+  stays fresh and a stale one stays stale.
+
+### Testing
+
+- New `tests/SipSdpMessage_cache_test.cpp` (13 tests): accessor parity with the
+  old per-call parse, and cache invalidation across every body-mutation path,
+  including both pool-recycle paths and both assignment defects above. Verified
+  by mutation — with the invalidation deliberately disabled, 8 of them fail.
+
+  Three of these only got teeth after being rewritten, and the failure modes are
+  worth knowing about. First, the two SDP bodies the tests switch between must
+  differ in line *length*, not just in content: with same-shape bodies the stale
+  offsets landed on the new body's correct text and the invalidation tests
+  passed against a knowingly broken cache. Second, a test that assigns one
+  `SipSdpMessage` lvalue to another does NOT reproduce the pool's assignment —
+  that one goes through a `SipMessage&` and assigns only the base subobject.
+  Third, the derived-assignment defect is a *collision* between two counters, so
+  that test sweeps a range of prior-mutation counts on both objects instead of
+  hardcoding the one pair that happens to line up today.
+- Full host suite: 180/180 passing (168 before this change).
+- Device build: all seven edited translation units compile clean for ESP32-S3
+  under `-Wall -Wextra`, and the full `idf.py build` links (see the closeout
+  section above).
+
 ## Unreleased (post-100-review-followups) - 2026-08-09
 
 A pass through `src/SIP` following a laziness/reuse-discipline review plus an

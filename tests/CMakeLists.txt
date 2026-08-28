@@ -25,6 +25,14 @@ include_directories(${gtest_SOURCE_DIR}/include ../src/SIP ../src/Helpers)
 add_executable(sip_parser_tests
     SipMessage_test.cpp
     SipMessage_header_test.cpp
+    # Issue #101(B): SDP parse-once cache. Covers every body-mutation path that
+    # must invalidate it — including reset() and `*msg = source`, the two ways
+    # the message pool recycles a slot into a different call.
+    SipSdpMessage_cache_test.cpp
+    # Issue #101(A)/(E): message-pool backpressure (bounded heap fallback, then
+    # refuse) and the concurrent-handout invariant. Draws on the process-global
+    # pool, so each test releases what it holds before it ends.
+    RequestsHandler_pool_test.cpp
     SipStatus_test.cpp
     SipDigest_test.cpp
     ArpLookup_test.cpp

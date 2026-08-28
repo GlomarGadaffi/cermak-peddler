@@ -92,6 +92,7 @@ void RegisterBeeper::sendBeep(const std::shared_ptr<SipClient>& phone)
 	   << body;
 
 	auto invite = _env.messageFromPool(ss.str(), addr);
+	if (!invite) return;   // pool exhausted: drop, peer retransmits (#101A)
 	// Normalise the codec list and (re)derive Content-Length from the actual body —
 	// a wrong Content-Length silently breaks the offer on UDP (the 777-path bug).
 	invite->enforceG711();
@@ -126,7 +127,17 @@ bool RegisterBeeper::handleOk(const std::shared_ptr<SipMessage>& data)
 		auto ack = buildAck(*bd, data);
 		if (ack) _env.enqueue(bd->addr, std::move(ack));
 		auto bye = buildBye(*bd, data);
-		if (bye) _env.enqueue(bd->addr, std::move(bye));
+		if (!bye)
+		{
+			// The pool refused the BYE. Do NOT advance to AwaitingByeOk: sweep()
+			// would then free the slot on its deadline having never sent a BYE,
+			// leaving the phone off-hook in a call the PBX has forgotten. Staying
+			// in the current state lets the phone's 200 OK retransmit re-enter here
+			// and retry the teardown (#101A).
+			_env.log("Register beep: " + bd->ext + " — pool exhausted, BYE deferred", true);
+			return true;
+		}
+		_env.enqueue(bd->addr, std::move(bye));
 		bd->state    = BeepState::AwaitingByeOk;
 		// Re-arm the deadline so a phone that never 200s our BYE still frees its
 		// slot from sweep() rather than lingering until the original INVITE timeout.
