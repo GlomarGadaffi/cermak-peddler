@@ -114,6 +114,11 @@ private:
 	// configure ring/hunt groups. Mutating (same-origin + auth gated), mirroring DND.
 	void sendApiForward(int sock, const std::string& body);
 	void sendApiGroup(int sock, const std::string& body);
+	// Issue #69: upsert/delete one dial-plan rule. Same gate and same shape as
+	// sendApiGroup — validation lives in RequestsHandler::setDialRule; this only
+	// rejects the parameter-level mistakes it can name precisely (missing pattern,
+	// bad action) so the operator gets a 400 instead of a silent server-side drop.
+	void sendApiDialPlan(int sock, const std::string& body);
 	void sendApiWifiScan(int sock);
 	void sendApiWifiConnect(int sock, const std::string& body);
 	void sendApiWifiModeAp(int sock);

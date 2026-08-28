@@ -151,6 +151,19 @@
 #define POCKETDIAL_ZONE_MEMBER_CAP 8
 #endif
 
+// Maximum number of dial-plan rules (Issue #69). The rule table is walked
+// linearly, in table order, on every INVITE that reaches the dial plan — so this
+// cap bounds BOTH the memory the table can occupy and the per-INVITE matching
+// work in the SIP packet path. Sixteen rules is comfortably more than a desk PBX
+// needs (the whole dial space here is three-digit LAN extensions) while keeping
+// the worst-case walk a handful of short string compares. setDialRule() refuses
+// a new rule once the table is full (existing rules can still be edited in
+// place), and loadPbxConfig() applies the same ceiling when replaying NVS, so a
+// blob written by a build with a larger cap can never overflow a smaller one.
+#ifndef POCKETDIAL_MAX_DIAL_RULES
+#define POCKETDIAL_MAX_DIAL_RULES 16
+#endif
+
 // Maximum concurrent RFC 3261 §17 transaction records tracked for retransmit
 // timers.  Each InviteClient slot tracks one outgoing INVITE fork (Timer A/B):
 // retransmit interval doubles from T1 until a provisional stops it, or Timer B

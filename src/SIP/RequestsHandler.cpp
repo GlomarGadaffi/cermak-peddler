@@ -865,27 +865,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	{
 		if (const pbx::PageZone* zone = findPageZone(destNumber))
 		{
-			std::vector<std::shared_ptr<SipClient>> targets;
-			for (const auto& m : zone->members)
-			{
-				if (m == caller.value()->getNumber()) continue;
-				auto mc = findClient(m);
-				if (mc.has_value())
-					targets.push_back(mc.value());
-			}
-
-			if (targets.empty())
-			{
-				std::shared_ptr<SipMessage> responseObj = getMessageFromPool(*data);
-				if (!responseObj) return;   // pool exhausted: drop, peer retransmits (#101A)
-				responseObj->setHeader(SipMessageTypes::UNAVAILABLE);
-				responseObj->clearBody();
-				responseObj->setContact(buildContact(caller.value()->getNumber()));
-				_outbox.emplace_back(data->getSource(), std::move(responseObj));
-				return;
-			}
-
-			startBroadcastFork(data, caller.value(), std::move(targets), /*intercom=*/true);
+			routePageZone(data, caller.value(), *zone);
 			return;
 		}
 	}
@@ -915,69 +895,22 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// real endpoint and so never carries its own DND/forward config.
 	if (const pbx::RingGroup* group = findRingGroup(destNumber))
 	{
-		// Collect the registered members (skip the caller and any offline member).
-		std::vector<std::shared_ptr<SipClient>> members;
-		std::vector<std::string> huntOrder;
-		for (const auto& m : group->members)
-		{
-			if (m == caller.value()->getNumber()) continue;
-			auto mc = findClient(m);
-			if (mc.has_value())
-			{
-				members.push_back(mc.value());
-				huntOrder.push_back(m);
-			}
-		}
+		routeRingGroup(data, caller.value(), destNumber, *group);
+		return;
+	}
 
-		if (members.empty())
-		{
-			std::shared_ptr<SipMessage> responseObj = getMessageFromPool(*data);
-			if (!responseObj) return;   // pool exhausted: drop, peer retransmits (#101A)
-			responseObj->setHeader(SipMessageTypes::UNAVAILABLE);
-			responseObj->clearBody();
-			responseObj->setContact(buildContact(caller.value()->getNumber()));
-			endHandle(data->getFromNumber(), responseObj);
-			return;
-		}
-
-		if (group->mode == pbx::GroupMode::RingAll)
-		{
-			startBroadcastFork(data, caller.value(), std::move(members), /*intercom=*/false);
-			return;
-		}
-
-		// Hunt (sequential): build a broadcast-style session but ring one at a time.
-		auto newSession = allocateSession(std::string(data->getCallID()), caller.value());
-		if (!newSession)
-		{
-			std::shared_ptr<SipMessage> responseObj = getMessageFromPool(*data);
-			if (!responseObj) return;   // pool exhausted: drop, peer retransmits (#101A)
-			responseObj->setHeader("SIP/2.0 503 Service Unavailable");
-			responseObj->clearBody();
-			responseObj->setContact(buildContact(caller.value()->getNumber()));
-			_outbox.emplace_back(data->getSource(), std::move(responseObj));
-			return;
-		}
-		newSession->setBroadcast(true);
-		newSession->setHunt(true);
-		newSession->setGroupExt(destNumber);
-		newSession->setInviteMessage(data);
-		newSession->setHuntMembers(std::move(huntOrder));
-		newSession->setHuntIndex(0);
-		_sessions.emplace(data->getCallID(), newSession);
-
-		// 180 Ringing back to the caller while we walk the list.
-		auto ringing = getMessageFromPool(*data);
-		if (!ringing) return;   // pool exhausted: drop, peer retransmits (#101A)
-		ringing->setHeader("SIP/2.0 180 Ringing");
-		ringing->clearBody();
-		std::string activeIp = _localIp;
-		ringing->setVia(std::string(data->getVia()) + ";received=" + activeIp);
-		ringing->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
-		ringing->setContact(buildContact(destNumber));
-		_outbox.emplace_back(data->getSource(), std::move(ringing));
-
-		huntRingNext(newSession);   // ring the first member, arm its timeout
+	// Dial plan (Issue #69): the bounded, ordered pattern → action rule table.
+	// Deliberately evaluated HERE — after every reserved virtual extension (777,
+	// 999, 98x zones, 440, 70x orbits) and after the direct ring-group lookup, but
+	// before CFU/DND/extension lookup. That ordering is what makes the feature
+	// additive rather than a behavior change: a rule can only ever intercept a
+	// dialed number that would otherwise have reached the ordinary extension
+	// lookup (and, for an unknown number, 404). No rule can shadow the echo test,
+	// a park retrieval or a configured group extension — so even a catch-all "*"
+	// pattern leaves the built-ins working. Nothing matched ⇒ routeDialPlan()
+	// returns false and everything below runs exactly as it did before #69.
+	if (routeDialPlan(data, caller.value(), destNumber))
+	{
 		return;
 	}
 
@@ -2791,6 +2724,289 @@ std::vector<std::tuple<std::string, std::string, std::string>> RequestsHandler::
 	return _snapshot.ringGroups;
 }
 
+// ── Action dispatch shared by the built-in codes and the dial plan (#69) ─────
+
+void RequestsHandler::routePageZone(const std::shared_ptr<SipMessage>& data,
+	const std::shared_ptr<SipClient>& caller,
+	const pbx::PageZone& zone)
+{
+	// A zone page is a scoped 999: fork an intercom (auto-answer) INVITE to every
+	// registered member of the zone. Lifted verbatim out of onInvite()'s 98x
+	// branch so the dial plan reaches the same code. Unlike routeRingGroup this
+	// needs no zone-extension parameter: startBroadcastFork stamps the intercom
+	// Contact as 999 for every page, built-in or dial-rule-aliased alike, so the
+	// zone's own extension never appears on the wire.
+	std::vector<std::shared_ptr<SipClient>> targets;
+	for (const auto& m : zone.members)
+	{
+		if (m == caller->getNumber()) continue;
+		auto mc = findClient(m);
+		if (mc.has_value())
+			targets.push_back(mc.value());
+	}
+
+	if (targets.empty())
+	{
+		std::shared_ptr<SipMessage> responseObj = getMessageFromPool(*data);
+		if (!responseObj) return;   // pool exhausted: drop, peer retransmits (#101A)
+		responseObj->setHeader(SipMessageTypes::UNAVAILABLE);
+		responseObj->clearBody();
+		responseObj->setContact(buildContact(caller->getNumber()));
+		_outbox.emplace_back(data->getSource(), std::move(responseObj));
+		return;
+	}
+
+	startBroadcastFork(data, caller, std::move(targets), /*intercom=*/true);
+}
+
+void RequestsHandler::routeRingGroup(const std::shared_ptr<SipMessage>& data,
+	const std::shared_ptr<SipClient>& caller,
+	const std::string& groupExt, const pbx::RingGroup& group)
+{
+	// Ring-all reuses the broadcast fork (without the intercom auto-answer headers,
+	// so members ring normally); hunt rings members one at a time, driven from
+	// tick(). Lifted verbatim out of onInvite()'s ring-group branch. `groupExt` is
+	// the REAL group extension — under a dial rule it differs from the dialed
+	// number, and Session::setGroupExt feeds the hunt-exhausted CDR and the
+	// no-answer Contact, both of which want the group's identity, not the alias.
+
+	// Collect the registered members (skip the caller and any offline member).
+	std::vector<std::shared_ptr<SipClient>> members;
+	std::vector<std::string> huntOrder;
+	for (const auto& m : group.members)
+	{
+		if (m == caller->getNumber()) continue;
+		auto mc = findClient(m);
+		if (mc.has_value())
+		{
+			members.push_back(mc.value());
+			huntOrder.push_back(m);
+		}
+	}
+
+	if (members.empty())
+	{
+		std::shared_ptr<SipMessage> responseObj = getMessageFromPool(*data);
+		if (!responseObj) return;   // pool exhausted: drop, peer retransmits (#101A)
+		responseObj->setHeader(SipMessageTypes::UNAVAILABLE);
+		responseObj->clearBody();
+		responseObj->setContact(buildContact(caller->getNumber()));
+		endHandle(data->getFromNumber(), responseObj);
+		return;
+	}
+
+	if (group.mode == pbx::GroupMode::RingAll)
+	{
+		startBroadcastFork(data, caller, std::move(members), /*intercom=*/false);
+		return;
+	}
+
+	// Hunt (sequential): build a broadcast-style session but ring one at a time.
+	auto newSession = allocateSession(std::string(data->getCallID()), caller);
+	if (!newSession)
+	{
+		std::shared_ptr<SipMessage> responseObj = getMessageFromPool(*data);
+		if (!responseObj) return;   // pool exhausted: drop, peer retransmits (#101A)
+		responseObj->setHeader("SIP/2.0 503 Service Unavailable");
+		responseObj->clearBody();
+		responseObj->setContact(buildContact(caller->getNumber()));
+		_outbox.emplace_back(data->getSource(), std::move(responseObj));
+		return;
+	}
+	newSession->setBroadcast(true);
+	newSession->setHunt(true);
+	newSession->setGroupExt(groupExt);
+	newSession->setInviteMessage(data);
+	newSession->setHuntMembers(std::move(huntOrder));
+	newSession->setHuntIndex(0);
+	_sessions.emplace(data->getCallID(), newSession);
+
+	// 180 Ringing back to the caller while we walk the list.
+	auto ringing = getMessageFromPool(*data);
+	if (!ringing) return;   // pool exhausted: drop, peer retransmits (#101A)
+	ringing->setHeader("SIP/2.0 180 Ringing");
+	ringing->clearBody();
+	std::string activeIp = _localIp;
+	ringing->setVia(std::string(data->getVia()) + ";received=" + activeIp);
+	ringing->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
+	ringing->setContact(buildContact(groupExt));
+	_outbox.emplace_back(data->getSource(), std::move(ringing));
+
+	huntRingNext(newSession);   // ring the first member, arm its timeout
+}
+
+// ── Dial plan (Issue #69) ────────────────────────────────────────────────────
+
+bool RequestsHandler::routeDialPlan(const std::shared_ptr<SipMessage>& data,
+	const std::shared_ptr<SipClient>& caller,
+	const std::string& destNumber)
+{
+	// Fast path: the table is empty on a default install, so the overwhelmingly
+	// common case costs one size check and nothing else.
+	if (_dialPlan.empty())
+	{
+		return false;
+	}
+
+	const pbx::DialRule* rule = _dialPlan.match(destNumber);
+	if (!rule)
+	{
+		return false;   // fallthrough — routing continues exactly as it did pre-#69
+	}
+
+	queueLog("Dial plan: " + destNumber + " matched \"" + rule->pattern + "\" -> " +
+		pbx::dialActionName(rule->action) + " " + rule->target);
+
+	switch (rule->action)
+	{
+	case pbx::DialActionType::RingGroup:
+		if (const pbx::RingGroup* group = findRingGroup(rule->target))
+		{
+			routeRingGroup(data, caller, rule->target, *group);
+			return true;
+		}
+		break;
+
+	case pbx::DialActionType::PageZone:
+		if (const pbx::PageZone* zone = findPageZone(rule->target))
+		{
+			routePageZone(data, caller, *zone);
+			return true;
+		}
+		break;
+
+	case pbx::DialActionType::ParkOrbit:
+	{
+		// Park/retrieve is stateless config-wise — the orbit always exists, so the
+		// only way this fails is a target outside this build's orbit range, which
+		// setDialRule() already refuses. Re-checked here anyway: POCKETDIAL_PARK_SLOTS
+		// can shrink under a rebuilt firmware that reloads an older NVS blob.
+		const int orbitIdx = _park.orbitIndex(rule->target);
+		if (orbitIdx >= 0)
+		{
+			_park.onInvite(data, caller, orbitIdx);
+			return true;
+		}
+		break;
+	}
+	}
+
+	// The rule matched but its target no longer resolves — a group or zone deleted
+	// after the rule was written, or an orbit outside this build's range. Answer
+	// 404 rather than falling through: falling through would silently ring a real
+	// extension that happens to share the dialed digits, which is a mis-routed
+	// call, whereas a stale rule failing loudly is diagnosable from one 404.
+	queueLog("Dial plan: rule \"" + rule->pattern + "\" -> " +
+		pbx::dialActionName(rule->action) + " " + rule->target +
+		" has no such target; answering 404", true);
+	auto responseObj = getMessageFromPool(*data);
+	if (!responseObj) return true;   // pool exhausted: drop, peer retransmits (#101A)
+	responseObj->setHeader(SipMessageTypes::NOT_FOUND);
+	responseObj->clearBody();
+	responseObj->setContact(buildContact(caller->getNumber()));
+	_outbox.emplace_back(data->getSource(), std::move(responseObj));
+	return true;
+}
+
+void RequestsHandler::setDialRule(const std::string& pattern, const std::string& action,
+	const std::string& target)
+{
+	std::vector<std::pair<bool, std::string>> localLogs;
+	{
+		std::lock_guard<std::mutex> lock(_mutex);
+
+		// Validate once, here, so a bad rule can never reach the SIP thread — and
+		// so the NVS blob (tab/newline delimited) can never be corrupted by a
+		// smuggled separator. Same "log and drop" contract as setRingGroup.
+		if (!pbx::isDialTokenSafe(pattern))
+		{
+			queueLog("Dial rule ignored: invalid pattern \"" + pattern + "\"", true);
+		}
+		else if (pattern == "777" || pattern == "999" || pattern == "440")
+		{
+			// These are handled above the dial plan in onInvite(), so a rule here
+			// would never fire. Refuse it instead of accepting a dead rule.
+			queueLog("Dial rule ignored: " + pattern +
+				" is a reserved extension and is routed before the dial plan", true);
+		}
+		else if (target.empty())
+		{
+			// Empty target deletes the rule (mirrors setRingGroup's empty member list).
+			if (_dialPlan.erase(pattern))
+			{
+				queueLog("Dial rule " + pattern + " deleted");
+				persistDialPlan();
+			}
+		}
+		else if (!pbx::isDialTokenSafe(target))
+		{
+			queueLog("Dial rule ignored: invalid target \"" + target + "\"", true);
+		}
+		else
+		{
+			pbx::DialActionType parsed;
+			if (!pbx::parseDialAction(action, parsed))
+			{
+				queueLog("Dial rule ignored: unknown action \"" + action +
+					"\" (want group|page|park)", true);
+			}
+			else if (parsed == pbx::DialActionType::PageZone && !pbx::isPageZoneExt(target))
+			{
+				queueLog("Dial rule ignored: page target " + target +
+					" is not a paging zone (zones are 980-989)", true);
+			}
+			else if (parsed == pbx::DialActionType::ParkOrbit && !pbx::isParkOrbitExt(target))
+			{
+				queueLog("Dial rule ignored: park target " + target +
+					" is not a park orbit for this build", true);
+			}
+			else
+			{
+				pbx::DialRule rule;
+				rule.pattern = pattern;
+				rule.action = parsed;
+				rule.target = target;
+				if (!_dialPlan.upsert(rule))
+				{
+					queueLog("Dial rule ignored (table full) for " + pattern, true);
+				}
+				else
+				{
+					queueLog("Dial rule " + pattern + " -> " +
+						pbx::dialActionName(parsed) + " " + target);
+					persistDialPlan();
+				}
+			}
+		}
+
+		// Refresh dashboard snapshot immediately (mirrors setRingGroup).
+		{
+			std::lock_guard<std::mutex> snapLock(_snapshotMutex);
+			_snapshot.dialRules.clear();
+			_snapshot.dialRules.reserve(_dialPlan.size());
+			for (const auto& r : _dialPlan.rules())
+			{
+				_snapshot.dialRules.emplace_back(r.pattern, pbx::dialActionName(r.action), r.target);
+			}
+		}
+
+		localLogs = std::move(_logQueue);
+		_logQueue.clear();
+	}
+
+	for (const auto& log : localLogs)
+	{
+		if (log.first) std::cerr << log.second << std::endl;
+		else std::cout << log.second << std::endl;
+	}
+}
+
+std::vector<std::tuple<std::string, std::string, std::string>> RequestsHandler::getDialRules()
+{
+	std::lock_guard<std::mutex> lock(_snapshotMutex);
+	return _snapshot.dialRules;
+}
+
 // ── Registrar mode (STAGE 2) ──────────────────────────────────────────────────
 
 void RequestsHandler::setRegistrarMode(RegistrarMode mode)
@@ -3171,6 +3387,15 @@ void RequestsHandler::tick()
 				pbx::joinMembers(g.members));
 		}
 
+		// Dial-plan rules (Issue #69), in table order. Rebuilt from _dialPlan here
+		// alongside ringGroups rather than mirrored out of band like pageZones, so
+		// the snapshot swap below can never blank or re-order them.
+		nextSnapshot.dialRules.reserve(_dialPlan.size());
+		for (const auto& r : _dialPlan.rules())
+		{
+			nextSnapshot.dialRules.emplace_back(r.pattern, pbx::dialActionName(r.action), r.target);
+		}
+
 		// Parked calls view: {orbit, parkedExt, parker, secondsParked}. This full
 		// rebuild already reflects anything _park.sweep() just did above, so clear
 		// the dirty flag here rather than leaving it to trigger a redundant mirror
@@ -3444,6 +3669,25 @@ void RequestsHandler::loadPbxConfig()
 		if (!z.members.empty()) _pageZones[rec[0]] = std::move(z);
 	}
 
+	// Dial plan (Issue #69): pattern \t action \t target, one record per rule, in
+	// evaluation order. DialPlan::upsert() enforces POCKETDIAL_MAX_DIAL_RULES on
+	// its own, so a blob written by a build with a larger cap simply stops being
+	// applied at this build's ceiling instead of overflowing it. Records that no
+	// longer validate (an unknown action, or a park target outside a shrunken
+	// POCKETDIAL_PARK_SLOTS) are dropped rather than loaded.
+	for (const auto& rec : deserializeBlob(readBlob("dplan")))
+	{
+		if (rec.size() < 3 || rec[0].empty() || rec[2].empty()) continue;
+		pbx::DialRule rule;
+		if (!pbx::parseDialAction(rec[1], rule.action)) continue;
+		if (!pbx::isDialTokenSafe(rec[0]) || !pbx::isDialTokenSafe(rec[2])) continue;
+		if (rule.action == pbx::DialActionType::PageZone && !pbx::isPageZoneExt(rec[2])) continue;
+		if (rule.action == pbx::DialActionType::ParkOrbit && !pbx::isParkOrbitExt(rec[2])) continue;
+		rule.pattern = rec[0];
+		rule.target = rec[2];
+		if (!_dialPlan.upsert(rule)) break;   // table full at this build's cap
+	}
+
 	nvs_close(h);
 #endif
 }
@@ -3502,6 +3746,28 @@ void RequestsHandler::persistPageZones()
 	if (nvs_open(NVS_PBX_NS, NVS_READWRITE, &h) == ESP_OK)
 	{
 		nvs_set_str(h, "pzones", blob.c_str());
+		nvs_commit(h);
+		nvs_close(h);
+	}
+#endif
+}
+
+void RequestsHandler::persistDialPlan()
+{
+#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
+	// Order matters here in a way it does not for the maps above: the blob is
+	// written (and replayed) in table order, because that IS the evaluation order.
+	std::string blob;
+	for (const auto& r : _dialPlan.rules())
+	{
+		blob += r.pattern; blob += '\t';
+		blob += pbx::dialActionName(r.action); blob += '\t';
+		blob += r.target; blob += '\n';
+	}
+	nvs_handle_t h;
+	if (nvs_open(NVS_PBX_NS, NVS_READWRITE, &h) == ESP_OK)
+	{
+		nvs_set_str(h, "dplan", blob.c_str());
 		nvs_commit(h);
 		nvs_close(h);
 	}

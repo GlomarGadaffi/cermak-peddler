@@ -168,7 +168,8 @@ Iteration D  ── Observability & ops
 
 Iteration E+ ── Bigger bets
   ✓   Call parking · BLF/presence · paging zones ........... shipped (ISSUES.md #65-67)
-  P1  Dial plan / hunt-group generalization (reuse 999 forking) · directed pickup .. ISSUES.md #68/#69
+  ✓   Dial plan / hunt-group generalization (pattern -> action table) ... shipped (ISSUES.md #69)
+  P1  Directed call pickup (pickup groups) ................................ ISSUES.md #68
   P2  DHCP Opt-66 · multi-vendor provisioning
   P2  Secure Boot v2 + flash encryption + signed OTA  (durable physical/supply-chain fix)
   P2  Multi-AP/mesh · optional HTTPS · SRTP
