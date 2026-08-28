@@ -1,9 +1,9 @@
 #include "SipMessageFactory.hpp"
 #include "RequestsHandler.hpp"
 
-std::optional<std::shared_ptr<SipMessage>> SipMessageFactory::createMessage(std::string message, sockaddr_in src)
+std::optional<std::shared_ptr<SipMessage>> SipMessageFactory::createMessage(std::string_view message, sockaddr_in src)
 {
-	auto msg = RequestsHandler::getMessageFromPool(std::move(message), src);
+	auto msg = RequestsHandler::getMessageFromPool(message, src);
 	if (!msg)
 	{
 		return std::nullopt;

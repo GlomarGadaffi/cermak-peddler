@@ -806,12 +806,20 @@ void HttpServer::sendHtml(int sock)
 	             std::string(CGA_INDEX_HTML));
 }
 
-// Helper: JSON-escape a string
+// Helper: JSON-escape a string. Beyond the five named C0 escapes, JSON (RFC
+// 8259 §7) requires every other U+0000-U+001F control byte to be escaped too
+// (as \u00XX) — not just the printable-looking ones. This matters here
+// because #105 made /api/trace/#api/pcap capable of carrying the raw,
+// unmodified bytes of an inbound SIP packet: a malformed-but-tolerated packet
+// containing a stray control byte (e.g. 0x01, 0x1F) would otherwise land in
+// the JSON body unescaped, producing invalid JSON that breaks the dashboard's
+// JSON.parse() and silently freezes the live trace view.
 static std::string jsonEscape(const std::string& s)
 {
+	static const char* hex = "0123456789abcdef";
 	std::string out;
 	out.reserve(s.size() + 8);
-	for (char c : s)
+	for (unsigned char c : s)
 	{
 		switch (c)
 		{
@@ -820,7 +828,17 @@ static std::string jsonEscape(const std::string& s)
 			case '\n': out += "\\n";  break;
 			case '\r': out += "\\r";  break;
 			case '\t': out += "\\t";  break;
-			default:   out += c;
+			default:
+				if (c < 0x20)
+				{
+					out += "\\u00";
+					out += hex[(c >> 4) & 0x0F];
+					out += hex[c & 0x0F];
+				}
+				else
+				{
+					out += static_cast<char>(c);
+				}
 		}
 	}
 	return out;

@@ -179,7 +179,12 @@ void UdpServer::receiveLoop()
 			reinterpret_cast<struct sockaddr*>(&senderEndPoint), &len);
 #endif
 		if (!_keepRunning || bytesReceived <= 0) continue;
-		_onNewMessageEvent(std::string(buffer, static_cast<size_t>(bytesReceived)), senderEndPoint);
+		// Issue #81: zero-copy hand-off — a view of the bytes recvfrom() just wrote
+		// into this loop's own stack buffer, valid until the next iteration
+		// overwrites it. No allocation on the per-packet hot path; every downstream
+		// consumer either copies what it needs synchronously or is done with the
+		// view before this call returns (see the OnNewMessageEvent comment above).
+		_onNewMessageEvent(std::string_view(buffer, static_cast<size_t>(bytesReceived)), senderEndPoint);
 	}
 }
 

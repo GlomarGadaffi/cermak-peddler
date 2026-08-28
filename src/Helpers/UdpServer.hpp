@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include <atomic>
 #include <functional>
+#include <string_view>
 #include <thread>
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
@@ -33,7 +34,16 @@
 class UdpServer
 {
 public:
-	using OnNewMessageEvent = std::function<void(std::string, sockaddr_in)>;
+	// Issue #81: a view into receiveLoop()'s own stack buffer for the duration of
+	// the call — NOT into anything static/shared, so nothing here changes once
+	// concurrent UdpServer instances or overlapping deliveries are involved. Every
+	// registered handler runs synchronously and to completion before the next
+	// recvfrom() overwrites that buffer, so the view is valid for exactly as long
+	// as this event call is on the stack. A handler that needs the bytes to
+	// outlive this call must copy them before returning — see SipServer::
+	// onNewMessage() and RequestsHandler::handle()'s pcap capture for the two
+	// places that actually do.
+	using OnNewMessageEvent = std::function<void(std::string_view, sockaddr_in)>;
 	static constexpr int BUFFER_SIZE = 2048;
 
 	// Back-off constants for socket/bind retry (ESP builds only).

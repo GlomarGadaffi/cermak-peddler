@@ -268,11 +268,11 @@ std::shared_ptr<SipMessage> RequestsHandler::acquirePooledMessage()
 	}
 }
 
-std::shared_ptr<SipMessage> RequestsHandler::getMessageFromPool(std::string message, sockaddr_in src)
+std::shared_ptr<SipMessage> RequestsHandler::getMessageFromPool(std::string_view message, sockaddr_in src)
 {
 	std::shared_ptr<SipMessage> msg = acquirePooledMessage();
 	if (!msg) return nullptr;   // acquirePooledMessage() already logged the pressure
-	msg->reset(std::move(message), src);
+	msg->reset(message, src);
 	return msg;
 }
 
@@ -304,7 +304,7 @@ void RequestsHandler::initHandlers()
 	_handlers.emplace(SipMessageTypes::SUBSCRIBE,         std::bind(&RequestsHandler::onSubscribe,      this, std::placeholders::_1));
 }
 
-void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
+void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_view rawBytes)
 {
 	// Input validation: Drop null or structurally malformed packets instantly (SEC-02)
 	if (!request || !request->isValidMessage())
@@ -339,9 +339,24 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request)
 		// signaling-research aid, not a wire-level DoS forensics tool, and
 		// capturing before the rate limiter would mean pulling the ring buffer
 		// out from under _mutex for every flood packet too.
-		// Serialized straight into the ring slot — no per-packet temporary inside
+		// Written straight into the ring slot — no per-packet temporary inside
 		// the critical section (Issue #101(D)).
-		request->toString(_pcapCapture.recordInto(/*outbound=*/false, request->getSource()));
+		std::string& pcapSlot = _pcapCapture.recordInto(/*outbound=*/false, request->getSource());
+		if (!rawBytes.empty())
+		{
+			// Issue #105: capture the exact bytes recvfrom() delivered, not a
+			// re-serialization of the parsed message — whitespace, compact header
+			// forms (f:/t:/v:/i:), CRLF-vs-LF tolerance, or any malformed-but-
+			// tolerated line the parser normalized must survive in the capture.
+			pcapSlot.assign(rawBytes.data(), rawBytes.size());
+		}
+		else
+		{
+			// No wire bytes offered (a message built in-process, or a test calling
+			// handle() directly with no UdpServer/SipServer involved) — the parsed
+			// form is genuinely what such a caller means to inspect.
+			request->toString(pcapSlot);
+		}
 
 		auto client = findClientByAddress(request->getSource());
 		if (client.has_value())

@@ -207,6 +207,59 @@ Confirmed as a live bug via real-hardware evidence in the issue's comment thread
 Fixed: on `buildCancel()` failure the dialog stays in `AwaitingInviteOk` with a short retry deadline and a distinct "cancel build failed — will retry" log; the next `sweep()` tick retries, succeeding once pool pressure eases. Per the issue's own caution against getting stuck forever either, added a bounded retry count (`BeepDialog::cancelRetries`, capped at 5) — after five consecutive failures `sweep()` gives up and frees the slot rather than retrying indefinitely under sustained exhaustion.
 
 Covered by two new tests in `tests/RegisterBeeper_test.cpp` (a new `FakePbxEnv::messagePoolAvailable` toggle forces `buildCancel()` to fail, matching the existing `sessionPoolAvailable` pattern): one confirms the retry-then-succeed path, the other confirms the bounded give-up-and-free path under sustained pressure. Full detail: https://github.com/GlomarGadaffi/pocket-dial/issues/104
+### 🟢 Issue #105: `/api/pcap` inbound capture stores re-serialized SIP, not wire bytes
+* **Status**: ✅ Resolved 2026-08-19
+* **Labels**: `bug`, `network`
+
+#### Description
+The inbound `/api/pcap`/`/api/trace` capture point in `RequestsHandler::handle()` recorded `request->toString()` — a re-serialization of the **parsed** message, not the bytes `recvfrom()` actually delivered. `SipMessage::toString()` always writes CRLF line endings and rejoins the parsed `_startLine`/`_headerLines`/`_body`; it does not restore whatever line-ending convention or malformed-but-tolerated layout the wire bytes actually used. Whitespace, compact-header forms (`v:`/`f:`/`t:`/`i:`), CRLF-vs-LF tolerance, or any malformed-but-tolerated line the SEC-02 parser normalized (a blank line inside the header block is silently dropped) was lost — for a signaling-debugging tool this is a fidelity bug pointed in the worst direction: the more unusual or hostile the input, the more the capture diverges from what actually arrived. The outbound side was already correct (server-minted messages, so `toString()` genuinely is the wire bytes there).
+
+#### Resolution
+`RequestsHandler::handle()` now takes an optional `std::string_view rawBytes` and writes it verbatim into the pcap ring slot when the caller supplies it, falling back to the old `toString()` capture otherwise (every pre-existing `handle(msg)` call site, all in `tests/`, keeps compiling and keeps its old behavior unchanged). `SipServer::onNewMessage()` — the one production caller — now always supplies it: `SipMessageFactory::createMessage()` and `RequestsHandler::getMessageFromPool()` were changed to take the message by view/reference rather than by value, so the original wire-received bytes stay intact in `onNewMessage()`'s local variable all the way through to the `handle()` call, with nothing along the way copying, moving-from, or discarding them. This pairs directly with Issue #81: the same reference-only chain that makes the raw bytes available here is what made the `UdpServer` per-packet allocation removable there.
+
+`docs/API.md`'s "exact SIP bytes" / "exactly as captured" claims for `/api/pcap` and `/api/trace` are now literally true for both directions in production — no wording change needed.
+
+Covered by 2 new tests in `tests/PcapCapture_test.cpp`: `InboundCaptureStoresExactWireBytesNotReserializedMessage` (a bare-LF, compact-header fixture that provably re-serializes to different bytes via `toString()`, asserting the capture equals the original raw text) and `InboundCaptureFallsBackToToStringWhenNoRawBytesGiven` (pinning the no-`rawBytes` fallback path). Full host suite: 193/193 passing.
+
+Full detail: https://github.com/GlomarGadaffi/pocket-dial/issues/105
+
+---
+
+### 🟢 Issue #111: `SIP_TRANSPORT=lan8720` on a non-esp32 target fails 1400 objects deep instead of at configure time
+* **Status**: ✅ Resolved 2026-08-19
+* **Labels**: `bug`, `esp32`
+
+#### Description
+`idf.py -D SIP_TRANSPORT=lan8720 set-target esp32s3 && idf.py build` configured without complaint and then failed ~1430 objects into the build with `main/esp_main_eth_lan8720.cpp:44:10: fatal error: esp_eth_phy_lan87xx.h: No such file or directory`. LAN8720 drives the classic ESP32's **internal EMAC**; the ESP32-S3 (and every other non-`esp32` target) has no internal EMAC, so the combination cannot work at runtime either — but nothing in the build system rejected it up front. Root cause: three gates that should have agreed didn't. `main/idf_component.yml`'s component-manager rule (`target == esp32`) correctly declined to fetch `espressif/lan87xx` on a non-`esp32` target; but `main/CMakeLists.txt`'s `lan8720` branch selected `esp_main_eth_lan8720.cpp` and added `REQUIRES espressif__lan87xx` based on `SIP_TRANSPORT` alone, with no target guard, and the source file's own `#if ESP_IDF_VERSION >= ...` include guard also carried no target check. So the source asked for a header the manifest had deliberately declined to fetch, and the resulting failure read like an ESP-IDF version incompatibility rather than an unsupported target/transport pairing.
+
+#### Resolution
+Added a configure-time guard to the `lan8720` branch of `main/CMakeLists.txt`: `if(NOT IDF_TARGET STREQUAL "esp32")` → `message(FATAL_ERROR ...)` naming `SIP_TRANSPORT=eth` (W5500) as the alternative for the target in use. `IDF_TARGET` is the same CMake cache variable the component manager's own `target ==` rule resolves against (set well before component registration — confirmed against `esp-idf/tools/cmake/targets.cmake` in this environment's installed ESP-IDF checkout), so the guard agrees with the gate that was already correct instead of introducing a fourth, independent one. Turns the 1400-object-deep missing-header error into a one-line configure failure.
+
+Verified in isolation with a standalone `cmake -P` script reproducing the exact guard expression: fails immediately for `IDF_TARGET=esp32s3` with the intended message, passes through cleanly for `IDF_TARGET=esp32`. A full `idf.py` configure run was not exercised — no activated ESP-IDF environment (`export.ps1`) in this session — so this is a static/isolated verification, not an end-to-end repro-to-green. The shipped `esp32` LAN8720 path and every other `SIP_TRANSPORT` branch (`eth`, `display`, default WiFi SoftAP) are untouched.
+
+Full detail: https://github.com/GlomarGadaffi/pocket-dial/issues/111
+
+---
+
+### 🟢 Issue #81: Zero-Allocation Network Ingestion (`UdpServer` Refactor)
+* **Status**: ✅ Resolved 2026-08-19
+* **Labels**: (none on the original issue)
+
+#### Description
+`UdpServer::receiveLoop()` heap-allocated a `std::string` copy of every incoming packet — `_onNewMessageEvent(std::string(buffer, bytesReceived), senderEndPoint)` — before the parser or message pool ever saw the bytes. The issue's blueprint proposed redefining `OnNewMessageEvent` to pass a zero-copy `std::string_view` instead.
+
+A first pass through this issue (see the issue's own comment thread) traced the call chain and found the literal blueprint would have been a **no-op at best**: as of `main` at the time, everything below `onNewMessage` — `SipMessageFactory::createMessage`, `RequestsHandler::getMessageFromPool`, the pooled `SipMessage::reset()` — already took the string **by value** and moved it through unconditionally, with nothing rejecting or intercepting a packet in between. Switching the event to `string_view` would only have *relocated* where the same one mandatory allocation happened, not removed it. That pass also flagged the version of this that *would* deliver a real win — skipping allocation for packets the Issue #38 rate limiter would reject anyway — as carrying real risk: the admission check lives inside `RequestsHandler::handle()`, the single entry point every test in the suite calls directly, and moving it out to check pre-parse would risk silently dropping defense-in-depth for any direct caller, present or future. Recorded as not safe to do as a quick pass.
+
+#### Resolution
+Fixing Issue #105 (same PR) changed the basis that first pass reasoned from: `SipMessageFactory::createMessage()` and `RequestsHandler::getMessageFromPool()` now take the message by reference/view rather than by value (so the original wire bytes can still reach `handle()`'s pcap capture), and `SipMessage::reset()`/`splitMessage()` already only ever read through their `message` parameter — nothing in the chain below `receiveLoop()` takes ownership of it. With that in place the literal blueprint stopped being a no-op: the `std::string(buffer, n)` allocation in `receiveLoop()` had no downstream consumer left to justify it.
+
+Implemented as scoped: `UdpServer::OnNewMessageEvent` is now `std::function<void(std::string_view, sockaddr_in)>`; `receiveLoop()` passes a view over its existing per-task stack buffer (deliberately **not** the `static` scratchpad the issue's blueprint sketched — a `static` buffer would share storage across `UdpServer` instances and introduce a race that doesn't exist today); and every link in the chain (`SipServer::onNewMessage`, `SipMessageFactory::createMessage`, `RequestsHandler::getMessageFromPool`, `SipMessage::reset`/`splitMessage`) now passes the view through instead of an owned string. Audited end to end: every consumer that needs the bytes past this call already copies them out synchronously before returning — `splitMessage()` substrs into the parsed message's owned `_startLine`/`_headerLines`/`_body`, and the #105 pcap-capture line copies into the ring slot — so nothing retains the view past the single synchronous call chain that produced it (`receiveLoop()` → `onNewMessage` → `createMessage` → `getMessageFromPool` → `reset` → back up to `handle()`).
+
+Deliberately did **not** take on the riskier admission-check relocation the first pass identified as the only path to a *bigger* win — `handle()`'s existing rate-limit/validity checks are untouched, so no defense-in-depth regression risk was introduced. Host-level functional coverage of the real `UdpServer`/`SipServer` socket layer (as opposed to the `RequestsHandler`/`SipMessage` pool-and-parse layer these views flow into, which the existing host suite already exercises heavily) remains a gap noted by the first pass and still not closed here — left as a follow-up rather than expanding this change's scope to build new socket-level test infrastructure.
+
+Verified via a full rebuild of the production `SipServer.exe` target (the only build target that actually compiles `UdpServer.cpp`/`SipServer.cpp`/`SipMessageFactory.cpp` — `tests/CMakeLists.txt` does not link those three), which succeeds clean with MSVC, plus the full host suite (193/193 passing) covering every downstream type this refactor touches. ESP-IDF device compilation was not exercised (no activated `idf.py` environment this session); `main/`'s only touch points (`esp_main*.cpp`) construct `SipServer` and never reference `OnNewMessageEvent` directly, so they are unaffected by the signature change.
+
+Full detail: https://github.com/GlomarGadaffi/pocket-dial/issues/81
 
 ---
 

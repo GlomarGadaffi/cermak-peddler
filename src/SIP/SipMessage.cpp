@@ -43,7 +43,7 @@ namespace
 	// a bare "\n\n" header/body separator — defensive parsing of untrusted
 	// network input (SEC-02), mirroring the tolerance the old buffer-scanning
 	// parse() had.
-	void splitMessage(const std::string& raw, std::string& startLine,
+	void splitMessage(std::string_view raw, std::string& startLine,
 		std::vector<std::string>& headerLines, std::string& body)
 	{
 		startLine.clear();
@@ -62,7 +62,10 @@ namespace
 		if (bodyStart != std::string::npos)
 		{
 			headerBlock = std::string_view(raw.data(), bodyStart);
-			body = raw.substr(bodyStart + sepLen);
+			// Issue #81: raw is now a view (into UdpServer::receiveLoop()'s stack
+			// buffer on the wire path), so this substr() is itself a view — assign()
+			// is what actually copies the bytes into the owned `body` string.
+			body.assign(raw.substr(bodyStart + sepLen));
 		}
 		else
 		{
@@ -148,7 +151,7 @@ SipMessage& SipMessage::operator=(const SipMessage& other)
 	return *this;
 }
 
-void SipMessage::reset(const std::string& message, sockaddr_in src)
+void SipMessage::reset(std::string_view message, sockaddr_in src)
 {
 	_src = src;
 	_hasSdp = (message.find("application/sdp") != std::string::npos);
