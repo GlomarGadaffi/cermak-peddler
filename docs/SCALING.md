@@ -171,6 +171,18 @@ All three counters surface on the dashboard (`getClientCount()`,
 `getSessionCount()`, processed/dropped packet counters), so operators can watch
 headroom and bump the tier before exhaustion becomes routine.
 
+> **Measured (Issue #79):** driving registrations from 40 distinct source IPs
+> (bypassing the Issue #38 per-IP limiter — see
+> [`tests/load/STRESS_FINDINGS.md`](../tests/load/STRESS_FINDINGS.md) for the
+> method) against a default-tier host build confirmed the client-pool ceiling
+> lands exactly at 32, with a clean `503` on the overflow and no crash. The
+> session-pool ceiling (8) is real server-side (confirmed via server logs) and
+> the ordinary call-setup path 503s cleanly at it, but the `777` echo/diagnostic
+> extension does **not** currently surface that 503 to the caller — see Issue
+> #115. This was a single-host, host-build measurement (loopback-range source
+> IPs, not real distinct hosts) — see STRESS_FINDINGS.md for exactly what that
+> does and doesn't validate versus a real multi-host run against firmware.
+
 ---
 
 ## 5. Why the defaults are 32 / 8 — and what breaks if you 10× them

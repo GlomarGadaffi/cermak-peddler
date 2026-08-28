@@ -47,6 +47,11 @@ add_executable(sip_parser_tests
     # Phase 0 of docs/PLAN_ADMIN_HTTP_ONLY.md: dark-by-default HTTP admin plane
     # test contract. Pulls in HttpServer.cpp for the first time in this target.
     AdminHttpGate_test.cpp
+    # Issue #32: the live SIP tracer's data path — the actual bytes GET
+    # /api/trace puts on the wire for the terminal's `trace on` command to
+    # render, not just the C++-side getTraceRecords() accessor other tests
+    # already cover.
+    HttpTraceCommand_test.cpp
     # Issue #77: DTMF CLASS codes (*60/*80/*73/*72NNNN) must update the same
     # dashboard snapshot the HTTP setters do, not bypass it by writing
     # _dnd/_forwards directly from inside onDtmfInfo's _mutex lock.

@@ -237,6 +237,14 @@ input:focus,select:focus{border-color:var(--brass);box-shadow:0 0 0 2px rgba(198
 .trace-screen .trc-empty{color:var(--ink-dim);font-family:var(--sans)}
 .trace-screen .trc-pkt{margin-bottom:8px;padding-bottom:8px;border-bottom:1px dashed var(--line)}
 .trace-screen .trc-pkt:last-child{border-bottom:none;margin-bottom:0}
+.trace-screen .trc-cmd{color:var(--green);opacity:.8;margin:2px 0 6px}
+
+/* trace command interpreter (Issue #32) */
+.term-line{display:flex;align-items:center;gap:6px;margin-top:8px;font-family:var(--mono);font-size:12px}
+.term-prompt{color:var(--green);flex-shrink:0}
+.term-input{flex:1;min-width:0;background:transparent;border:none;border-bottom:1px solid var(--line-hi);
+  color:var(--green);font-family:var(--mono);font-size:12px;padding:3px 0}
+.term-input:focus{outline:none;border-bottom-color:var(--amber)}
 
 @media (max-width:720px){
   .grid2{grid-template-columns:1fr}
@@ -342,9 +350,14 @@ R"html1(    <div class="stat"><span class="k">Jacks</span><span class="v" id="s-
     <div class="body">
       <div class="row" style="justify-content:space-between;margin-bottom:8px">
         <label class="toggle"><input type="checkbox" id="trace-toggle" onchange="toggleTrace()"><span class="track"><span class="knob"></span></span></label>
-        <span class="note" style="margin:0">Polls the recent-signaling ring while on. Downloadable as a full .pcap via <a href="/api/pcap">/api/pcap</a>.</span>
+        <span class="note" style="margin:0">Flip the switch, or type <b>trace on</b> / <b>trace off</b> below. Downloadable as a full .pcap via <a href="/api/pcap">/api/pcap</a>.</span>
       </div>
       <div class="trace-screen" id="trace-screen"><div class="trc-empty">Trace is off.</div></div>
+      <div class="term-line">
+        <span class="term-prompt">pd&gt;</span>
+        <input type="text" id="term-input" class="term-input" autocomplete="off" autocapitalize="off" spellcheck="false"
+               placeholder="trace on | trace off | help" onkeydown="if(event.key==='Enter')termExec()">
+      </div>
     </div>
   </section>
 
@@ -668,6 +681,7 @@ function saveForward(){
     .catch(function(err){setMsg("fwd-msg",err.message,"err");});
 }
 
+)html2" R"html2a(
 /* ── CDR table ── */
 function renderCdr(records){
   var tb=$("cdr-tbody");
@@ -687,23 +701,31 @@ function renderCdr(records){
 function fmtDur(s){s=Math.floor(s||0);var m=Math.floor(s/60),sec=s%60;return m+":"+(sec<10?"0":"")+sec;}
 function fmtAge(s){s=Math.floor(s||0);if(s<60)return s+"s ago";if(s<3600)return Math.floor(s/60)+"m ago";return Math.floor(s/3600)+"h ago";}
 
-/* ── live SIP trace (Issue #32): polls /api/trace while the toggle is on ── */
+/* ── live SIP trace (Issue #32): polls /api/trace while on ──
+   Started/stopped either by the checkbox or by the `trace on`/`trace off`
+   terminal commands below — both paths funnel through startTrace()/
+   stopTrace() so there is exactly one live-update mechanism (1.5 s polling
+   of the existing /api/trace ring), not a second one bolted on for the
+   command surface. */
 var traceOn=false,traceTimer=null,traceSeen={};
 function toggleTrace(){
   if($("trace-toggle").checked&&!gateCheck()){$("trace-toggle").checked=false;return;}
-  traceOn=$("trace-toggle").checked;
-  if(traceOn){
-    traceSeen={};$("trace-screen").innerHTML="";$("trace-count").textContent="0 shown";
-    pollTrace();traceTimer=setInterval(pollTrace,1500);
-  }else{
-    stopTrace();
-  }
+  if($("trace-toggle").checked)startTrace();else stopTrace();
 }
-function stopTrace(){
+// `cmdEcho`, if given, is the "pd> trace on" line to show once the screen has
+// been cleared for the new session (so it doesn't get wiped by the clear).
+function startTrace(cmdEcho){
+  traceOn=true;$("trace-toggle").checked=true;
+  traceSeen={};$("trace-screen").innerHTML="";$("trace-count").textContent="0 shown";
+  if(cmdEcho){termEcho(cmdEcho);termEcho("trace on — streaming.");}
+  pollTrace();traceTimer=setInterval(pollTrace,1500);
+}
+function stopTrace(cmdEcho){
   traceOn=false;$("trace-toggle").checked=false;
   if(traceTimer){clearInterval(traceTimer);traceTimer=null;}
   $("trace-count").textContent="off";
   $("trace-screen").innerHTML='<div class="trc-empty">Trace is off.</div>';
+  if(cmdEcho){termEcho(cmdEcho);termEcho("trace off.");}
 }
 function pollTrace(){
   fetch("/api/trace",{credentials:"same-origin"}).then(function(r){
@@ -729,6 +751,40 @@ function renderTraceAppend(records){
   if(added>0)screen.scrollTop=screen.scrollHeight;
   var shown=screen.querySelectorAll(".trc-pkt").length;
   $("trace-count").textContent=shown+" shown";
+}
+
+/* ── trace-screen command interpreter (Issue #32): `trace on` / `trace off` ──
+   A minimal line interpreter for the terminal input under the trace screen.
+   It does not add a new transport — `trace on`/`trace off` just call the same
+   startTrace()/stopTrace() the checkbox uses, so packets still arrive via the
+   existing /api/trace poll. Command echoes share the trace-screen's own
+   200-block client-side cap (renderTraceAppend), so typing commands can't
+   grow the DOM unbounded either. */
+function termEcho(line){
+  var screen=$("trace-screen");
+  var empty=screen.querySelector(".trc-empty");if(empty)empty.remove();
+  var div=document.createElement("div");div.className="trc-cmd";div.textContent=line;
+  screen.appendChild(div);
+  while(screen.children.length>200){screen.removeChild(screen.children[0]);}
+  screen.scrollTop=screen.scrollHeight;
+}
+function termExec(){
+  var input=$("term-input");var raw=input.value;input.value="";
+  if(!raw.trim())return;
+  var line="pd> "+raw;
+  var cmd=raw.trim().toLowerCase().replace(/\s+/g," ");
+  if(cmd==="trace on"){
+    if(traceOn){termEcho(line);termEcho("trace already on.");return;}
+    if(!gateCheck()){termEcho(line);termEcho("session required — log in above first.");return;}
+    startTrace(line);
+  }else if(cmd==="trace off"){
+    if(!traceOn){termEcho(line);termEcho("trace already off.");return;}
+    stopTrace(line);
+  }else if(cmd==="help"||cmd==="?"){
+    termEcho(line);termEcho("commands: trace on, trace off, help");
+  }else{
+    termEcho(line);termEcho("unknown command: "+raw);
+  }
 }
 
 /* ── networking ── */
@@ -798,7 +854,7 @@ function adminSetPin(mode){
   fetch("/api/admin/set-pin",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"pin="+encodeURIComponent(pin)})
     .then(function(r){
       if(r.status===401){handleAuthExpired();return;}
-)html2"
+)html2a"
 R"html3(      if(r.status===400){setMsg("admin-msg","Invalid PIN (min 4 chars).","err");return;}
       if(!r.ok){setMsg("admin-msg","Failed (HTTP "+r.status+").","err");return;}
       $(inputId).value="";$("admin-changepin").style.display="none";
