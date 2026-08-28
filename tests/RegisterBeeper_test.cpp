@@ -123,6 +123,85 @@ TEST(RegisterBeeper, LateOkAfterSweepCancelStillGetsAckedAndByed)
 	EXPECT_EQ(env.byeCalls[0].callId, callId);
 }
 
+// Issue #104: buildCancel() draws a message from the pool, which can be spent
+// under the same flood conditions that make an operator watch this log
+// (Issue #101(A)). sweep() must not claim "cancelled" or advance to
+// AwaitingCancelDone when nothing was actually sent — that would abandon the
+// dialog in a half-cancelled limbo no later tick ever revisits. It must retry
+// on a later tick instead, succeeding once pool pressure eases.
+TEST(RegisterBeeper, SweepRetriesCancelWhenBuildCancelFailsUnderPoolPressure)
+{
+	FakePbxEnv env;
+	RegisterBeeper beeper(env);
+
+	const sockaddr_in phoneAddr = FakePbxEnv::addr("192.168.1.50", 5060);
+	const auto t0 = std::chrono::steady_clock::now();
+	beeper.sendBeep(std::make_shared<SipClient>("101", phoneAddr));
+	ASSERT_EQ(env.sent.size(), 1u);
+	const std::string callId = callIdOf(env.sentRaw(0));
+	ASSERT_FALSE(callId.empty());
+
+	// No answer within the beep deadline, but the message pool is exhausted:
+	// buildCancel() returns nullptr. No CANCEL goes out, no "cancelled" log,
+	// and the dialog must not move to AwaitingCancelDone (verified below: it is
+	// still recognized as an in-flight beep dialog on the next sweep, i.e. it
+	// was not silently freed either).
+	env.messagePoolAvailable = false;
+	beeper.sweep(t0 + std::chrono::seconds(6));
+	EXPECT_EQ(env.sent.size(), 1u) << "no CANCEL should have been sent";
+	ASSERT_FALSE(env.logs.empty());
+	EXPECT_EQ(env.logs.back().find("cancelled"), std::string::npos) << env.logs.back();
+	EXPECT_NE(env.logs.back().find("cancel build failed"), std::string::npos)
+		<< env.logs.back();
+
+	// Pool pressure eases; the next sweep tick must retry and succeed, proving
+	// the dialog was left retryable rather than stuck forever.
+	env.messagePoolAvailable = true;
+	beeper.sweep(t0 + std::chrono::seconds(7));
+	ASSERT_EQ(env.sent.size(), 2u);
+	EXPECT_EQ(env.sentRaw(1).rfind("CANCEL sip:", 0), 0u) << env.sentRaw(1);
+	EXPECT_NE(env.logs.back().find("cancelled"), std::string::npos) << env.logs.back();
+
+	// The dialog is still tracked (now AwaitingCancelDone): a raced 200 OK is
+	// still ACKed/BYEd, exactly like the non-pool-pressure path.
+	EXPECT_TRUE(beeper.handleOk(okFor(callId, phoneAddr)));
+	ASSERT_EQ(env.sent.size(), 4u);   // + ACK, + (BYE delegated to serverBye)
+}
+
+// Issue #104 follow-up: retrying forever is its own bug ("don't leave it stuck
+// forever either"). If the message pool never recovers, sweep() must eventually
+// give up and free the slot instead of retrying indefinitely.
+TEST(RegisterBeeper, SweepGivesUpAndFreesSlotAfterSustainedPoolPressure)
+{
+	FakePbxEnv env;
+	RegisterBeeper beeper(env);
+
+	const sockaddr_in phoneAddr = FakePbxEnv::addr("192.168.1.50", 5060);
+	const auto t0 = std::chrono::steady_clock::now();
+	beeper.sendBeep(std::make_shared<SipClient>("101", phoneAddr));
+	const std::string callId = callIdOf(env.sentRaw(0));
+	ASSERT_FALSE(callId.empty());
+
+	// Pool pressure never eases: every retry tick fails to build the CANCEL.
+	env.messagePoolAvailable = false;
+	auto t = t0 + std::chrono::seconds(6);
+	for (int i = 0; i < 10; ++i)
+	{
+		beeper.sweep(t);
+		t += std::chrono::seconds(1);
+	}
+
+	// No CANCEL was ever sent (pool never had a slot for it) ...
+	EXPECT_EQ(env.sent.size(), 1u) << "only the original INVITE, never a CANCEL";
+	// ... and sweep eventually gave up rather than retrying forever.
+	ASSERT_FALSE(env.logs.empty());
+	EXPECT_NE(env.logs.back().find("giving up"), std::string::npos) << env.logs.back();
+
+	// The slot is free again: this now-stale Call-ID is no longer recognized,
+	// exactly like the normal fallback-expiry path (SlotFreedByFallback...).
+	EXPECT_FALSE(beeper.handleOk(okFor(callId, phoneAddr)));
+}
+
 // If nothing further ever arrives after the CANCEL (the CANCEL landed cleanly,
 // or the response was simply lost), the slot must still be freed by the bounded
 // fallback rather than lingering forever.

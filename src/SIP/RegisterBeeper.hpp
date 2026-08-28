@@ -74,6 +74,12 @@ private:
 		std::string ext;           // target extension (phone number)
 		sockaddr_in addr{};        // phone's contact address
 		std::chrono::steady_clock::time_point deadline{};
+		// Issue #104: counts consecutive buildCancel() failures (message-pool
+		// exhaustion) in AwaitingInviteOk. sweep() retries on a short delay
+		// rather than freeing the slot immediately, but bounded — past
+		// kMaxCancelRetries the slot is freed like any other abandoned dialog
+		// instead of retrying forever under sustained pool pressure.
+		int cancelRetries = 0;
 	};
 
 	BeepDialog* findByCallID(std::string_view callID);
@@ -83,6 +89,11 @@ private:
 	std::shared_ptr<SipMessage> buildAck(const BeepDialog& bd, const std::shared_ptr<SipMessage>& ok);
 	std::shared_ptr<SipMessage> buildBye(const BeepDialog& bd, const std::shared_ptr<SipMessage>& ok);
 	std::shared_ptr<SipMessage> buildCancel(std::size_t slot);
+
+	// Issue #104: cap on consecutive buildCancel() retries (see BeepDialog::
+	// cancelRetries) before sweep() gives up and frees the slot outright rather
+	// than retrying forever under sustained message-pool pressure.
+	static constexpr int kMaxCancelRetries = 5;
 
 	// Bounded outbound-UAC dialog table. Tiny fixed footprint; if all slots are
 	// busy a new registration just skips its beep.
