@@ -97,6 +97,11 @@ jobs:
           cp build/SipServer.bin                          "${DEST}/SipServer-${TAG}.bin"
           cp build/bootloader/bootloader.bin              "${DEST}/bootloader-${TAG}.bin"
           cp build/partition_table/partition-table.bin    "${DEST}/partition-table-${TAG}.bin"
+          # otadata initial image (8 KB of 0xFF): points the bootloader at
+          # ota_0 on first boot. The browser flasher (docs/flasher/) writes it
+          # at 0xf000 so a board whose previous firmware lived in ota_1 still
+          # boots the freshly written slot.
+          cp build/ota_data_initial.bin                   "${DEST}/ota_data_initial-${TAG}.bin"
           # The flasher args file documents the offsets for each image.
           if [ -f build/flasher_args.json ]; then
             cp build/flasher_args.json "${DEST}/flasher_args-${TAG}.json"
@@ -139,6 +144,51 @@ jobs:
           cp partitions.csv release/partitions.csv
           echo "Release bundle contents:"
           ls -l release/
+
+      # manifest.json is what docs/flasher/index.html (the browser flasher on
+      # GitHub Pages) consumes: one entry per variant with each image's offset,
+      # role, and size, plus the flash mode/size/freq — all taken from the
+      # build's own flasher_args-<variant>.json rather than hardcoded here, so
+      # a partition-table or flash-settings change follows automatically.
+      # Variant ids are the "<chip>-<transport>" tags used in the asset names
+      # and must match the VARIANTS table in docs/flasher/index.html.
+      - name: Generate flasher manifest.json
+        run: |
+          python3 - "${{ github.ref_name }}" <<'EOF'
+          import glob, json, os, re, sys
+          version = sys.argv[1]
+          roles = {"bootloader": "bootloader", "partition-table": "partition-table",
+                   "otadata": "ota-data", "app": "app"}
+          stems = {"bootloader": "bootloader", "partition-table": "partition-table",
+                   "otadata": "ota_data_initial", "app": "SipServer"}
+          variants = {}
+          for args_path in sorted(glob.glob("release/flasher_args-*.json")):
+              vid = re.fullmatch(r"flasher_args-(.+)\.json", os.path.basename(args_path)).group(1)
+              with open(args_path) as f:
+                  args = json.load(f)
+              fs = args.get("flash_settings", {})
+              parts = []
+              for key, role in roles.items():
+                  entry = args.get(key)
+                  if not entry:
+                      continue
+                  fname = f"{stems[key]}-{vid}.bin"
+                  path = os.path.join("release", fname)
+                  if not os.path.exists(path):
+                      sys.exit(f"{args_path} lists {key} but {path} is missing")
+                  parts.append({"offset": int(entry["offset"], 0), "file": fname,
+                                "role": role, "size": os.path.getsize(path)})
+              variants[vid] = {"name": vid,
+                               "flash": {"size": fs.get("flash_size", "16MB"),
+                                         "mode": fs.get("flash_mode", "dio"),
+                                         "freq": fs.get("flash_freq", "80m")},
+                               "parts": parts}
+          if not variants:
+              sys.exit("no flasher_args-*.json found in release/")
+          with open("release/manifest.json", "w") as f:
+              json.dump({"version": version, "variants": variants}, f, indent=2)
+          print(open("release/manifest.json").read())
+          EOF
 
       - name: Generate SHA256SUMS
         run: |

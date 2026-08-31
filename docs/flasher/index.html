@@ -1,0 +1,1255 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flash pocket-dial</title>
+<meta name="description" content="Install the pocket-dial SIP PBX firmware onto an ESP32-S3 board straight from your browser over USB. No toolchain needed.">
+<style>
+:root {
+  color-scheme: light dark;
+
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --surface-2: #f0f2f5;
+  --border: #d8dce3;
+  --border-strong: #b9c0cb;
+  --text: #14181f;
+  --text-dim: #5a6472;
+  --accent: #0f766e;
+  --accent-text: #ffffff;
+  --accent-dim: #e3f4f2;
+  --ok: #1a7f37;
+  --ok-bg: #e6f4ea;
+  --warn: #9a6700;
+  --warn-bg: #fff8e1;
+  --err: #cf222e;
+  --err-bg: #ffebe9;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --radius: 10px;
+  --shadow: 0 1px 2px rgba(16, 22, 30, .06), 0 4px 12px rgba(16, 22, 30, .05);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface-2: #1c232c;
+    --border: #2d353f;
+    --border-strong: #3d4650;
+    --text: #e6edf3;
+    --text-dim: #9aa4b2;
+    --accent: #2dd4bf;
+    --accent-text: #06201d;
+    --accent-dim: #113330;
+    --ok: #5fd377;
+    --ok-bg: #12261a;
+    --warn: #e3b341;
+    --warn-bg: #2b2312;
+    --err: #ff7b72;
+    --err-bg: #2d1615;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 4px 14px rgba(0, 0, 0, .3);
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+
+.wrap { max-width: 780px; margin: 0 auto; padding: 24px 16px 72px; }
+
+header { margin-bottom: 24px; }
+h1 { font-size: clamp(1.5rem, 4vw, 2rem); line-height: 1.2; margin: 0 0 6px; letter-spacing: -.02em; }
+.sub { color: var(--text-dim); margin: 0; }
+
+h2 { font-size: 1.05rem; margin: 0 0 4px; letter-spacing: -.01em; }
+h3 { font-size: .9rem; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-dim); }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px;
+  margin-bottom: 16px;
+  box-shadow: var(--shadow);
+}
+.card > :last-child { margin-bottom: 0; }
+
+.step-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 12px; }
+.step-num {
+  flex: none;
+  width: 26px; height: 26px;
+  border-radius: 50%;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: .82rem; font-weight: 600;
+  display: grid; place-items: center;
+  align-self: center;
+}
+.card[data-state="active"] { border-color: var(--accent); }
+.card[data-state="active"] .step-num { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+.card[data-state="done"] .step-num { background: var(--ok-bg); border-color: var(--ok); color: var(--ok); }
+.card[data-state="done"] .step-num::after { content: "\2713"; }
+.card[data-state="done"] .step-num > span { display: none; }
+.card[aria-disabled="true"] { opacity: .55; }
+.card[aria-disabled="true"] button { pointer-events: none; }
+
+p { margin: 0 0 12px; }
+.muted { color: var(--text-dim); font-size: .9rem; }
+code, kbd { font-family: var(--mono); font-size: .875em; background: var(--surface-2); padding: .12em .38em; border-radius: 4px; }
+a { color: var(--accent); }
+
+button {
+  font: inherit;
+  font-weight: 550;
+  padding: 9px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+  color: var(--text);
+  cursor: pointer;
+  transition: filter .12s ease;
+}
+button:hover:not(:disabled) { filter: brightness(1.06); }
+button:active:not(:disabled) { filter: brightness(.94); }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+
+select {
+  font: inherit; font-size: .9rem;
+  padding: 6px 9px; border-radius: 7px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface); color: var(--text);
+  max-width: 100%;
+}
+
+.row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+
+dl.facts { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; margin: 0; font-size: .92rem; }
+dl.facts dt { color: var(--text-dim); }
+dl.facts dd { margin: 0; font-family: var(--mono); font-size: .86rem; word-break: break-all; }
+
+/* Variant picker */
+.variants { display: grid; gap: 10px; grid-template-columns: 1fr; margin-bottom: 12px; }
+@media (min-width: 620px) { .variants { grid-template-columns: 1fr 1fr 1fr; } }
+
+.variant {
+  position: relative;
+  display: block;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  background: var(--surface-2);
+  cursor: pointer;
+}
+.variant:has(input:checked) { border-color: var(--accent); background: var(--accent-dim); }
+.variant:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+.variant input { position: absolute; opacity: 0; pointer-events: none; }
+.variant svg { display: block; width: 100%; height: auto; border-radius: 6px; margin-bottom: 10px; }
+.variant .vname { font-weight: 600; display: block; }
+.variant .vdesc { color: var(--text-dim); font-size: .84rem; }
+.variant[data-missing="1"] { opacity: .55; }
+.badge {
+  display: inline-block;
+  font-size: .72rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .05em;
+  padding: 2px 7px; border-radius: 20px;
+  background: var(--ok-bg); color: var(--ok);
+  vertical-align: 2px; margin-left: 6px;
+}
+.badge.warn { background: var(--warn-bg); color: var(--warn); }
+
+/* Mode picker */
+.modes { display: grid; gap: 10px; margin-bottom: 14px; }
+.mode {
+  display: block;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  background: var(--surface-2);
+  cursor: pointer;
+}
+.mode:has(input:checked) { border-color: var(--accent); background: var(--accent-dim); }
+.mode:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+.mode input { position: absolute; opacity: 0; pointer-events: none; }
+.mode .mname { font-weight: 600; }
+.mode .mdesc { color: var(--text-dim); font-size: .88rem; }
+
+.check { display: flex; gap: 8px; align-items: flex-start; font-size: .9rem; margin-bottom: 14px; }
+.check input { margin-top: 4px; }
+
+/* Progress */
+.parts { display: grid; gap: 8px; margin: 14px 0; }
+.part { font-size: .88rem; }
+.part-top { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 3px; }
+.part-name { font-family: var(--mono); font-size: .82rem; }
+.part-pct { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.bar { height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; border: 1px solid var(--border); }
+.bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .15s linear; }
+.part[data-done="1"] .bar > i { background: var(--ok); }
+
+/* Log */
+.log {
+  font-family: var(--mono);
+  font-size: .78rem;
+  line-height: 1.5;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+}
+.log:empty::after { content: "(nothing yet)"; color: var(--text-dim); }
+.log .e { color: var(--err); }
+.log .w { color: var(--warn); }
+.log .k { color: var(--ok); }
+
+/* Notices */
+.notice { border-radius: 8px; padding: 11px 13px; margin-bottom: 12px; font-size: .92rem; border: 1px solid; }
+.notice > :last-child { margin-bottom: 0; }
+.notice.info { background: var(--accent-dim); border-color: var(--accent); }
+.notice.warn { background: var(--warn-bg); border-color: var(--warn); }
+.notice.err  { background: var(--err-bg);  border-color: var(--err); }
+.notice.ok   { background: var(--ok-bg);   border-color: var(--ok); }
+
+details { border-top: 1px solid var(--border); padding-top: 12px; margin-top: 14px; }
+details summary { cursor: pointer; font-weight: 550; font-size: .92rem; }
+details[open] summary { margin-bottom: 10px; }
+
+input[type="file"] { font: inherit; font-size: .88rem; max-width: 100%; }
+input[type="text"] {
+  font: inherit; font-family: var(--mono); font-size: .88rem;
+  padding: 7px 9px; border-radius: 7px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface); color: var(--text);
+  width: 8em;
+}
+
+.hidden { display: none !important; }
+
+.local-part { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 10px; }
+
+footer { color: var(--text-dim); font-size: .86rem; text-align: center; margin-top: 32px; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Flash pocket-dial</h1>
+  <p class="sub">Install the pocket-dial SIP PBX firmware onto your ESP32-S3 board over USB, straight from this page. No toolchain, no downloads.</p>
+</header>
+
+<!-- Unsupported browser gate -->
+<div id="unsupported" class="notice err hidden">
+  <p><strong>This browser can't talk to serial devices.</strong></p>
+  <p>Flashing needs the <a href="https://developer.mozilla.org/docs/Web/API/Web_Serial_API" rel="noreferrer">Web Serial API</a>, which today only <strong>Chrome, Edge, and Opera on desktop</strong> support — Firefox, Safari, and all mobile browsers do not.</p>
+  <p id="unsupported-why" class="muted"></p>
+  <p style="margin-bottom:0">Open this page in Chrome or Edge on a desktop, or flash from the command line with the <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/FLASHING.md">esptool instructions in FLASHING.md</a>.</p>
+</div>
+
+<div id="app">
+
+  <!-- Step 1: connect -->
+  <section class="card" id="step-connect" data-state="active">
+    <div class="step-head">
+      <div class="step-num"><span>1</span></div>
+      <div>
+        <h2>Connect your board</h2>
+        <p class="muted" style="margin:0">Plug it into USB, then pick its port in the browser prompt.</p>
+      </div>
+    </div>
+
+    <div class="notice warn">
+      <p style="margin-bottom:6px"><strong>Close any serial monitor first.</strong></p>
+      <p class="muted" style="margin-bottom:0">On Windows a COM port can only be open in one program at a time. If <code>idf.py monitor</code>, PuTTY, the Arduino IDE, or a VS Code serial terminal has the port, connecting here fails with &ldquo;Failed to open serial port&rdquo;.</p>
+    </div>
+
+    <div class="row">
+      <button id="btn-connect" class="primary">Connect board</button>
+      <button id="btn-disconnect" class="hidden">Disconnect</button>
+      <span id="connect-status" class="muted"></span>
+    </div>
+
+    <div id="chip-info" class="hidden" style="margin-top:14px">
+      <h3>Board</h3>
+      <dl class="facts">
+        <dt>Chip</dt><dd id="fact-chip">&mdash;</dd>
+        <dt>MAC</dt><dd id="fact-mac">&mdash;</dd>
+        <dt>Flash</dt><dd id="fact-flash">&mdash;</dd>
+        <dt>Installed</dt><dd id="fact-version">&mdash;</dd>
+      </dl>
+    </div>
+  </section>
+
+  <!-- Step 2: variant -->
+  <section class="card" id="step-variant" aria-disabled="true">
+    <div class="step-head">
+      <div class="step-num"><span>2</span></div>
+      <div>
+        <h2>Pick your board</h2>
+        <p class="muted" style="margin:0" id="detect-summary">Every build targets the ESP32-S3, so the chip alone can't say which one you have. The firmware differs by how it reaches the network.</p>
+      </div>
+    </div>
+
+    <div id="detect-notice"></div>
+
+    <div class="variants" id="variants" role="radiogroup" aria-label="Firmware variant"></div>
+    <p class="muted" style="margin-bottom:0">Picking the wrong one gives you a board that boots but never gets on the network. Ethernet builds have no Wi-Fi at all, and the display build expects the Guition panel wired up.</p>
+  </section>
+
+  <!-- Step 3: what to flash -->
+  <section class="card" id="step-mode" aria-disabled="true">
+    <div class="step-head">
+      <div class="step-num"><span>3</span></div>
+      <div>
+        <h2>Choose what to write</h2>
+        <p class="muted" style="margin:0" id="release-line">Loading releases&hellip;</p>
+      </div>
+    </div>
+
+    <div id="release-notice"></div>
+
+    <div class="row" id="release-row" style="margin-bottom:14px">
+      <label for="release-select" class="muted">Release</label>
+      <select id="release-select" aria-label="Release to flash"></select>
+      <a id="release-link" class="muted" href="#" rel="noreferrer" target="_blank">release notes</a>
+    </div>
+
+    <div class="modes" id="modes" role="radiogroup" aria-label="Flash mode">
+      <label class="mode">
+        <input type="radio" name="mode" value="full" checked>
+        <span class="mname">Full flash</span>
+        <span class="badge">Recommended</span>
+        <div class="mdesc">Bootloader, partition table, OTA data, and the app. Writes only those four regions, so your saved Wi-Fi credentials, admin PIN, and extensions in NVS survive. Use this the first time, and after any partition or bootloader change.</div>
+      </label>
+      <label class="mode">
+        <input type="radio" name="mode" value="app">
+        <span class="mname">App only</span>
+        <div class="mdesc">OTA data and the app image &mdash; the same regions the over-the-air updater touches, and the fastest option. Fine for upgrading firmware that's already running on this board.</div>
+      </label>
+    </div>
+
+    <label class="check">
+      <input type="checkbox" id="erase-all">
+      <span><strong>Erase the whole chip first.</strong> <span class="muted">Wipes NVS (saved Wi-Fi, admin PIN, extensions) and both OTA slots. Use when moving a board from an old single-<code>factory</code> image to the dual-OTA layout, or to start clean. Adds a few seconds.</span></span>
+    </label>
+
+    <div class="row">
+      <button id="btn-flash" class="primary" disabled>Flash board</button>
+      <span id="mode-status" class="muted"></span>
+    </div>
+
+    <details id="local-details">
+      <summary>Flash your own build instead</summary>
+      <p class="muted">For images you built yourself with <code>idf.py build</code>. Leave a slot empty to skip that region. Offsets default to this project's layout &mdash; take the real ones from your build's <code>flash_args</code> if you've changed the partition table.</p>
+      <div id="local-parts"></div>
+      <div class="row">
+        <button id="btn-flash-local">Flash selected files</button>
+        <span id="local-status" class="muted"></span>
+      </div>
+    </details>
+  </section>
+
+  <!-- Step 4: progress -->
+  <section class="card" id="step-progress" aria-disabled="true">
+    <div class="step-head">
+      <div class="step-num"><span>4</span></div>
+      <div>
+        <h2>Progress</h2>
+        <p class="muted" style="margin:0">Don't unplug the board or close this tab while writing.</p>
+      </div>
+    </div>
+
+    <div id="done-notice"></div>
+    <div class="parts" id="parts"></div>
+
+    <h3>Log</h3>
+    <pre class="log" id="log" aria-live="polite" aria-label="Flashing log"></pre>
+    <div class="row" style="margin-top:10px">
+      <button id="btn-copy-log">Copy log</button>
+    </div>
+  </section>
+
+</div>
+
+<footer>
+  <p><a href="https://github.com/GlomarGadaffi/pocket-dial">pocket-dial</a>
+  &middot; <a href="../">project site</a>
+  &middot; flashing powered by <a href="https://github.com/espressif/esptool-js">esptool-js</a>
+  &middot; nothing leaves your machine &mdash; firmware is fetched from GitHub and written by your browser</p>
+</footer>
+
+</div>
+
+<script type="module">
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+const REPO = "GlomarGadaffi/pocket-dial";
+const RELEASES_API = `https://api.github.com/repos/${REPO}/releases?per_page=15`;
+
+// Variant ids double as the "<chip>-<transport>" tag the release workflow
+// (.github/workflows/release.yml) bakes into asset names, e.g.
+// SipServer-esp32s3-eth.bin. Keep the two in sync.
+const VARIANTS = {
+  "esp32s3-eth": {
+    name: "Ethernet",
+    desc: "LilyGO T-ETH-Elite (W5500, PoE). Wired only — no Wi-Fi in this build.",
+    art: { body: "#2b7a4b", chip: "#1d2733", label: "T-ETH-ELITE", jack: true },
+    after: `<p style="margin-bottom:8px">Plug an Ethernet cable in. The board asks your router for an address over DHCP;
+            find it in the router's client list, then open <strong>http://&lt;that address&gt;/</strong> for the dashboard.
+            SIP phones register to the same address on port <code>5060</code>.</p>`
+  },
+  "esp32s3-display": {
+    name: "Touch display",
+    desc: "Guition JC3248W535 3.5″ panel. Wi-Fi with on-screen onboarding.",
+    art: { body: "#1d2733", chip: "#0f766e", label: "JC3248W535", screen: true },
+    after: `<p style="margin-bottom:8px">The screen lights up with the onboarding flow: it starts an access point and shows
+            a QR code to join it. Follow the prompts to put the board on your Wi-Fi; the dashboard address is shown on
+            screen once it's connected.</p>`
+  },
+  "esp32s3-wifi": {
+    name: "Wi-Fi access point",
+    desc: "Any plain ESP32-S3 dev board. Runs its own SoftAP; no Ethernet or screen needed.",
+    art: { body: "#1f4f8f", chip: "#1d2733", label: "ESP32-S3", antenna: true },
+    after: `<p style="margin-bottom:8px">Look for a Wi-Fi network named <strong>esp32-sipserver</strong> and join it.
+            The dashboard is at <strong>http://192.168.4.1/</strong>, and SIP phones register to
+            <code>192.168.4.1:5060</code>. The dashboard lets you point the board at your own Wi-Fi instead.</p>`
+  }
+};
+const DEFAULT_VARIANT = "esp32s3-eth";
+
+// Flash layout from partitions.csv. Offsets normally come from the release's
+// manifest.json or flasher_args-<variant>.json; these are the fallbacks for
+// the "flash your own build" panel and for releases that predate both.
+const APP_OFFSET = 0x20000;      // ota_0
+const APP1_OFFSET = 0x620000;    // ota_1
+const OTADATA_OFFSET = 0xf000;
+const OTADATA_SIZE = 0x2000;     // two 4 KB sectors
+const OTADATA_SECTOR = 0x1000;   // the second entry lives one sector on
+const APP_DESC_OFFSET = 0x20;    // esp_app_desc_t follows the 24-byte image
+                                 // header + 8-byte first segment header
+const APP_DESC_MAGIC = 0xabcd5432;
+const PROJECT_NAME = "SipServer";
+const DEFAULT_FLASH = { size: "16MB", mode: "dio", freq: "80m" };
+
+const LOCAL_SLOTS = [
+  { role: "bootloader",      label: "Bootloader",      offset: 0x0 },
+  { role: "partition-table", label: "Partition table", offset: 0x8000 },
+  { role: "ota-data",        label: "OTA data",        offset: OTADATA_OFFSET },
+  { role: "app",             label: "App",             offset: APP_OFFSET }
+];
+
+const ESPTOOL_URL = "https://cdn.jsdelivr.net/npm/esptool-js@0.6.1/bundle.js";
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+const $ = (id) => document.getElementById(id);
+
+function log(msg, cls) {
+  const el = $("log");
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+  const line = document.createElement("span");
+  if (cls) line.className = cls;
+  line.textContent = msg + "\n";
+  el.appendChild(line);
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+const logErr = (m) => log(m, "e");
+const logWarn = (m) => log(m, "w");
+const logOk = (m) => log(m, "k");
+
+function notice(hostId, kind, html) {
+  const host = $(hostId);
+  if (!kind) { host.innerHTML = ""; return; }
+  host.innerHTML = `<div class="notice ${kind}">${html}</div>`;
+}
+
+function setStep(id, state) {
+  const el = $(id);
+  if (state === "locked") {
+    el.setAttribute("aria-disabled", "true");
+    el.removeAttribute("data-state");
+  } else {
+    el.removeAttribute("aria-disabled");
+    el.setAttribute("data-state", state);
+  }
+}
+
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const hex = (n) => "0x" + n.toString(16);
+const fmtBytes = (n) => n >= 1048576 ? (n / 1048576).toFixed(2) + " MB"
+                      : n >= 1024    ? (n / 1024).toFixed(1) + " KB"
+                      : n + " B";
+
+// ---------------------------------------------------------------------------
+// Browser support gate
+// ---------------------------------------------------------------------------
+
+function checkSupport() {
+  const reasons = [];
+  if (!("serial" in navigator)) reasons.push("navigator.serial is not available in this browser.");
+  if (!window.isSecureContext) reasons.push("This page is not in a secure context — Web Serial needs HTTPS (or localhost).");
+
+  if (reasons.length) {
+    $("unsupported").classList.remove("hidden");
+    $("unsupported-why").textContent = reasons.join(" ");
+    $("app").classList.add("hidden");
+    return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// esp_app_desc_t parsing
+//
+//   0   magic          u32   0xABCD5432
+//   4   secure_version u32
+//   8   reserv1[2]     u32 x2
+//   16  version        char[32]
+//   48  project_name   char[32]
+//   80  time           char[16]
+//   96  date           char[16]
+//   112 idf_ver        char[32]
+//   144 app_elf_sha256 u8[32]
+// ---------------------------------------------------------------------------
+
+function cstr(bytes, offset, maxLen) {
+  const slice = bytes.subarray(offset, offset + maxLen);
+  let end = slice.indexOf(0);
+  if (end < 0) end = slice.length;
+  return new TextDecoder("utf-8", { fatal: false }).decode(slice.subarray(0, end)).replace(/[^\x20-\x7e]/g, "");
+}
+
+function parseAppDesc(bytes) {
+  if (!bytes || bytes.length < 176) return null;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (dv.getUint32(0, true) !== APP_DESC_MAGIC) return null;
+  return {
+    version: cstr(bytes, 16, 32),
+    projectName: cstr(bytes, 48, 32),
+    time: cstr(bytes, 80, 16),
+    date: cstr(bytes, 96, 16),
+    idfVer: cstr(bytes, 112, 32)
+  };
+}
+
+// otadata: two 32-byte entries a sector apart, each starting with u32 ota_seq.
+// IDF boots the entry with the highest valid seq, slot = (seq - 1) % 2.
+// 0xFFFFFFFF means blank; both blank falls back to ota_0.
+function activeSlot(entry0, entry1) {
+  const seqOf = (e) => {
+    if (!e || e.length < 4) return 0xffffffff;
+    return new DataView(e.buffer, e.byteOffset, e.byteLength).getUint32(0, true);
+  };
+  const s0 = seqOf(entry0), s1 = seqOf(entry1);
+  const valid = [];
+  if (s0 !== 0xffffffff && s0 !== 0) valid.push(s0);
+  if (s1 !== 0xffffffff && s1 !== 0) valid.push(s1);
+  if (!valid.length) return 0;
+  const seq = Math.max(...valid);
+  return (seq - 1) % 2;
+}
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+const state = {
+  esptool: null,
+  port: null,
+  transport: null,
+  loader: null,
+  connected: false,
+  busy: false,
+  usbOtg: false,
+  selectedVariant: DEFAULT_VARIANT,
+  installedVersion: null,
+  releases: [],       // [{ tag, name, prerelease, url, assets: Map<name, url>, manifest?, resolved: Map<variantId, plan> }]
+  release: null,      // the selected entry from `releases`
+  releaseError: null
+};
+
+// ---------------------------------------------------------------------------
+// Release loading
+//
+// Two layouts are understood:
+//
+//   1. manifest.json (releases cut by the current workflow):
+//        { "version": "...", "variants": { "<id>": { "name", "flash": {size,mode,freq},
+//          "parts": [ { "offset", "file", "role", "size" } ] } } }
+//
+//   2. Bare convention (v1.2.0 and earlier):
+//        bootloader-<id>.bin, partition-table-<id>.bin, SipServer-<id>.bin, and
+//        optionally flasher_args-<id>.json for the real offsets and flash mode.
+//        Those releases ship no ota_data_initial.bin; the page synthesises it
+//        (it is nothing but 0xFF, which tells the bootloader "boot ota_0").
+// ---------------------------------------------------------------------------
+
+async function loadReleases() {
+  try {
+    const res = await fetch(RELEASES_API, { headers: { Accept: "application/vnd.github+json" } });
+    if (res.status === 403 || res.status === 429) throw new Error("rate-limited");
+    if (!res.ok) throw new Error(`GitHub API returned ${res.status}`);
+
+    const list = (await res.json()).filter((r) => !r.draft);
+    if (!list.length) throw new Error("no-release");
+
+    state.releases = list.map((r) => ({
+      tag: r.tag_name,
+      name: r.name || r.tag_name,
+      prerelease: !!r.prerelease,
+      url: r.html_url,
+      assets: new Map((r.assets || []).map((a) => [a.name, { url: a.browser_download_url, size: a.size }])),
+      manifest: undefined,
+      resolved: new Map()
+    }));
+
+    // Default to the newest stable release; fall back to a pre-release if
+    // that's all there is.
+    const stable = state.releases.find((r) => !r.prerelease);
+    await selectRelease(stable || state.releases[0]);
+    renderReleasePicker();
+  } catch (err) {
+    state.releaseError = err;
+    renderRelease();
+  }
+}
+
+async function selectRelease(rel) {
+  state.release = rel;
+  state.releaseError = null;
+
+  if (rel.manifest === undefined) {
+    const m = rel.assets.get("manifest.json");
+    if (m) {
+      try {
+        const r = await fetch(m.url);
+        rel.manifest = r.ok ? await r.json() : null;
+        if (!r.ok) logWarn(`manifest.json in ${rel.tag} could not be downloaded (${r.status}); falling back to asset names.`);
+      } catch (e) {
+        rel.manifest = null;
+        logWarn(`manifest.json in ${rel.tag} is unreadable (${e.message}); falling back to asset names.`);
+      }
+    } else {
+      rel.manifest = null;
+    }
+  }
+
+  renderRelease();
+  renderVariants();
+  updateFlashButton();
+}
+
+function renderReleasePicker() {
+  const sel = $("release-select");
+  sel.innerHTML = state.releases.map((r) =>
+    `<option value="${esc(r.tag)}" ${r === state.release ? "selected" : ""}>${esc(r.tag)}${r.prerelease ? " (pre-release)" : ""}</option>`).join("");
+  sel.addEventListener("change", async () => {
+    const rel = state.releases.find((r) => r.tag === sel.value);
+    if (rel) {
+      log(`Switched to release ${rel.tag}.`);
+      await selectRelease(rel);
+    }
+  });
+}
+
+function renderRelease() {
+  const line = $("release-line");
+
+  if (state.release) {
+    const r = state.release;
+    const ver = r.manifest?.version || r.tag;
+    line.innerHTML = `Release <strong>${esc(r.tag)}</strong>${r.prerelease ? ' <span class="badge warn">pre-release</span>' : ""}` +
+                     (r.manifest ? ` &mdash; firmware ${esc(ver)}` : "") + ".";
+    $("release-link").href = r.url;
+    $("release-row").classList.remove("hidden");
+    notice("release-notice", null);
+    return;
+  }
+
+  const err = state.releaseError;
+  if (!err) { line.textContent = "Loading releases…"; return; }
+
+  let body, kind = "err";
+  if (err.message === "no-release") {
+    kind = "warn";
+    body = `<p style="margin-bottom:6px"><strong>No release published yet.</strong></p>
+            <p class="muted" style="margin-bottom:0">There's nothing to download for this repository yet, so one-click flashing isn't available.
+            You can still use <em>Flash your own build</em> below with images you built locally.</p>`;
+    line.textContent = "No release available.";
+  } else if (err.message === "rate-limited") {
+    body = `<p style="margin-bottom:6px"><strong>GitHub rate-limited this browser.</strong></p>
+            <p class="muted" style="margin-bottom:0">Unauthenticated API requests are capped at 60 per hour per IP. Wait a while and reload,
+            or use <em>Flash your own build</em> below.</p>`;
+    line.textContent = "Couldn't reach GitHub.";
+  } else {
+    body = `<p style="margin-bottom:6px"><strong>Couldn't load the releases.</strong></p>
+            <p class="muted" style="margin-bottom:0">${esc(err.message)} &mdash; you can still use <em>Flash your own build</em> below.</p>`;
+    line.textContent = "Couldn't load the releases.";
+  }
+
+  $("release-row").classList.add("hidden");
+  notice("release-notice", kind, body);
+  $("local-details").open = true;
+}
+
+// A plan is { flash: {size,mode,freq}, parts: [{ name, offset, role, url?, data?, size? }] }
+// or null when the release has nothing for this variant. Memoised per release.
+function planFor(rel, variantId) {
+  if (!rel) return null;
+  if (rel.resolved.has(variantId)) return rel.resolved.get(variantId);
+  const plan = rel.manifest ? planFromManifest(rel, variantId) : planFromConvention(rel, variantId);
+  rel.resolved.set(variantId, plan);
+  return plan;
+}
+
+function planFromManifest(rel, variantId) {
+  const v = rel.manifest.variants?.[variantId];
+  if (!v || !Array.isArray(v.parts)) return null;
+  const parts = [];
+  for (const p of v.parts) {
+    const a = rel.assets.get(p.file);
+    if (!a) return { error: `Release is missing asset "${p.file}".` };
+    parts.push({ name: p.file, offset: Number(p.offset), role: p.role, url: a.url, size: p.size ?? a.size });
+  }
+  return { flash: { ...DEFAULT_FLASH, ...(v.flash || rel.manifest.flash || {}) }, parts };
+}
+
+function planFromConvention(rel, variantId) {
+  const transport = variantId.split("-").slice(1).join("-");
+  const find = (...names) => {
+    for (const n of names) if (rel.assets.has(n)) return n;
+    return null;
+  };
+  const findRe = (re) => [...rel.assets.keys()].find((n) => re.test(n)) || null;
+
+  // Asset naming across releases: release.yml writes SipServer-<id>.bin; the
+  // hand-cut v1.3.0-pre-alpha used pocket-dial-<tag>-<id>[-board].bin and
+  // dropped the transport from the eth bootloader/partition names.
+  const app = find(`SipServer-${variantId}.bin`) ||
+              findRe(new RegExp(`^pocket-dial-.*-${variantId}(-[a-z0-9]+)?\\.bin$`));
+  if (!app) return null;
+
+  const bootloader = find(`bootloader-${variantId}.bin`, "bootloader-esp32s3.bin", "bootloader.bin");
+  const ptable = find(`partition-table-${variantId}.bin`, "partition-table-esp32s3.bin", "partition-table.bin");
+  const otadata = find(`ota_data_initial-${variantId}.bin`, `ota_data_initial-${transport}.bin`, "ota_data_initial.bin");
+  if (!bootloader || !ptable) return { error: `Release ${rel.tag} has the app for ${variantId} but no bootloader/partition table for it.` };
+
+  const plan = {
+    flash: { ...DEFAULT_FLASH },
+    offsets: { bootloader: 0x0, "partition-table": 0x8000, "ota-data": OTADATA_OFFSET, app: APP_OFFSET },
+    argsAsset: find(`flasher_args-${variantId}.json`),
+    files: { bootloader, "partition-table": ptable, "ota-data": otadata, app }
+  };
+  return plan;
+}
+
+// Convention plans may carry a flasher_args json whose offsets/flash settings
+// should win over the defaults; fetch it lazily, once.
+async function finalisePlan(rel, plan) {
+  if (plan.parts) return plan;
+
+  if (plan.argsAsset && !plan.argsLoaded) {
+    plan.argsLoaded = true;
+    try {
+      const r = await fetch(rel.assets.get(plan.argsAsset).url);
+      if (r.ok) {
+        const a = await r.json();
+        const fs = a.flash_settings || {};
+        plan.flash = {
+          size: fs.flash_size || plan.flash.size,
+          mode: fs.flash_mode || plan.flash.mode,
+          freq: fs.flash_freq || plan.flash.freq
+        };
+        const off = (k) => a[k]?.offset ? Number(a[k].offset) : null;
+        plan.offsets.bootloader = off("bootloader") ?? plan.offsets.bootloader;
+        plan.offsets["partition-table"] = off("partition-table") ?? plan.offsets["partition-table"];
+        plan.offsets["ota-data"] = off("otadata") ?? plan.offsets["ota-data"];
+        plan.offsets.app = off("app") ?? plan.offsets.app;
+        log(`${plan.argsAsset}: flash ${plan.flash.size} ${plan.flash.mode}@${plan.flash.freq}, app at ${hex(plan.offsets.app)}.`);
+      } else {
+        logWarn(`${plan.argsAsset} could not be downloaded (${r.status}); using default offsets.`);
+      }
+    } catch (e) {
+      logWarn(`${plan.argsAsset} unreadable (${e.message}); using default offsets.`);
+    }
+  }
+
+  const part = (role, name) => {
+    if (!name) return null;
+    const a = rel.assets.get(name);
+    return { name, offset: plan.offsets[role], role, url: a.url, size: a.size };
+  };
+
+  plan.parts = [
+    part("bootloader", plan.files.bootloader),
+    part("partition-table", plan.files["partition-table"]),
+    plan.files["ota-data"]
+      ? part("ota-data", plan.files["ota-data"])
+      : { name: "ota_data_initial (generated)", offset: plan.offsets["ota-data"], role: "ota-data",
+          data: new Uint8Array(OTADATA_SIZE).fill(0xff), size: OTADATA_SIZE },
+    part("app", plan.files.app)
+  ].filter(Boolean);
+  return plan;
+}
+
+// ---------------------------------------------------------------------------
+// Variant picker UI
+// ---------------------------------------------------------------------------
+
+function variantArt(art) {
+  const pads = Array.from({ length: 18 }, (_, i) =>
+    `<rect x="${10 + i * 10}" y="4" width="6" height="5" rx="1" fill="#d8b84a"/>` +
+    `<rect x="${10 + i * 10}" y="75" width="6" height="5" rx="1" fill="#d8b84a"/>`).join("");
+  let extra = "";
+  if (art.jack) extra = `<rect x="142" y="22" width="44" height="34" rx="4" fill="#8a939c"/><rect x="150" y="30" width="28" height="18" rx="2" fill="#2b333c"/>`;
+  if (art.antenna) extra = `<path d="M150 56 V28 M150 28 l-10 -12 M150 28 l10 -12" stroke="#e8ecf0" stroke-width="3" fill="none" stroke-linecap="round"/>`;
+  if (art.screen) extra = `<rect x="86" y="14" width="100" height="56" rx="3" fill="#0b1a2b"/><rect x="92" y="20" width="88" height="44" rx="2" fill="#123b5e"/><rect x="100" y="28" width="30" height="8" rx="1" fill="#2dd4bf"/><rect x="100" y="42" width="60" height="4" rx="1" fill="#6b8fb0"/><rect x="100" y="50" width="44" height="4" rx="1" fill="#6b8fb0"/>`;
+  return `<svg viewBox="0 0 200 84" role="img" aria-hidden="true" focusable="false">
+    <rect x="1" y="1" width="198" height="82" rx="6" fill="${art.body}"/>
+    <rect x="14" y="16" width="58" height="40" rx="3" fill="#e8ecf0"/>
+    <rect x="20" y="22" width="46" height="28" rx="2" fill="${art.chip}"/>
+    ${art.screen ? "" : `<rect x="86" y="20" width="42" height="32" rx="3" fill="${art.chip}"/>`}
+    ${extra}${pads}
+    <text x="${art.screen ? 14 : 86}" y="70" font-family="monospace" font-size="9" fill="#ffffff" opacity=".85">${art.label}</text>
+  </svg>`;
+}
+
+function renderVariants() {
+  const host = $("variants");
+  host.innerHTML = Object.entries(VARIANTS).map(([id, v]) => {
+    const plan = planFor(state.release, id);
+    const missing = state.release && !plan;
+    return `
+    <label class="variant" data-missing="${missing ? 1 : 0}">
+      <input type="radio" name="variant" value="${id}" ${id === state.selectedVariant ? "checked" : ""}>
+      ${variantArt(v.art)}
+      <span class="vname">${v.name}${missing ? '<span class="badge warn">not in this release</span>' : ""}</span>
+      <span class="vdesc">${v.desc}</span>
+    </label>`;
+  }).join("");
+
+  host.querySelectorAll('input[name="variant"]').forEach((input) => {
+    input.addEventListener("change", () => {
+      state.selectedVariant = input.value;
+      updateFlashButton();
+    });
+  });
+}
+
+function renderLocalSlots() {
+  $("local-parts").innerHTML = LOCAL_SLOTS.map((s) => `
+    <div class="local-part">
+      <label for="local-${s.role}" style="min-width:8.5em;font-size:.9rem">${s.label}</label>
+      <input type="text" id="local-off-${s.role}" value="${hex(s.offset)}" aria-label="${s.label} offset" size="8">
+      <input type="file" id="local-${s.role}" accept=".bin" aria-label="${s.label} image">
+    </div>`).join("");
+}
+
+// ---------------------------------------------------------------------------
+// Connect / detect
+// ---------------------------------------------------------------------------
+
+async function loadEsptool() {
+  if (state.esptool) return state.esptool;
+  log(`Loading esptool-js from ${ESPTOOL_URL} …`);
+  state.esptool = await import(ESPTOOL_URL);
+  return state.esptool;
+}
+
+const terminal = {
+  clean() {},
+  writeLine(data) { log(String(data)); },
+  write(data) { log(String(data).replace(/\r?\n$/, "")); }
+};
+
+async function connect() {
+  if (state.busy) return;
+  state.busy = true;
+  $("btn-connect").disabled = true;
+  $("connect-status").textContent = "Connecting…";
+
+  try {
+    const { ESPLoader, Transport } = await loadEsptool();
+
+    state.port = await navigator.serial.requestPort();
+    state.transport = new Transport(state.port, false);
+
+    state.loader = new ESPLoader({
+      transport: state.transport,
+      baudrate: 921600,
+      romBaudrate: 115200,
+      terminal,
+      debugLogging: false
+    });
+
+    // main() syncs, identifies the chip, uploads the flasher stub, and raises
+    // the baud rate. Everything after this point runs against the stub.
+    const chipName = await state.loader.main();
+    state.connected = true;
+
+    // The S3's native USB-Serial-JTAG needs the USB-OTG reset path rather than
+    // DTR/RTS wiggling; the PID tells us which cable we're on.
+    const pid = state.transport.getPid();
+    state.usbOtg = pid === state.loader.USB_JTAG_SERIAL_PID;
+    log(`Interface: ${state.usbOtg ? "native USB-Serial-JTAG (CDC-ACM)" : "USB-UART bridge"} (PID ${pid ?? "unknown"}).`);
+
+    let mac = "unknown", flashSize = "unknown";
+    try { mac = await state.loader.chip.readMac(state.loader); } catch (e) { logWarn(`Could not read MAC: ${e.message}`); }
+    try { flashSize = await state.loader.detectFlashSize(); } catch (e) { logWarn(`Could not detect flash size: ${e.message}`); }
+
+    $("fact-chip").textContent = chipName || state.loader.chip.CHIP_NAME || "unknown";
+    $("fact-mac").textContent = mac;
+    $("fact-flash").textContent = flashSize;
+    $("chip-info").classList.remove("hidden");
+
+    logOk(`Connected: ${chipName}, MAC ${mac}, flash ${flashSize}.`);
+
+    if (chipName && !/S3/i.test(chipName)) {
+      logWarn(`${chipName} is not an ESP32-S3; the published builds won't run on it.`);
+      notice("detect-notice", "warn",
+        `<p style="margin-bottom:0"><strong>This is a ${esc(chipName)}, not an ESP32-S3.</strong> Every published release targets the S3.
+         A classic ESP32 needs the <code>lan8720</code> build from source &mdash; see FLASHING.md &mdash; and can be written here through
+         <em>Flash your own build</em>.</p>`);
+    }
+
+    $("connect-status").textContent = "Connected.";
+    $("btn-connect").classList.add("hidden");
+    $("btn-disconnect").classList.remove("hidden");
+    setStep("step-connect", "done");
+    setStep("step-variant", "active");
+    setStep("step-mode", "active");
+
+    await readInstalled();
+    updateFlashButton();
+  } catch (err) {
+    handleConnectError(err);
+  } finally {
+    state.busy = false;
+    $("btn-connect").disabled = false;
+  }
+}
+
+function handleConnectError(err) {
+  const msg = err && err.message ? err.message : String(err);
+
+  if (err && err.name === "NotFoundError") {
+    $("connect-status").textContent = "No port selected.";
+    return;
+  }
+
+  logErr(`Connect failed: ${msg}`);
+  $("connect-status").textContent = "Connection failed.";
+
+  let hint = "";
+  if (/open|busy|access|locked/i.test(msg)) {
+    hint = "Something else is holding the port. Close any serial monitor (<code>idf.py monitor</code>, PuTTY, Arduino IDE, VS Code) and try again.";
+  } else if (/sync|timed? ?out|connect/i.test(msg)) {
+    hint = "The chip didn't answer. Try again; if it keeps failing, hold <kbd>BOOT</kbd>, tap <kbd>RESET</kbd>, release <kbd>BOOT</kbd> to force the bootloader, then connect. Also make sure the cable carries data, not just power.";
+  }
+
+  notice("detect-notice", "err",
+    `<p style="margin-bottom:${hint ? "6px" : "0"}"><strong>Couldn't connect.</strong> ${esc(msg)}</p>` +
+    (hint ? `<p class="muted" style="margin-bottom:0">${hint}</p>` : ""));
+
+  cleanup();
+}
+
+async function readAppDesc(appOffset) {
+  const bytes = await state.loader.readFlash(appOffset + APP_DESC_OFFSET, 0x100);
+  return parseAppDesc(bytes);
+}
+
+// The firmware doesn't stamp its variant into the app descriptor, so this
+// only reports what's installed; the user still picks the variant. One
+// command at a time: esptool-js has no command queue and overlapping reads
+// interleave their replies.
+async function readInstalled() {
+  $("detect-summary").textContent = "Reading what's installed…";
+  try {
+    const d0 = await readAppDesc(APP_OFFSET).catch(() => null);
+    const d1 = await readAppDesc(APP1_OFFSET).catch(() => null);
+    let active = 0;
+    try {
+      const e0 = await state.loader.readFlash(OTADATA_OFFSET, 32);
+      const e1 = await state.loader.readFlash(OTADATA_OFFSET + OTADATA_SECTOR, 32);
+      active = activeSlot(e0, e1);
+      log(`OTA data says slot ota_${active} is active.`);
+    } catch (e) {
+      logWarn(`Could not read OTA data (${e.message}); assuming ota_0.`);
+    }
+
+    const slots = [d0, d1];
+    const cur = slots[active] || slots[1 - active];
+    if (cur) {
+      state.installedVersion = cur.version;
+      $("fact-version").textContent = `${cur.projectName || "?"} ${cur.version}` + (cur.date ? ` — built ${cur.date}` : "");
+      log(`Slot ota_${slots[active] ? active : 1 - active}: ${cur.projectName} ${cur.version}, IDF ${cur.idfVer}, built ${cur.date} ${cur.time}.`);
+      if (cur.projectName === PROJECT_NAME) {
+        notice("detect-notice", "ok",
+          `<p style="margin-bottom:0"><strong>pocket-dial ${esc(cur.version)} is already on this board.</strong>
+           The build can't tell which board it was made for, so confirm the variant below. <em>App only</em> is enough to upgrade it.</p>`);
+      } else {
+        notice("detect-notice", "info",
+          `<p style="margin-bottom:0">This board is currently running <code>${esc(cur.projectName || "unknown")}</code>, not pocket-dial.
+           A <em>Full flash</em> replaces it.</p>`);
+      }
+    } else {
+      $("fact-version").textContent = "none — blank or unrecognised";
+      notice("detect-notice", "info", `<p style="margin-bottom:0">No firmware descriptor found on this board &mdash; it looks blank. Use a <em>Full flash</em>.</p>`);
+    }
+    $("detect-summary").textContent = "Every build targets the ESP32-S3, so the chip alone can't say which one you have. Pick by how the board reaches the network.";
+  } catch (err) {
+    logWarn(`Could not read the flash: ${err.message}`);
+    $("fact-version").textContent = "unknown (read failed)";
+    $("detect-summary").textContent = "Couldn't read the board's flash — pick your board below.";
+  }
+}
+
+async function cleanup() {
+  state.connected = false;
+  try {
+    if (state.transport) await state.transport.disconnect();
+  } catch { /* the port may already be gone */ }
+  state.transport = null;
+  state.loader = null;
+  state.port = null;
+  $("btn-connect").classList.remove("hidden");
+  $("btn-disconnect").classList.add("hidden");
+  updateFlashButton();
+}
+
+async function disconnect() {
+  await cleanup();
+  $("connect-status").textContent = "Disconnected.";
+  setStep("step-connect", "active");
+  setStep("step-variant", "locked");
+  setStep("step-mode", "locked");
+  log("Disconnected.");
+}
+
+// ---------------------------------------------------------------------------
+// Flashing
+// ---------------------------------------------------------------------------
+
+function updateFlashButton() {
+  const plan = planFor(state.release, state.selectedVariant);
+  const ready = state.connected && !state.busy && !!plan && !plan.error;
+  $("btn-flash").disabled = !ready;
+  $("btn-flash-local").disabled = !state.connected || state.busy;
+
+  const status = $("mode-status");
+  if (!state.connected) status.textContent = "Connect a board first.";
+  else if (!state.release) status.textContent = "No release available.";
+  else if (plan && plan.error) status.textContent = plan.error;
+  else if (!plan) status.textContent = `${state.release.tag} has no ${VARIANTS[state.selectedVariant].name} build.`;
+  else status.textContent = "";
+}
+
+function renderParts(parts) {
+  $("parts").innerHTML = parts.map((p, i) => `
+    <div class="part" id="part-${i}" data-done="0">
+      <div class="part-top">
+        <span class="part-name">${hex(p.offset)} &nbsp; ${esc(p.name)}</span>
+        <span class="part-pct" id="part-pct-${i}">waiting</span>
+      </div>
+      <div class="bar"><i id="part-bar-${i}" role="progressbar" aria-label="${esc(p.name)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></i></div>
+    </div>`).join("");
+}
+
+function setPartProgress(i, written, total) {
+  const pct = total ? Math.round((written / total) * 100) : 0;
+  const bar = $(`part-bar-${i}`);
+  if (bar) {
+    bar.style.width = pct + "%";
+    bar.setAttribute("aria-valuenow", String(pct));
+  }
+  const label = $(`part-pct-${i}`);
+  if (label) label.textContent = pct >= 100 ? "done" : `${pct}%`;
+  if (pct >= 100) $(`part-${i}`)?.setAttribute("data-done", "1");
+}
+
+async function fetchPart(part) {
+  const res = await fetch(part.url);
+  if (!res.ok) throw new Error(`Download of ${part.name} failed (${res.status}).`);
+  return new Uint8Array(await res.arrayBuffer());
+}
+
+async function doFlash(parts, flash, label, eraseAll) {
+  if (state.busy || !state.connected) return;
+  state.busy = true;
+  notice("done-notice", null);
+  setStep("step-progress", "active");
+  $("btn-flash").disabled = true;
+  $("btn-flash-local").disabled = true;
+
+  try {
+    renderParts(parts);
+    log(`--- ${label} ---`);
+
+    // Download everything before touching the flash, so a network failure
+    // can't leave the board half-written.
+    const fileArray = [];
+    for (const p of parts) {
+      const data = p.data || await fetchPart(p);
+      log(`${p.name}: ${fmtBytes(data.length)} ready for ${hex(p.offset)}.`);
+      fileArray.push({ data, address: p.offset });
+    }
+
+    if (eraseAll) logWarn("Erasing the entire flash first (this wipes NVS).");
+
+    await state.loader.writeFlash({
+      fileArray,
+      flashSize: flash.size || DEFAULT_FLASH.size,
+      flashMode: flash.mode || DEFAULT_FLASH.mode,
+      flashFreq: flash.freq || DEFAULT_FLASH.freq,
+      // Off by default: a whole-chip erase takes the NVS partition with it,
+      // and with it the saved Wi-Fi, admin PIN, and extensions.
+      eraseAll: !!eraseAll,
+      compress: true,
+      reportProgress: (fileIndex, written, total) => setPartProgress(fileIndex, written, total)
+    });
+
+    parts.forEach((_, i) => setPartProgress(i, 1, 1));
+    logOk("Write complete. Resetting the board…");
+
+    await state.loader.after("hard_reset", state.usbOtg);
+    logOk("Board reset. It should be booting the new firmware now.");
+
+    showDone();
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    logErr(`Flashing failed: ${msg}`);
+    notice("done-notice", "err",
+      `<p style="margin-bottom:6px"><strong>Flashing failed.</strong> ${esc(msg)}</p>
+       <p class="muted" style="margin-bottom:0">The board may be in a half-written state. Reconnect and run a
+       <strong>Full flash</strong> to put it back in a known-good condition.</p>`);
+  } finally {
+    state.busy = false;
+    updateFlashButton();
+  }
+}
+
+function showDone() {
+  const v = VARIANTS[state.selectedVariant];
+  setStep("step-progress", "done");
+  notice("done-notice", "ok", `
+    <p style="margin-bottom:8px"><strong>Done — the board is rebooting.</strong></p>
+    ${v.after}
+    <p class="muted" style="margin-bottom:0">Later updates can go over the air from the dashboard (see
+      <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/OTA.md">OTA.md</a>). You can unplug the board now;
+      disconnecting the port here is safe.</p>`);
+}
+
+async function flashFromRelease() {
+  const mode = document.querySelector('input[name="mode"]:checked').value;
+  const rel = state.release;
+  let plan = planFor(rel, state.selectedVariant);
+  if (!plan || plan.error) {
+    logErr(plan?.error || "Nothing to flash for that variant.");
+    return;
+  }
+  try {
+    plan = await finalisePlan(rel, plan);
+  } catch (err) {
+    logErr(err.message);
+    notice("done-notice", "err", `<p style="margin-bottom:0">${esc(err.message)}</p>`);
+    return;
+  }
+
+  let parts = plan.parts;
+  if (mode === "app") parts = parts.filter((p) => p.role === "app" || p.role === "ota-data");
+  if (!parts.length) { logErr("Nothing to flash for that variant and mode."); return; }
+
+  const name = VARIANTS[state.selectedVariant].name;
+  const label = `${mode === "full" ? "Full" : "App-only"} flash — ${name} ${rel.tag}`;
+  await doFlash(parts, plan.flash, label, $("erase-all").checked);
+}
+
+async function flashLocal() {
+  const parts = [];
+  for (const slot of LOCAL_SLOTS) {
+    const fileInput = $(`local-${slot.role}`);
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) continue;
+
+    const offsetText = $(`local-off-${slot.role}`).value.trim();
+    const offset = Number(offsetText);
+    if (!Number.isInteger(offset) || offset < 0) {
+      $("local-status").textContent = `"${offsetText}" is not a valid offset for ${slot.label}.`;
+      return;
+    }
+    parts.push({
+      name: file.name,
+      offset,
+      role: slot.role,
+      data: new Uint8Array(await file.arrayBuffer())
+    });
+  }
+
+  if (!parts.length) {
+    $("local-status").textContent = "Pick at least one file.";
+    return;
+  }
+  $("local-status").textContent = "";
+  await doFlash(parts, DEFAULT_FLASH, `Local flash — ${parts.length} file(s)`, $("erase-all").checked);
+}
+
+// ---------------------------------------------------------------------------
+// Wire-up
+// ---------------------------------------------------------------------------
+
+if (checkSupport()) {
+  renderVariants();
+  renderLocalSlots();
+  updateFlashButton();
+  loadReleases().then(updateFlashButton);
+
+  $("btn-connect").addEventListener("click", connect);
+  $("btn-disconnect").addEventListener("click", disconnect);
+  $("btn-flash").addEventListener("click", flashFromRelease);
+  $("btn-flash-local").addEventListener("click", flashLocal);
+
+  document.querySelectorAll('input[name="mode"]').forEach((r) =>
+    r.addEventListener("change", updateFlashButton));
+
+  $("btn-copy-log").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText($("log").textContent);
+      $("btn-copy-log").textContent = "Copied";
+    } catch {
+      $("btn-copy-log").textContent = "Copy failed";
+    }
+    setTimeout(() => { $("btn-copy-log").textContent = "Copy log"; }, 1500);
+  });
+
+  window.addEventListener("beforeunload", (e) => {
+    if (state.busy) { e.preventDefault(); e.returnValue = ""; }
+  });
+
+  log("Ready. Connect your board to begin.");
+}
+</script>
+</body>
+</html>
