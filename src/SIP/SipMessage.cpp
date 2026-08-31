@@ -1,4 +1,8 @@
 #include "SipMessage.hpp"
+#include <functional>
+#include <unordered_map>
+#include <vector>
+#include <cctype>
 #include "SipMessageTypes.h"
 #include <cstring>
 #include <cctype>
@@ -256,6 +260,174 @@ void SipMessage::enforceG711()
 	// so the answer isn't dropped as malformed on UDP.
 	++_bodyGen;   // unconditional: cheaper than tracking whether the m= line matched
 	syncContentLength();
+}
+
+namespace
+{
+	// One pass over an SDP body applying the relay codec policy. Fills the kept
+	// and dropped payload types (m=audio order preserved) and reports whether
+	// a real audio codec -- not just telephone-event -- survives.
+	struct AudioPolicyResult
+	{
+		bool hasMLine = false;
+		bool hasAudio = false;
+		std::vector<int> kept;
+		std::vector<int> dropped;
+		size_t mPos = 0, mLen = 0;   // span of the m=audio line (no terminator)
+		std::string mPrefix;         // "m=audio <port> <proto>"
+	};
+
+	void forEachLine(std::string_view body, const std::function<void(std::string_view, size_t)>& fn)
+	{
+		size_t pos = 0;
+		while (pos < body.size())
+		{
+			size_t eol = body.find('\n', pos);
+			size_t end = (eol == std::string_view::npos) ? body.size() : eol;
+			std::string_view line = body.substr(pos, end - pos);
+			if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+			fn(line, pos);
+			if (eol == std::string_view::npos) break;
+			pos = eol + 1;
+		}
+	}
+
+	int parseIntPrefix(std::string_view s)
+	{
+		int v = 0;
+		bool any = false;
+		for (char c : s)
+		{
+			if (c < '0' || c > '9') break;
+			v = v * 10 + (c - '0');
+			any = true;
+			if (v > 127) return -1;
+		}
+		return any ? v : -1;
+	}
+
+	std::string lower(std::string_view s)
+	{
+		std::string out(s);
+		for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+		return out;
+	}
+
+	AudioPolicyResult applyAudioPolicy(std::string_view body, bool allowWideband)
+	{
+		AudioPolicyResult r;
+		std::unordered_map<int, std::string> rtpmap;   // pt -> lowercase encoding name
+		std::vector<int> offered;
+
+		forEachLine(body, [&](std::string_view line, size_t pos) {
+			if (line.rfind("a=rtpmap:", 0) == 0)
+			{
+				std::string_view rest = line.substr(9);
+				int pt = parseIntPrefix(rest);
+				size_t sp = rest.find(' ');
+				if (pt >= 0 && sp != std::string_view::npos)
+				{
+					std::string_view name = rest.substr(sp + 1);
+					size_t slash = name.find('/');
+					if (slash != std::string_view::npos) name = name.substr(0, slash);
+					rtpmap[pt] = lower(name);
+				}
+			}
+			else if (!r.hasMLine && line.rfind("m=audio ", 0) == 0)
+			{
+				r.hasMLine = true;
+				r.mPos = pos;
+				r.mLen = line.size();
+				// m=audio <port> <proto> <fmt> <fmt> ...
+				size_t p1 = line.find(' ');
+				size_t p2 = (p1 == std::string_view::npos) ? p1 : line.find(' ', p1 + 1);
+				size_t p3 = (p2 == std::string_view::npos) ? p2 : line.find(' ', p2 + 1);
+				if (p3 == std::string_view::npos) { r.mPrefix = std::string(line); return; }
+				r.mPrefix = std::string(line.substr(0, p3));
+				std::string_view fmts = line.substr(p3 + 1);
+				size_t i = 0;
+				while (i < fmts.size())
+				{
+					while (i < fmts.size() && fmts[i] == ' ') ++i;
+					size_t s = i;
+					while (i < fmts.size() && fmts[i] != ' ') ++i;
+					if (i > s)
+					{
+						int pt = parseIntPrefix(fmts.substr(s, i - s));
+						if (pt >= 0) offered.push_back(pt);
+					}
+				}
+			}
+		});
+
+		for (int pt : offered)
+		{
+			auto it = rtpmap.find(pt);
+			const std::string name = (it == rtpmap.end()) ? std::string() : it->second;
+			const bool isEvent = (name == "telephone-event");
+			const bool keep = (pt == 0) || (pt == 8) || (allowWideband && pt == 9) || isEvent;
+			if (keep)
+			{
+				r.kept.push_back(pt);
+				if (!isEvent) r.hasAudio = true;
+			}
+			else
+			{
+				r.dropped.push_back(pt);
+			}
+		}
+		return r;
+	}
+}
+
+bool SipMessage::offersSupportedAudio(bool allowWideband) const
+{
+	const AudioPolicyResult r = applyAudioPolicy(_body, allowWideband);
+	return !r.hasMLine || r.hasAudio;
+}
+
+bool SipMessage::filterAudioCodecs(bool allowWideband)
+{
+	const AudioPolicyResult r = applyAudioPolicy(_body, allowWideband);
+	if (!r.hasMLine) return true;      // nothing to negotiate
+	if (!r.hasAudio) return false;     // caller answers 488; body left as offered
+	if (r.dropped.empty()) return true; // already within policy: no rewrite, no churn
+
+	std::string out;
+	out.reserve(_body.size());
+	const std::string_view body(_body);
+	size_t pos = 0;
+	while (pos < body.size())
+	{
+		size_t eol = body.find('\n', pos);
+		size_t next = (eol == std::string_view::npos) ? body.size() : eol + 1;
+		std::string_view raw = body.substr(pos, next - pos);   // line WITH terminator
+		std::string_view line = raw;
+		if (!line.empty() && line.back() == '\n') line.remove_suffix(1);
+		if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+
+		bool drop = false;
+		if (pos == r.mPos)
+		{
+			out += r.mPrefix;
+			for (int pt : r.kept) { out += ' '; out += std::to_string(pt); }
+			out.append(raw.substr(line.size()));   // original terminator
+			pos = next;
+			continue;
+		}
+		if (line.rfind("a=rtpmap:", 0) == 0 || line.rfind("a=fmtp:", 0) == 0)
+		{
+			size_t colon = line.find(':');
+			int pt = parseIntPrefix(line.substr(colon + 1));
+			for (int d : r.dropped) if (d == pt) { drop = true; break; }
+		}
+		if (!drop) out.append(raw);
+		pos = next;
+	}
+	_body = std::move(out);
+	++_bodyGen;
+	syncContentLength();
+	return true;
 }
 
 void SipMessage::syncContentLength()

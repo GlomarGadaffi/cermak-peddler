@@ -1,0 +1,176 @@
+'vswhere.exe' is not recognized as an internal or external command,
+operable program or batch file.
+**********************************************************************
+** Visual Studio 2022 Developer Command Prompt v17.0
+** Copyright (c) 2025 Microsoft Corporation
+**********************************************************************
+[vcvarsall.bat] Environment initialized for: 'x64'
+-- Selecting Windows SDK version 10.0.26100.0 to target Windows 10.0.26200.
+CMake Warning (dev) at C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/share/cmake-3.31/Modules/FetchContent.cmake:1373 (message):
+  The DOWNLOAD_EXTRACT_TIMESTAMP option was not given and policy CMP0135 is
+  not set.  The policy's OLD behavior will be used.  When using a URL
+  download, the timestamps of extracted files should preferably be that of
+  the time of extraction, otherwise code that depends on the extracted
+  contents might not be rebuilt if the URL changes.  The OLD behavior
+  preserves the timestamps from the archive instead, but this is usually not
+  what you want.  Update your project to the NEW behavior or specify the
+  DOWNLOAD_EXTRACT_TIMESTAMP option with a value of true to avoid this
+  robustness issue.
+Call Stack (most recent call first):
+  tests/CMakeLists.txt:15 (FetchContent_Declare)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+-- Configuring done (0.9s)
+-- Generating done (0.1s)
+-- Build files have been written to: C:/Users/desmo/Glomar's Github/pocket-dial/build_host
+MSBuild version 17.14.51+25f168cee for .NET Framework
+
+  1>Checking Build System
+  Building Custom Rule C:/Users/desmo/Glomar's Github/pocket-dial/CMakeLists.txt
+  main.cpp
+C:\Users\desmo\Glomar's Github\pocket-dial\src\SIP\PcapCapture.hpp(114,52): warning C4996: 'inet_addr': Use inet_pton() or InetPton() instead or define _WINSOCK_DEPRECATED_NO_WARNINGS to disable deprecated API warnings [C:\Users\desmo\Glomar's Github\pocket-dial\build_host\SipServer.vcxproj]
+  (compiling source file '../main.cpp')
+  
+C:\Users\desmo\Glomar's Github\pocket-dial\src\Helpers\IPHelper.hpp(30,30): warning C4996: 'inet_addr': Use inet_pton() or InetPton() instead or define _WINSOCK_DEPRECATED_NO_WARNINGS to disable deprecated API warnings [C:\Users\desmo\Glomar's Github\pocket-dial\build_host\SipServer.vcxproj]
+  (compiling source file '../main.cpp')
+  
+  BlfSubscriptions.cpp
+  LoopbackAnchorClient.cpp
+  MediaBridge.cpp
+  MixBus.cpp
+  ParkOrbit.cpp
+  PlayoutBuffer.cpp
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include\xutility(5310,24): warning C4244: '=': conversion from 'const _Ty' to 'short', possible loss of data [C:\Users\desmo\Glomar's Github\pocket-dial\build_host\SipServer.vcxproj]
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include\xutility(5310,24): warning C4244:         with [C:\Users\desmo\Glomar's Github\pocket-dial\build_host\SipServer.vcxproj]
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include\xutility(5310,24): warning C4244:         [ [C:\Users\desmo\Glomar's Github\pocket-dial\build_host\SipServer.vcxproj]
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include\xutility(5310,24): warning C4244:             _Ty=int [C:\Users\desmo\Glomar's Github\pocket-dial\build_host\SipServer.vcxproj]
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include\xutility(5310,24): warning C4244:         ] [C:\Users\desmo\Glomar's Github\pocket-dial\build_host\SipServer.vcxproj]
+  (compiling source file '../src/SIP/PlayoutBuffer.cpp')
+      C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include\xutility(5310,24):
+      the template instantiation context (the oldest one first) is
+          C:\Users\desmo\Glomar's Github\pocket-dial\src\SIP\PlayoutBuffer.cpp(121,7):
+          see reference to function template instantiation 'void std::fill<std::_Vector_iterator<std::_Vector_val<std::_Simple_types<_Ty>>>,int>(const _FwdIt,const _FwdIt,const int &)' being compiled
+          with
+          [
+              _Ty=int16_t,
+              _FwdIt=std::_Vector_iterator<std::_Vector_val<std::_Simple_types<int16_t>>>
+          ]
+  
+  RegisterBeeper.cpp
+  Registrar.cpp
+  RequestsHandler.cpp
+C:\Users\desmo\Glomar's Github\pocket-dial\src\SIP\PcapCapture.hpp(114,52): warning C4996: 'inet_addr': Use inet_pton() or InetPton() instead or define _WINSOCK_DEPRECATED_NO_WARNINGS to disable deprecated API warnings [C:\Users\desmo\Glomar's Github\pocket-dial\build_host\SipServer.vcxproj]
+  (compiling source file '../src/SIP/RequestsHandler.cpp')
+  
+C:\Users\desmo\Glomar's Github\pocket-dial\src\Helpers\IPHelper.hpp(30,30): warning C4996: 'inet_addr': Use inet_pton() or InetPton() instead or define _WINSOCK_DEPRECATED_NO_WARNINGS to disable deprecated API warnings [C:\Users\desmo\Glomar's Github\pocket-dial\build_host\SipServer.vcxproj]
+  (compiling source file '../src/SIP/RequestsHandler.cpp')
+  
+  RtpReceiver.cpp
+  RtpSender.cpp
+  Session.cpp
+  SipClient.cpp
+  SipMessage.cpp
+  SipMessageFactory.cpp
+C:\Users\desmo\Glomar's Github\pocket-dial\src\SIP\PcapCapture.hpp(114,52): warning C4996: 'inet_addr': Use inet_pton() or InetPton() instead or define _WINSOCK_DEPRECATED_NO_WARNINGS to disable deprecated API warnings [C:\Users\desmo\Glomar's Github\pocket-dial\build_host\SipServer.vcxproj]
+  (compiling source file '../src/SIP/SipMessageFactory.cpp')
+  
+  SipSdpMessage.cpp
+  SipServer.cpp
+C:\Users\desmo\Glomar's Github\pocket-dial\src\SIP\PcapCapture.hpp(114,52): warning C4996: 'inet_addr': Use inet_pton() or InetPton() instead or define _WINSOCK_DEPRECATED_NO_WARNINGS to disable deprecated API warnings [C:\Users\desmo\Glomar's Github\pocket-dial\build_host\SipServer.vcxproj]
+  (compiling source file '../src/SIP/SipServer.cpp')
+  
+  SipStatus.cpp
+  TelephonyApiConfig.cpp
+  Generating Code...
+  Compiling...
+  TelephonyProvider.cpp
+  TransactionLayer.cpp
+  mix_kernels_scalar.cpp
+  AdminAuth.cpp
+  ArpLookup.cpp
+  HttpServer.cpp
+C:\Users\desmo\Glomar's Github\pocket-dial\src\SIP\PcapCapture.hpp(114,52): warning C4996: 'inet_addr': Use inet_pton() or InetPton() instead or define _WINSOCK_DEPRECATED_NO_WARNINGS to disable deprecated API warnings [C:\Users\desmo\Glomar's Github\pocket-dial\build_host\SipServer.vcxproj]
+  (compiling source file '../src/Helpers/HttpServer.cpp')
+  
+C:\Users\desmo\Glomar's Github\pocket-dial\src\Helpers\IPHelper.hpp(30,30): warning C4996: 'inet_addr': Use inet_pton() or InetPton() instead or define _WINSOCK_DEPRECATED_NO_WARNINGS to disable deprecated API warnings [C:\Users\desmo\Glomar's Github\pocket-dial\build_host\SipServer.vcxproj]
+  (compiling source file '../src/Helpers/HttpServer.cpp')
+  
+C:\Users\desmo\Glomar's Github\pocket-dial\src\Helpers\HttpServer.cpp(1310,5): warning C4996: 'sscanf': This function or variable may be unsafe. Consider using sscanf_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details. [C:\Users\desmo\Glomar's Github\pocket-dial\build_host\SipServer.vcxproj]
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include\algorithm(3800,24): warning C4244: '=': conversion from 'int' to 'char', possible loss of data [C:\Users\desmo\Glomar's Github\pocket-dial\build_host\SipServer.vcxproj]
+  (compiling source file '../src/Helpers/HttpServer.cpp')
+      C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\include\algorithm(3800,24):
+      the template instantiation context (the oldest one first) is
+          C:\Users\desmo\Glomar's Github\pocket-dial\src\Helpers\HttpServer.cpp(734,10):
+          see reference to function template instantiation '_OutIt std::transform<std::_String_iterator<std::_String_val<std::_Simple_types<_Elem>>>,std::_String_iterator<std::_String_val<std::_Simple_types<_Elem>>>,int(__cdecl *)(int)>(const _InIt,const _InIt,_OutIt,_Fn)' being compiled
+          with
+          [
+              _OutIt=std::_String_iterator<std::_String_val<std::_Simple_types<char>>>,
+              _Elem=char,
+              _InIt=std::_String_iterator<std::_String_val<std::_Simple_types<char>>>,
+              _Fn=int (__cdecl *)(int)
+          ]
+  
+  OtaUpdater.cpp
+  SipDigest.cpp
+  SipSecretStore.cpp
+  UdpServer.cpp
+C:\Users\desmo\Glomar's Github\pocket-dial\src\Helpers\UdpServer.cpp(84,23): warning C4244: '=': conversion from 'SOCKET' to 'int', possible loss of data [C:\Users\desmo\Glomar's Github\pocket-dial\build_host\SipServer.vcxproj]
+C:\Users\desmo\Glomar's Github\pocket-dial\src\Helpers\UdpServer.cpp(102,36): warning C4244: 'argument': conversion from 'int' to 'u_short', possible loss of data [C:\Users\desmo\Glomar's Github\pocket-dial\build_host\SipServer.vcxproj]
+C:\Users\desmo\Glomar's Github\pocket-dial\src\Helpers\UdpServer.cpp(101,30): warning C4996: 'inet_addr': Use inet_pton() or InetPton() instead or define _WINSOCK_DEPRECATED_NO_WARNINGS to disable deprecated API warnings [C:\Users\desmo\Glomar's Github\pocket-dial\build_host\SipServer.vcxproj]
+C:\Users\desmo\Glomar's Github\pocket-dial\src\Helpers\UdpServer.cpp(188,52): warning C4267: 'argument': conversion from 'size_t' to 'int', possible loss of data [C:\Users\desmo\Glomar's Github\pocket-dial\build_host\SipServer.vcxproj]
+  Generating Code...
+  SipServer.vcxproj -> C:\Users\desmo\Glomar's Github\pocket-dial\build_host\Release\SipServer.exe
+  gtest-all.cc
+  gmock-all.cc
+  Generating Code...
+  gmock.vcxproj -> C:\Users\desmo\Glomar's Github\pocket-dial\build_host\lib\Release\gmock.lib
+  gtest-all.cc
+  gmock-all.cc
+  gmock_main.cc
+  Generating Code...
+  gmock_main.vcxproj -> C:\Users\desmo\Glomar's Github\pocket-dial\build_host\lib\Release\gmock_main.lib
+  gtest-all.cc
+  gtest.vcxproj -> C:\Users\desmo\Glomar's Github\pocket-dial\build_host\lib\Release\gtest.lib
+  gtest_main.cc
+  gtest_main.vcxproj -> C:\Users\desmo\Glomar's Github\pocket-dial\build_host\lib\Release\gtest_main.lib
+  SipMessage_test.cpp
+  SipMessage_header_test.cpp
+  SipStatus_test.cpp
+  SipDigest_test.cpp
+  ArpLookup_test.cpp
+  Pbx_test.cpp
+  PageZone_test.cpp
+  Rtp_test.cpp
+  RtpReceiver_test.cpp
+  PlayoutBuffer_test.cpp
+  AnchorClient_test.cpp
+  MediaBridge_test.cpp
+  MixBus_test.cpp
+  AdminHttpGate_test.cpp
+  DtmfClassCodes_test.cpp
+  ParkOrbit_test.cpp
+  RegisterBeeper_test.cpp
+  BlfSubscriptions_test.cpp
+  DashboardSnapshot_test.cpp
+  PcapCapture_test.cpp
+  Generating Code...
+  Compiling...
+  ProvisioningConfig_test.cpp
+  SipDigest.cpp
+  SipSecretStore.cpp
+  ArpLookup.cpp
+  AdminAuth.cpp
+  SipMessage.cpp
+  SipStatus.cpp
+  RtpSender.cpp
+  RtpReceiver.cpp
+  PlayoutBuffer.cpp
+  LoopbackAnchorClient.cpp
+  MediaBridge.cpp
+  MixBus.cpp
+  mix_kernels_scalar.cpp
+  RequestsHandler.cpp
+  TransactionLayer.cpp
+  Registrar.cpp
+  RegisterBeeper.cpp
+  ParkOrbit.cpp

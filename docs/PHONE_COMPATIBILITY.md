@@ -19,16 +19,20 @@ For the end-to-end first call, see [SETUP_GUIDE.md](SETUP_GUIDE.md). For board c
 | Transport | **UDP only** — the engine does not speak TCP or TLS |
 | Username / Auth ID / extension | your choice, e.g. `1001` (avoid `777` and `999`) |
 | Password | any value or blank — there is **no SIP digest auth today** (see [THREAT_MODEL.md](THREAT_MODEL.md) S-3) |
-| Audio codec | **G.711 only**: µ-law (PCMU, payload `0`) and a-law (PCMA, payload `8`); DTMF telephone-event is payload `101` |
+| Audio codec | **G.711** µ-law (PCMU, `0`) / a-law (PCMA, `8`) always; **G.722** (`9`) between two phones that both offer it (peer-to-peer legs only — the echo test, register beep and any server-terminated media stay G.711). DTMF telephone-event (any payload number, `101` by convention) passes through |
 | Registration expiry | ≤ `3600` s (the registrar caps higher values to 3600) |
 | NAT / STUN / ICE / rport | **off** — media is peer-to-peer on one L2 segment; NAT traversal only adds latency and failure modes |
 
 > [!IMPORTANT]
-> **Codec is the single most important setting.** pocket-dial does not transcode; it
-> rewrites every answer SDP to `0 8 101` via `SipMessage::enforceG711()`. If a phone is
-> left on Opus/G.722/G.729-only, the rewritten answer advertises payloads the phone never
-> offered and the call has **no common codec** → no audio. **Disable every codec except
-> G.711 µ-law and a-law** on each client.
+> **Codec is still the most important setting, but it now fails loudly.** pocket-dial does
+> not transcode. On peer-to-peer legs it relays each phone's own offer/answer with the
+> phone's preference order intact, dropping only payloads it won't carry (anything but
+> PCMU, PCMA, G.722 and telephone-event) via `SipMessage::filterAudioCodecs()`. Two
+> G.722-capable phones therefore negotiate wideband on their own; a phone left on
+> Opus/G.729-only gets a clean **488 Not Acceptable Here** instead of the old rewritten
+> answer that advertised payloads it never offered (signalling up, media dead). Keep
+> G.711 enabled on every client so calls to the echo test, the register beep and any
+> server-terminated leg — which stay pinned to `0 8 101` via `enforceG711()` — still work.
 
 > [!NOTE]
 > **Reserved extensions:** `777` (echo test) and `999` (all-page broadcast) are virtual

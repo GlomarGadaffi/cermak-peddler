@@ -58,7 +58,24 @@ public:
 	void setContact(std::string value);
 	void setContentLength(std::string value);
 	void addHeader(const std::string& name, const std::string& value);
+	// Pins the SDP payload list to "0 8 101". For SDP the SERVER itself
+	// terminates (777 echo, register beep, the 440/anchor media legs): those
+	// paths only ever speak G.711, so the list is the truth for them. Do NOT
+	// use it on a relayed offer/answer -- see filterAudioCodecs().
 	void enforceG711();
+	// Codec policy for a RELAYED offer/answer (peer-to-peer legs): keep the
+	// endpoint's own payload list and ORDER, dropping only what this PBX
+	// won't carry -- anything but PCMU/PCMA (+ G.722 when allowWideband) and
+	// telephone-event -- together with the matching a=rtpmap/a=fmtp lines.
+	// The offerer's preference order is therefore honoured end to end and a
+	// G.722-capable pair negotiates wideband on their own. Returns false and
+	// leaves the body untouched when no audio codec would survive (the
+	// caller should answer 488 rather than advertise payloads the phone never
+	// offered -- the old "signalling completes, media is dead" failure).
+	bool filterAudioCodecs(bool allowWideband);
+	// The same policy as a query: does this SDP offer at least one audio codec
+	// we would keep? True when there is no m=audio line at all.
+	bool offersSupportedAudio(bool allowWideband) const;
 	void clearBody();
 
 	// The message body — everything after the header/body separator (the SDP for

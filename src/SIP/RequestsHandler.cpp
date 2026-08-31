@@ -774,6 +774,42 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// Codec gate, before any session is allocated: an offer with no audio codec
+	// this PBX will relay (Opus-only, G.729-only ...) gets a clean 488 now,
+	// instead of a 200 OK whose rewritten m-line advertised payloads the phone
+	// never offered -- the "signalling completes, media is dead" failure
+	// PHONE_COMPATIBILITY.md used to document as a phone-side setting.
+	if (data->hasSdp() && !data->offersSupportedAudio(/*allowWideband=*/true))
+	{
+		auto response = getMessageFromPool(*data);
+		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+		response->setHeader("SIP/2.0 488 Not Acceptable Here");
+		response->clearBody();
+		response->addHeader("Warning", "304 " + _localIp + " \"No compatible audio codec (PCMU/PCMA/G722)\"");
+		response->setVia(std::string(data->getVia()) + ";received=" + _localIp);
+		_outbox.emplace_back(data->getSource(), std::move(response));
+		return;
+	}
+
+	// Secure mode: registration auth alone leaves call setup open to anyone who
+	// can reach UDP/5060 (drawbridge #125). Challenge the INVITE with the same
+	// digest machinery -- admitSecure() takes the method from the request line,
+	// so it verifies against INVITE. The stateless 401 needs no session; the
+	// credentialed retry arrives with CSeq+1 and falls through here. Learn mode
+	// keeps its TOFU semantics and Open mode never challenges.
+	if (_registrar.getMode() == RegistrarMode::Secure)
+	{
+		std::string rejectReason;
+		const Registrar::AuthDecision decision =
+			_registrar.admitSecure(data, std::string(data->getFromNumber()), rejectReason);
+		if (decision == Registrar::AuthDecision::Challenge) return;   // 401 enqueued
+		if (decision == Registrar::AuthDecision::Reject)
+		{
+			_registrar.sendForbidden(data, rejectReason.empty() ? "Forbidden" : rejectReason);
+			return;
+		}
+	}
+
 	std::string destNumber(data->getToNumber());
 	if (destNumber == "777")
 	{
@@ -1720,7 +1756,12 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 						response->setTo(originalTo);
 					}
 
-					response->enforceG711();
+					// Relayed answer on a peer-to-peer leg: keep the callee's codec
+					// pick and order (it already intersected the caller's offer),
+					// dropping only what this PBX won't carry. Never the blind
+					// "0 8 101" rewrite -- that advertised payloads the caller
+					// never offered and broke wideband/dynamic-PT phones.
+					(void)response->filterAudioCodecs(/*allowWideband=*/true);
 					endHandle(session.value()->getSrc()->getNumber(), std::move(response));
 
 					if (inviteMsg)
@@ -2038,7 +2079,9 @@ bool RequestsHandler::buildInviteFork(const std::shared_ptr<SipMessage>& invite,
 		inviteFork->addHeader("Alert-Info", "intercom=true");
 		inviteFork->addHeader("P-Auto-Answer", "normal");
 	}
-	inviteFork->enforceG711();
+	// Caller's offer relayed peer-to-peer: preserve its preference order, drop
+	// only unsupported payloads (onInvite already 488'd offers with nothing left).
+	(void)inviteFork->filterAudioCodecs(/*allowWideband=*/true);
 	_outbox.emplace_back(target->getAddress(), std::move(inviteFork));
 	return true;
 }
@@ -4939,7 +4982,7 @@ void RequestsHandler::onPickup(const std::shared_ptr<SipMessage>& data, const st
 	okToCaller->setTo(callerTo);
 	okToCaller->setContact(buildContact(picker->getNumber()));
 	okToCaller->setBody(std::string(data->getBody()));
-	okToCaller->enforceG711();
+	(void)okToCaller->filterAudioCodecs(/*allowWideband=*/true);
 	okToCaller->syncContentLength();
 
 	// ── Answer the picker's own INVITE with the caller's original SDP ───────
@@ -4952,7 +4995,7 @@ void RequestsHandler::onPickup(const std::shared_ptr<SipMessage>& data, const st
 	okToPicker->setTo(toForPicker);
 	okToPicker->setContact(buildContact(ringingExt));
 	okToPicker->setBody(std::string(invite->getBody()));
-	okToPicker->enforceG711();
+	(void)okToPicker->filterAudioCodecs(/*allowWideband=*/true);
 	okToPicker->syncContentLength();
 
 	// ── Bridge the two independent dialogs. Both legs are REAL registered

@@ -107,7 +107,7 @@ void ParkOrbit::onInvite(const std::shared_ptr<SipMessage>& data,
 	ok->setTo(std::string(data->getTo()) + ";tag=" + toTag);
 	ok->setContact(_env.contactFor(orbit));
 	if (!parkedSdp.empty()) ok->setBody(parkedSdp);
-	ok->enforceG711();
+	(void)ok->filterAudioCodecs(/*allowWideband=*/true);   // parked party's own SDP, relayed P2P
 	ok->syncContentLength();
 	_env.enqueue(data->getSource(), ok);
 
@@ -157,7 +157,7 @@ void ParkOrbit::sendReinvite(ParkSlot& slot, const std::string& sdp)
 
 	auto inv = _env.messageFromPool(ss.str(), slot.parkedAddr);
 	if (!inv) return;   // pool exhausted: drop, peer retransmits (#101A)
-	inv->enforceG711();
+	(void)inv->filterAudioCodecs(/*allowWideband=*/true);   // phone SDP relayed P2P
 	inv->syncContentLength();
 	_env.enqueue(slot.parkedAddr, std::move(inv));
 	_pendingAcks.push_back(slot.callID);
@@ -209,7 +209,7 @@ void ParkOrbit::startRingback(ParkSlot& slot, const std::shared_ptr<SipClient>& 
 
 	auto inv = _env.messageFromPool(ss.str(), addr);
 	if (!inv) return;   // pool exhausted: drop, peer retransmits (#101A)
-	inv->enforceG711();
+	(void)inv->filterAudioCodecs(/*allowWideband=*/true);   // phone SDP relayed P2P
 	inv->syncContentLength();
 	_env.enqueue(addr, std::move(inv));
 	_env.log("Park: timeout on " + slot.orbit + " — ringing back parker " + parker->getNumber());

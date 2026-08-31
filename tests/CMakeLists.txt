@@ -37,6 +37,14 @@ add_executable(sip_parser_tests
     # BEFORE building any 180/200, mirroring the ordinary call-to-call INVITE
     # path, so a full session pool gets a real 503 instead of a false 200.
     Invite777SessionPool_test.cpp
+    # Relay codec policy: filterAudioCodecs()/offersSupportedAudio() replaced the
+    # blind enforceG711() "0 8 101" rewrite on peer-to-peer legs -- offer order
+    # preserved, G.722 admitted, unsupported payloads (and their rtpmap/fmtp)
+    # dropped, 488 when nothing is left.
+    SdpNegotiate_test.cpp
+    # onInvite admission gates: the 488 codec gate and the Secure-mode INVITE
+    # digest challenge (drawbridge #125), driven through handle().
+    InviteAdmission_test.cpp
     SipStatus_test.cpp
     SipDigest_test.cpp
     ArpLookup_test.cpp
