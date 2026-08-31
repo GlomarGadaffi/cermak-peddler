@@ -49,6 +49,10 @@ Register two SIP softphones (Linphone, Zoiper, etc.) to `sip:127.0.0.1:5060`, di
 
 ## Run it on hardware (ESP32-S3)
 
+**No toolchain?** Flash a release straight from Chrome or Edge at
+**<https://glomargadaffi.github.io/pocket-dial/flasher/>** — plug the board in over USB,
+pick Ethernet / display / Wi-Fi, click Flash. Or build it yourself:
+
 ```bash
 # WiFi SoftAP (default for standard ESP32-S3 boards)
 idf.py set-target esp32s3
@@ -127,6 +131,7 @@ If you need conference calls or external bridging, see **[docs/CONFERENCE_MIXER.
 **Ops:**
 - [docs/API.md](docs/API.md) — HTTP API reference (extensions, DND, CDR, live calls)
 - [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — "it's not working"
+- [Browser flasher](https://glomargadaffi.github.io/pocket-dial/flasher/) — flash a release over USB from Chrome/Edge, no toolchain
 - [FLASHING.md](docs/FLASHING.md) — ESP-IDF & build recipes
 
 ## License

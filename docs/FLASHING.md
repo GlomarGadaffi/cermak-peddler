@@ -44,6 +44,15 @@ The build produces, under `build/`:
 
 ## 3. First-time flash (USB)
 
+### Option 0 — from the browser, no toolchain
+
+Open **<https://glomargadaffi.github.io/pocket-dial/flasher/>** in Chrome, Edge, or
+Opera on a desktop, plug the board in over USB, pick the variant (Ethernet /
+display / Wi-Fi) and click **Flash board**. It pulls the images from the GitHub
+Release you choose and writes them from your machine; nothing is uploaded. It
+also takes locally built `.bin` files under *Flash your own build*. Details in
+[flasher/README.md](flasher/README.md).
+
 Connect the board over USB and identify the serial port:
 
 - **Linux:** `/dev/ttyUSB0` or `/dev/ttyACM0`
