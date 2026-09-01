@@ -29,6 +29,15 @@ add_executable(sip_parser_tests
     # must invalidate it — including reset() and `*msg = source`, the two ways
     # the message pool recycles a slot into a different call.
     SipSdpMessage_cache_test.cpp
+    # CWE-674 hardening: the SDP parser must stay flat, non-recursive and bounded
+    # against the UNISOC T612 a=acap-flood RCE class (SSD advisory, 2026), even as
+    # SDP negotiation adds a= attribute handling on this branch.
+    SipSdpMessage_hardening_test.cpp
+    # T-7 (docs/THREAT_MODEL.md): SipMessage::checkSdp() structural caps + the
+    # RFC 5939 capability-negotiation refusal, and the handle()-level gate that
+    # applies them to every SDP-bearing message before any decode or relay.
+    # Also pins the decode paths as zero-heap via a counting operator new.
+    SdpAdmission_test.cpp
     # Issue #101(A)/(E): message-pool backpressure (bounded heap fallback, then
     # refuse) and the concurrent-handout invariant. Draws on the process-global
     # pool, so each test releases what it holds before it ends.

@@ -358,6 +358,27 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 			request->toString(pcapSlot);
 		}
 
+		// ── SDP admission gate (docs/THREAT_MODEL.md T-7) ──────────────────────
+		// Every SDP body is structurally checked HERE, once, before any handler
+		// decodes it and before it can be relayed to a peer phone -- initial
+		// INVITE, re-INVITE, UPDATE, ACK and every response alike. A well-formed
+		// SIP start line says nothing about the body: the UNISOC T612 RCE rode in
+		// on a normal MMTel video offer whose a= lines were the poison. The check
+		// is one flat, allocation-free pass (SipMessage::checkSdp); a violation is
+		// a hard error for the whole message, never "keep tokenizing". It sits
+		// after the pcap capture on purpose, so the refused bytes are there to
+		// look at.
+		bool sdpRefused = false;
+		if (request->hasSdp() && !request->getBody().empty())
+		{
+			const auto verdict = request->checkSdp();
+			if (verdict != SipMessage::SdpVerdict::Ok)
+			{
+				rejectSdp(request, verdict);
+				sdpRefused = true;
+			}
+		}
+
 		auto client = findClientByAddress(request->getSource());
 		if (client.has_value())
 		{
@@ -366,6 +387,12 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 
 		maybeSweep();
 
+		// A refused SDP body skips the transaction layer and the handler table
+		// entirely: a poison 200 OK must not "accept" an INVITE transaction any
+		// more than it may be relayed. The pool slot is released with the shared_ptr
+		// like any other unhandled packet.
+		if (!sdpRefused)
+		{
 		// RFC 3261 §17 transaction layer: advance the state machine for any tracked
 		// InviteClient transaction before the TU handler runs. A 1xx moves Calling →
 		// Proceeding (stops retransmitting); a 2xx/3xx-6xx → Accepted/Completed.
@@ -460,6 +487,7 @@ void RequestsHandler::handle(std::shared_ptr<SipMessage> request, std::string_vi
 				it->second(std::move(request));
 			}
 		}
+		}   // !sdpRefused
 
 		// Device-registry change detection: a REGISTER may have adopted a device,
 		// re-synced its extension, or flipped its online flag inside the Registrar
@@ -2691,6 +2719,40 @@ void RequestsHandler::forceDisconnect(const std::string& extension)
 uint64_t RequestsHandler::getPacketsProcessed() const
 {
 	return _packetsProcessed.load(std::memory_order_relaxed);
+}
+
+uint64_t RequestsHandler::getSdpRejected() const
+{
+	return _sdpRejected.load(std::memory_order_relaxed);
+}
+
+void RequestsHandler::rejectSdp(const std::shared_ptr<SipMessage>& request, SipMessage::SdpVerdict verdict)
+{
+	_sdpRejected.fetch_add(1, std::memory_order_relaxed);
+	const char* why = SipMessage::sdpVerdictText(verdict);
+
+	// Only a request other than ACK takes a final response (RFC 3261 §17.1.1.3,
+	// §8.2.6). A poison response or ACK is simply not acted on: not relayed, not
+	// matched against a transaction, not used to advance a session.
+	const bool isResponse = request->getStatusInfo().has_value();
+	if (isResponse || request->getType() == SipMessageTypes::ACK)
+	{
+		queueLog("[SIP] SDP refused (" + std::string(why) + "), dropped: " +
+			std::string(request->getHeader()) + " from " + std::string(request->getFromNumber()), true);
+		return;
+	}
+
+	auto response = getMessageFromPool(*request);
+	if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
+	response->setHeader("SIP/2.0 488 Not Acceptable Here");
+	response->clearBody();
+	// Warning 399 (miscellaneous, RFC 3261 §20.43) with the reason, so the
+	// refusal is diagnosable from the phone's SIP trace rather than a mystery 488.
+	response->addHeader("Warning", "399 " + _localIp + " \"SDP refused: " + why + "\"");
+	response->setVia(std::string(request->getVia()) + ";received=" + _localIp);
+	_outbox.emplace_back(request->getSource(), std::move(response));
+	queueLog("[SIP] SDP refused (" + std::string(why) + "), 488 to " +
+		std::string(request->getFromNumber()) + " for " + std::string(request->getHeader()), true);
 }
 
 uint64_t RequestsHandler::getPacketsDropped() const

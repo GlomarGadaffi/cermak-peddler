@@ -1,6 +1,4 @@
 #include "SipMessage.hpp"
-#include <functional>
-#include <unordered_map>
 #include <vector>
 #include <cctype>
 #include "SipMessageTypes.h"
@@ -9,6 +7,26 @@
 
 namespace
 {
+	// Case-insensitive search for the SDP MIME type. MIME types are
+	// case-insensitive (RFC 2045 §5.1), and a body whose Content-Type reads
+	// "Application/SDP" is still SDP to the phone we would relay it to -- so it
+	// must be SDP to the admission gate as well (SipMessage::checkSdp), or the
+	// gate could be sidestepped by changing case. Flat scan, bounded by the
+	// datagram size, no allocation.
+	bool mentionsSdpContentType(std::string_view message)
+	{
+		static constexpr std::string_view kType = "application/sdp";
+		if (message.size() < kType.size()) return false;
+		for (size_t i = 0; i + kType.size() <= message.size(); ++i)
+		{
+			size_t k = 0;
+			while (k < kType.size() &&
+				std::tolower(static_cast<unsigned char>(message[i + k])) == kType[k]) ++k;
+			if (k == kType.size()) return true;
+		}
+		return false;
+	}
+
 	bool iequal(std::string_view a, std::string_view b)
 	{
 		if (a.size() != b.size()) return false;
@@ -131,7 +149,7 @@ namespace
 
 SipMessage::SipMessage(const std::string& message, sockaddr_in src) : _src(src)
 {
-	_hasSdp = (message.find("application/sdp") != std::string::npos);
+	_hasSdp = mentionsSdpContentType(message);
 	splitMessage(message, _startLine, _headerLines, _body);
 }
 
@@ -158,7 +176,7 @@ SipMessage& SipMessage::operator=(const SipMessage& other)
 void SipMessage::reset(std::string_view message, sockaddr_in src)
 {
 	_src = src;
-	_hasSdp = (message.find("application/sdp") != std::string::npos);
+	_hasSdp = mentionsSdpContentType(message);
 	// splitMessage() clear()s _headerLines rather than reassigning it, so a
 	// pooled message's vector capacity survives across reset() calls.
 	splitMessage(message, _startLine, _headerLines, _body);
@@ -264,34 +282,25 @@ void SipMessage::enforceG711()
 
 namespace
 {
-	// One pass over an SDP body applying the relay codec policy. Fills the kept
-	// and dropped payload types (m=audio order preserved) and reports whether
-	// a real audio codec -- not just telephone-event -- survives.
-	struct AudioPolicyResult
+	// ── Shared SDP line walker ───────────────────────────────────────────────
+	// Returns the line starting at `pos` with its terminator stripped ("\r\n"
+	// or bare "\n") and advances `pos` past it. Every SDP consumer in this file
+	// walks the body through this one flat loop: there is no per-line callback,
+	// no function pointer on the parser's stack and nothing that could re-enter
+	// a line handler from inside another (docs/THREAT_MODEL.md T-7).
+	std::string_view nextSdpLine(std::string_view body, size_t& pos)
 	{
-		bool hasMLine = false;
-		bool hasAudio = false;
-		std::vector<int> kept;
-		std::vector<int> dropped;
-		size_t mPos = 0, mLen = 0;   // span of the m=audio line (no terminator)
-		std::string mPrefix;         // "m=audio <port> <proto>"
-	};
-
-	void forEachLine(std::string_view body, const std::function<void(std::string_view, size_t)>& fn)
-	{
-		size_t pos = 0;
-		while (pos < body.size())
-		{
-			size_t eol = body.find('\n', pos);
-			size_t end = (eol == std::string_view::npos) ? body.size() : eol;
-			std::string_view line = body.substr(pos, end - pos);
-			if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
-			fn(line, pos);
-			if (eol == std::string_view::npos) break;
-			pos = eol + 1;
-		}
+		const size_t eol = body.find('\n', pos);
+		const size_t end = (eol == std::string_view::npos) ? body.size() : eol;
+		std::string_view line = body.substr(pos, end - pos);
+		if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+		pos = (eol == std::string_view::npos) ? body.size() : eol + 1;
+		return line;
 	}
 
+	// Decimal prefix of `s` as an RTP payload type; -1 if absent or > 127.
+	// The 7-bit bound is what lets every per-PT fact below live in a fixed
+	// 128-slot table instead of a map.
 	int parseIntPrefix(std::string_view s)
 	{
 		int v = 0;
@@ -306,20 +315,49 @@ namespace
 		return any ? v : -1;
 	}
 
-	std::string lower(std::string_view s)
+	// Case-insensitive equality against an ASCII-lowercase literal.
+	bool iequalLower(std::string_view s, std::string_view lowerLit)
 	{
-		std::string out(s);
-		for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-		return out;
+		if (s.size() != lowerLit.size()) return false;
+		for (size_t i = 0; i < s.size(); ++i)
+			if (std::tolower(static_cast<unsigned char>(s[i])) != lowerLit[i]) return false;
+		return true;
 	}
+
+	// One flat pass over an SDP body applying the relay codec policy. Fills the
+	// kept payload types (m=audio order preserved), the dropped set, and reports
+	// whether a real audio codec -- not just telephone-event -- survives.
+	//
+	// Zero heap and zero indirect calls on this path, by construction: the only
+	// thing the policy needs from an a=rtpmap line is "is this PT
+	// telephone-event", which is one bit per 7-bit payload type, and the m=
+	// format list is captured into a fixed array. checkSdp() has already capped
+	// the format count on the wire path, so the cap here is reached only by a
+	// locally built message; extra formats are ignored, never decoded.
+	struct AudioPolicyResult
+	{
+		bool    hasMLine = false;
+		bool    hasAudio = false;
+		uint8_t keptCount = 0;
+		uint8_t droppedCount = 0;
+		uint8_t kept[SdpLimits::kMaxMediaFormats] = {};   // m=audio order preserved
+		bool    dropped[128] = {};                          // membership by payload type
+		size_t  mPos = 0, mLen = 0;    // span of the m=audio line (no terminator)
+		size_t  mPrefixLen = 0;        // length of "m=audio <port> <proto>" within it
+	};
 
 	AudioPolicyResult applyAudioPolicy(std::string_view body, bool allowWideband)
 	{
 		AudioPolicyResult r;
-		std::unordered_map<int, std::string> rtpmap;   // pt -> lowercase encoding name
-		std::vector<int> offered;
+		bool     isEvent[128] = {};   // a=rtpmap:<pt> telephone-event/...
+		uint8_t  offered[SdpLimits::kMaxMediaFormats];
+		unsigned offeredCount = 0;
 
-		forEachLine(body, [&](std::string_view line, size_t pos) {
+		size_t pos = 0;
+		while (pos < body.size())
+		{
+			const size_t lineStart = pos;
+			const std::string_view line = nextSdpLine(body, pos);
 			if (line.rfind("a=rtpmap:", 0) == 0)
 			{
 				std::string_view rest = line.substr(9);
@@ -330,23 +368,23 @@ namespace
 					std::string_view name = rest.substr(sp + 1);
 					size_t slash = name.find('/');
 					if (slash != std::string_view::npos) name = name.substr(0, slash);
-					rtpmap[pt] = lower(name);
+					isEvent[pt] = iequalLower(name, "telephone-event");   // last one wins
 				}
 			}
 			else if (!r.hasMLine && line.rfind("m=audio ", 0) == 0)
 			{
 				r.hasMLine = true;
-				r.mPos = pos;
+				r.mPos = lineStart;
 				r.mLen = line.size();
 				// m=audio <port> <proto> <fmt> <fmt> ...
 				size_t p1 = line.find(' ');
 				size_t p2 = (p1 == std::string_view::npos) ? p1 : line.find(' ', p1 + 1);
 				size_t p3 = (p2 == std::string_view::npos) ? p2 : line.find(' ', p2 + 1);
-				if (p3 == std::string_view::npos) { r.mPrefix = std::string(line); return; }
-				r.mPrefix = std::string(line.substr(0, p3));
+				if (p3 == std::string_view::npos) { r.mPrefixLen = line.size(); continue; }
+				r.mPrefixLen = p3;
 				std::string_view fmts = line.substr(p3 + 1);
 				size_t i = 0;
-				while (i < fmts.size())
+				while (i < fmts.size() && offeredCount < SdpLimits::kMaxMediaFormats)
 				{
 					while (i < fmts.size() && fmts[i] == ' ') ++i;
 					size_t s = i;
@@ -354,29 +392,60 @@ namespace
 					if (i > s)
 					{
 						int pt = parseIntPrefix(fmts.substr(s, i - s));
-						if (pt >= 0) offered.push_back(pt);
+						if (pt >= 0) offered[offeredCount++] = static_cast<uint8_t>(pt);
 					}
 				}
 			}
-		});
+		}
 
-		for (int pt : offered)
+		for (unsigned k = 0; k < offeredCount; ++k)
 		{
-			auto it = rtpmap.find(pt);
-			const std::string name = (it == rtpmap.end()) ? std::string() : it->second;
-			const bool isEvent = (name == "telephone-event");
-			const bool keep = (pt == 0) || (pt == 8) || (allowWideband && pt == 9) || isEvent;
+			const uint8_t pt = offered[k];
+			const bool ev = isEvent[pt];
+			const bool keep = (pt == 0) || (pt == 8) || (allowWideband && pt == 9) || ev;
 			if (keep)
 			{
-				r.kept.push_back(pt);
-				if (!isEvent) r.hasAudio = true;
+				r.kept[r.keptCount++] = pt;
+				if (!ev) r.hasAudio = true;
 			}
 			else
 			{
-				r.dropped.push_back(pt);
+				r.dropped[pt] = true;
+				++r.droppedCount;
 			}
 		}
 		return r;
+	}
+
+	// a=<name> must be an RFC 4566 token. The charset is kept tighter than the
+	// RFC's full token set on purpose: every attribute a real phone sends is
+	// alnum plus '-', '_', '.', '+', and a name outside that is noise we would
+	// otherwise relay unread.
+	bool isAttrNameChar(char c)
+	{
+		const unsigned char u = static_cast<unsigned char>(c);
+		return std::isalnum(u) || c == '-' || c == '_' || c == '.' || c == '+';
+	}
+
+	// SDP capability-negotiation attributes this PBX does not implement and
+	// therefore refuses rather than relays: RFC 5939 (acap/tcap/pcfg/acfg/creq),
+	// its media-level extension RFC 6871 (rmcap/omcap/mfcap/mscap/lcfg/sescap)
+	// and RFC 7104 (bcap/ccap/icap). Each one carries a mini-grammar of its own
+	// that a receiver is expected to decode and dispatch on -- the exact class
+	// of "attribute that is really a program" behind the T612 RCE. a=csup is
+	// deliberately NOT here: it only advertises support and an offer carrying it
+	// alone is still a plain RFC 3264 offer (RFC 5939 §3.3.2), so rejecting it
+	// would refuse well-behaved phones for nothing.
+	bool isCapNegAttribute(std::string_view name)
+	{
+		static constexpr std::string_view kCapNeg[] = {
+			"acap", "tcap", "pcfg", "acfg", "creq",
+			"rmcap", "omcap", "mfcap", "mscap", "lcfg", "sescap",
+			"bcap", "ccap", "icap",
+		};
+		for (std::string_view k : kCapNeg)
+			if (iequalLower(name, k)) return true;
+		return false;
 	}
 }
 
@@ -389,45 +458,126 @@ bool SipMessage::offersSupportedAudio(bool allowWideband) const
 bool SipMessage::filterAudioCodecs(bool allowWideband)
 {
 	const AudioPolicyResult r = applyAudioPolicy(_body, allowWideband);
-	if (!r.hasMLine) return true;      // nothing to negotiate
-	if (!r.hasAudio) return false;     // caller answers 488; body left as offered
-	if (r.dropped.empty()) return true; // already within policy: no rewrite, no churn
+	if (!r.hasMLine) return true;        // nothing to negotiate
+	if (!r.hasAudio) return false;       // caller answers 488; body left as offered
+	if (r.droppedCount == 0) return true; // already within policy: no rewrite, no churn
 
+	// The rewrite is the one place this path allocates: a fresh body of at most
+	// the old body's size. That is a bounded copy of bytes checkSdp() already
+	// admitted, not a decode -- nothing here is proportional to attribute
+	// structure the peer chose.
 	std::string out;
 	out.reserve(_body.size());
 	const std::string_view body(_body);
 	size_t pos = 0;
 	while (pos < body.size())
 	{
-		size_t eol = body.find('\n', pos);
-		size_t next = (eol == std::string_view::npos) ? body.size() : eol + 1;
-		std::string_view raw = body.substr(pos, next - pos);   // line WITH terminator
-		std::string_view line = raw;
-		if (!line.empty() && line.back() == '\n') line.remove_suffix(1);
-		if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+		const size_t lineStart = pos;
+		const std::string_view line = nextSdpLine(body, pos);
+		const std::string_view raw = body.substr(lineStart, pos - lineStart);   // WITH terminator
 
-		bool drop = false;
-		if (pos == r.mPos)
+		if (lineStart == r.mPos)
 		{
-			out += r.mPrefix;
-			for (int pt : r.kept) { out += ' '; out += std::to_string(pt); }
+			out.append(line.substr(0, r.mPrefixLen));
+			for (unsigned k = 0; k < r.keptCount; ++k)
+			{
+				out += ' ';
+				out += std::to_string(static_cast<int>(r.kept[k]));   // <= 3 digits: SSO, no heap
+			}
 			out.append(raw.substr(line.size()));   // original terminator
-			pos = next;
 			continue;
 		}
+		bool drop = false;
 		if (line.rfind("a=rtpmap:", 0) == 0 || line.rfind("a=fmtp:", 0) == 0)
 		{
 			size_t colon = line.find(':');
 			int pt = parseIntPrefix(line.substr(colon + 1));
-			for (int d : r.dropped) if (d == pt) { drop = true; break; }
+			drop = (pt >= 0) && r.dropped[pt];
 		}
 		if (!drop) out.append(raw);
-		pos = next;
 	}
 	_body = std::move(out);
 	++_bodyGen;
 	syncContentLength();
 	return true;
+}
+
+SipMessage::SdpVerdict SipMessage::checkSdp() const
+{
+	using namespace SdpLimits;
+	const std::string_view body(_body);
+	if (body.size() > kMaxBodyBytes) return SdpVerdict::BodyTooLarge;
+
+	unsigned lines = 0;
+	size_t pos = 0;
+	while (pos < body.size())
+	{
+		const std::string_view line = nextSdpLine(body, pos);
+		if (line.empty()) continue;   // tolerated, as every decoder here tolerates it
+		if (++lines > kMaxLines) return SdpVerdict::TooManyLines;
+
+		// RFC 4566 §5: every line is exactly <type>=<value> with a one-letter type.
+		if (line.size() < 2 || line[1] != '=' ||
+			!std::isalpha(static_cast<unsigned char>(line[0])))
+		{
+			return SdpVerdict::MalformedLine;
+		}
+
+		// Attribute policy before the length and token caps: the name is read
+		// through at most kMaxAttrNameBytes + 1 bytes whatever the line's length,
+		// so this is bounded work, and it is the verdict that matters for the
+		// canonical attack body (`a=acap:1 acap:1 ...` -- 1.4 KB on one line),
+		// which violates all three. Naming the real reason in the 488's Warning
+		// beats "line too long" when someone reads the phone's SIP trace.
+		if (line[0] == 'a')
+		{
+			std::string_view name = line.substr(2, kMaxAttrNameBytes + 1);
+			const size_t colon = name.find(':');
+			if (colon != std::string_view::npos) name = name.substr(0, colon);
+			if (name.empty() || name.size() > kMaxAttrNameBytes) return SdpVerdict::BadAttributeName;
+			for (char c : name)
+				if (!isAttrNameChar(c)) return SdpVerdict::BadAttributeName;
+			if (isCapNegAttribute(name)) return SdpVerdict::CapabilityNegotiation;
+		}
+
+		if (line.size() > kMaxLineBytes) return SdpVerdict::LineTooLong;
+
+		// Token count: SP-separated runs. Counted, never decoded. This is the
+		// "attribute depth" bound -- there is no re-dispatch on tokens anywhere
+		// in this parser, so depth is 1 by construction and the token cap is what
+		// keeps the per-line work of any downstream decoder fixed.
+		unsigned tokens = 0;
+		bool inToken = false;
+		for (char c : line)
+		{
+			if (c == ' ') { inToken = false; continue; }
+			if (!inToken)
+			{
+				inToken = true;
+				if (++tokens > kMaxTokensPerLine) return SdpVerdict::TooManyTokens;
+			}
+		}
+		// m=<media> <port> <proto> <fmt>...: everything past the third token is a format.
+		if (line[0] == 'm' && tokens > 3 + kMaxMediaFormats) return SdpVerdict::TooManyMediaFormats;
+	}
+	return SdpVerdict::Ok;
+}
+
+const char* SipMessage::sdpVerdictText(SdpVerdict v)
+{
+	switch (v)
+	{
+		case SdpVerdict::Ok:                    return "ok";
+		case SdpVerdict::BodyTooLarge:          return "body too large";
+		case SdpVerdict::TooManyLines:          return "too many lines";
+		case SdpVerdict::LineTooLong:           return "line too long";
+		case SdpVerdict::MalformedLine:         return "malformed line";
+		case SdpVerdict::TooManyTokens:         return "too many tokens on a line";
+		case SdpVerdict::TooManyMediaFormats:   return "too many media formats";
+		case SdpVerdict::BadAttributeName:      return "bad attribute name";
+		case SdpVerdict::CapabilityNegotiation: return "capability negotiation (RFC 5939) not supported";
+	}
+	return "rejected";
 }
 
 void SipMessage::syncContentLength()
@@ -457,22 +607,11 @@ SipMessage::SdpDirection SipMessage::getSdpDirection() const
 	size_t pos = 0;
 	while (pos < whole.size())
 	{
-		size_t eol = whole.find('\n', pos);
-		size_t lineEnd = (eol == std::string_view::npos) ? whole.size() : eol;
-		std::string_view line = whole.substr(pos, lineEnd - pos);
-		if (!line.empty() && line.back() == '\r')
-		{
-			line.remove_suffix(1);
-		}
+		const std::string_view line = nextSdpLine(whole, pos);
 		if (line == "a=sendrecv") return SdpDirection::SendRecv;
 		if (line == "a=sendonly") return SdpDirection::SendOnly;
 		if (line == "a=recvonly") return SdpDirection::RecvOnly;
 		if (line == "a=inactive") return SdpDirection::Inactive;
-		if (eol == std::string_view::npos)
-		{
-			break;
-		}
-		pos = eol + 1;
 	}
 	return SdpDirection::None;
 }

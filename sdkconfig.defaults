@@ -86,3 +86,25 @@ CONFIG_ESP_WOLFSSL_NO_STACK_SIZE_BUILD_WARNING=y
 # unaffected.
 CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=32
+
+
+# ── Task-stack overflow: fail loud, immediately (docs/THREAT_MODEL.md T-7) ──
+# The lesson of the UNISOC T612 VoLTE RCE: on an RTOS a parser that spends the
+# call stack turns a stack overflow into native code execution, because the
+# bytes past the end of one task's stack are another task's stack (and its
+# saved return addresses / function pointers). The SIP parser runs on the 16 KB
+# udp_receiver_task and is non-recursive and bounded by construction (see
+# SipMessage::checkSdp and tests/tools/check_parser_callgraph.py) -- these two
+# settings are the backstop for the day a future change forgets that.
+#
+# WATCHPOINT_END_OF_STACK arms a hardware debug watchpoint on the last 32 bytes
+# of every task's stack, so the FIRST write past the end traps into the panic
+# handler -- not the next context switch, by which time the neighbour is
+# already corrupted (the canary check alone, which stays on, only catches it
+# then). Costs one of the two watchpoints (OpenOCD keeps the other).
+CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
+# -fstack-protector-strong: a per-frame canary on every function that holds an
+# array or takes a local's address (i.e. every parser frame), verified before
+# return. A smashed return address becomes an abort in __stack_chk_fail rather
+# than a jump. The code-size cost is a few percent on the parser TUs only.
+CONFIG_COMPILER_STACK_CHECK_MODE_STRONG=y

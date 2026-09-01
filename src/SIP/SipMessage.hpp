@@ -20,6 +20,35 @@
 
 #include "SipStatus.hpp"
 
+// ── SDP structural limits ───────────────────────────────────────────────────
+// Hard caps SipMessage::checkSdp() enforces on every SDP body BEFORE any decoder
+// runs (RequestsHandler::handle() applies it to the wire path ahead of dispatch).
+// The design rule they pin (docs/THREAT_MODEL.md T-7): SDP's a= extension
+// grammar looks like a line-oriented key/value format and is really a nested
+// dispatcher; on an RTOS a parser whose work is a function of attacker-chosen
+// structure is a stack-exhaustion primitive (the UNISOC T612 VoLTE RCE, CWE-674,
+// was exactly that -- an a=acap decoder recursing once per token). So: line
+// length, line count, tokens per line and media formats are capped up front, a
+// violation is a hard error for the WHOLE body (488 on a request, drop on a
+// response) rather than "keep tokenizing", and the RFC 5939 capability-
+// negotiation family is rejected outright because this PBX does not implement
+// it and must not relay it to a phone that might.
+//
+// Sizing: a codec-rich softphone offer with ICE/DTLS attributes is ~40 lines of
+// <200 bytes; the longest legitimate lines (H.264 fmtp, ICE candidates) stay
+// under 300 bytes and 16 tokens; hardphones offer well under 16 payload types.
+// Inbound SIP is UDP-capped at 2048 bytes today (UdpServer::BUFFER_SIZE), so
+// kMaxBodyBytes only matters for a future TCP/large-MTU transport.
+namespace SdpLimits
+{
+	constexpr size_t   kMaxBodyBytes     = 4096;
+	constexpr unsigned kMaxLines         = 256;
+	constexpr size_t   kMaxLineBytes     = 512;
+	constexpr unsigned kMaxTokensPerLine = 40;   // SP-separated runs on one line
+	constexpr unsigned kMaxMediaFormats  = 32;   // <fmt> tokens on one m= line
+	constexpr size_t   kMaxAttrNameBytes = 32;   // a=<name>[:value]
+}
+
 class SipMessage
 {
 public:
@@ -76,6 +105,30 @@ public:
 	// The same policy as a query: does this SDP offer at least one audio codec
 	// we would keep? True when there is no m=audio line at all.
 	bool offersSupportedAudio(bool allowWideband) const;
+
+	// ── SDP admission ───────────────────────────────────────────────────────
+	// One flat pass over the body applying SdpLimits and the attribute policy.
+	// Never allocates, never recurses, never dispatches on attribute content:
+	// the only per-attribute work is a bounded name compare. Ok means "safe to
+	// hand to the decoders below and to relay"; anything else is a hard error
+	// for the whole body. Run this before offersSupportedAudio(),
+	// filterAudioCodecs(), getSdpDirection() or SipSdpMessage's accessors on
+	// any body that came off the wire -- handle() already does, once, for
+	// every SDP-bearing message regardless of method or status.
+	enum class SdpVerdict : uint8_t
+	{
+		Ok = 0,
+		BodyTooLarge,            // > SdpLimits::kMaxBodyBytes
+		TooManyLines,            // > SdpLimits::kMaxLines
+		LineTooLong,             // > SdpLimits::kMaxLineBytes
+		MalformedLine,           // not "<type>=<value>" (RFC 4566 §5)
+		TooManyTokens,           // > SdpLimits::kMaxTokensPerLine on one line
+		TooManyMediaFormats,     // > SdpLimits::kMaxMediaFormats on one m= line
+		BadAttributeName,        // a= name empty, over-long or not a token
+		CapabilityNegotiation,   // RFC 5939 / 6871 / 7104 attribute: not implemented
+	};
+	SdpVerdict checkSdp() const;
+	static const char* sdpVerdictText(SdpVerdict v);   // short reason for a Warning header / log
 	void clearBody();
 
 	// The message body — everything after the header/body separator (the SDP for

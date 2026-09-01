@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased (feat/sdp-negotiation-invite-auth) - 2026-09-01
+
+### Security — SDP admission gate (docs/THREAT_MODEL.md T-7)
+
+- Every SDP-bearing SIP message is now structurally checked once, in
+  `RequestsHandler::handle()`, before any decoder runs and before it can be
+  relayed to a peer phone — initial INVITE, re-INVITE, UPDATE, ACK and every
+  response alike. `SipMessage::checkSdp()` is one flat, allocation-free pass
+  that enforces `SdpLimits` (body ≤ 4 KB, ≤ 256 lines, ≤ 512 bytes per line,
+  ≤ 40 tokens per line, ≤ 32 formats per `m=` line, `a=` names ≤ 32 token
+  characters) and refuses the RFC 5939 / 6871 / 7104 capability-negotiation
+  attributes (`acap tcap pcfg acfg creq rmcap omcap mfcap mscap lcfg sescap bcap
+  ccap icap`) outright, since this PBX does not implement them. A violation is a
+  hard error for the whole body: requests get `488 Not Acceptable Here` with a
+  `Warning: 399 <ip> "SDP refused: <reason>"`, responses and ACKs are dropped
+  (never relayed, never advance a transaction). New counter
+  `RequestsHandler::getSdpRejected()`. Motivated by the UNISOC T612 VoLTE RCE
+  (CWE-674: an `a=acap` decoder recursing per token until the modem stack
+  overflowed) — a body this PBX used to relay verbatim to the held party.
+- The SDP MIME type is now matched case-insensitively (`Application/SDP` is
+  SDP to a phone, so it is SDP to the gate).
+- `applyAudioPolicy` (the relay codec policy behind `filterAudioCodecs` /
+  `offersSupportedAudio`) rewritten heap-free: per-payload-type facts live in
+  fixed 128-slot tables and the `m=` format list in a fixed array; the
+  `std::function` line callback is gone, so the parser task's stack holds no
+  function pointer on this path. Behaviour is unchanged (existing
+  `SdpNegotiate` tests) and now pinned as zero-allocation by a counting
+  `operator new` in `tests/SdpAdmission_test.cpp`.
+- `sdkconfig.defaults`: `CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y` (hardware
+  trap on the first write past any task stack) and
+  `CONFIG_COMPILER_STACK_CHECK_MODE_STRONG=y` (per-frame canaries) as the
+  backstop for the day a future change reintroduces stack-proportional parsing.
+- New `tests/tools/check_parser_callgraph.py`: compiles the SIP translation
+  units with GCC `-fcallgraph-info=su` / `-fstack-usage` and fails on any
+  recursion cycle or dynamic stack frame in project code (run under Linux/WSL).
+  Current state: 656 functions, no cycles, no dynamic frames; `checkSdp` is two
+  frames deep.
+- Tests: `tests/SdpAdmission_test.cpp` (14 cases, unit + through `handle()`:
+  the literal T612 payload on an INVITE, a re-INVITE and a 200 OK; every
+  capneg attribute; each structural cap; a codec-rich ICE/DTLS offer still
+  forwarded) and `tests/SipSdpMessage_hardening_test.cpp`.
+
 ## Unreleased (issue-33-pcap-dump-endpoint) - 2026-08-28
 
 ### Added — `GET /api/diagnostics/pcap` (#33)

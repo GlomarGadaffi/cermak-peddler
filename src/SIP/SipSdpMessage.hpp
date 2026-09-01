@@ -55,6 +55,20 @@ private:
 	// len == 0 means "field absent": every line we match starts with a two-char
 	// prefix, so a matched span is never shorter than 2 and the sentinel is
 	// unambiguous. Absent fields return an empty view, exactly as before.
+
+	// CWE-674 defense-in-depth. The UNISOC T612 VoLTE RCE (SSD advisory, 2026)
+	// was uncontrolled recursion in an SDP a=acap decoder: a body of repeated
+	// `acap:1 acap:1 ...` drove the parser to recurse per token until the modem
+	// stack overflowed into a neighbouring task and became code execution. This
+	// parser is structurally immune — it is a flat, non-recursive line scan that
+	// ignores a= attributes entirely — and on the wire path SipMessage::checkSdp()
+	// has already refused any body over SdpLimits before an accessor here can
+	// run. The line cap is still applied locally so the "SDP parse work is
+	// bounded, never a function of attacker-chosen structure" invariant holds
+	// for a body that reached this class by any other route (a locally built or
+	// test-constructed message). See SipSdpMessage_hardening_test.cpp.
+	static constexpr unsigned kMaxSdpLines = SdpLimits::kMaxLines;
+
 	struct FieldSpan
 	{
 		uint32_t pos = 0;

@@ -113,6 +113,11 @@ public:
 	void forceDisconnect(const std::string& extension);
 	uint64_t getPacketsProcessed() const;
 	uint64_t getPacketsDropped() const;   // Issue #38: rate-limited/blocked packets
+	// SDP bodies refused by the admission gate in handle() (docs/THREAT_MODEL.md
+	// T-7): structurally over-limit or carrying RFC 5939 capability negotiation.
+	// Counted whether the refusal went out as a 488 (requests) or as a silent
+	// drop (responses, ACK).
+	uint64_t getSdpRejected() const;
 	size_t getClientCount();
 	size_t getSessionCount();
 	// Legs currently mixed on the meet-me conference (virtual extension 888); 0 while
@@ -306,6 +311,12 @@ private:
 	void onMessage(std::shared_ptr<SipMessage> data); // inbound MESSAGE (RFC 3428): ack 200 OK
 	void onReinvite(std::shared_ptr<SipMessage> data);  // mid-dialog re-INVITE (hold/resume, RFC 3261 §14)
 	void onUpdate(std::shared_ptr<SipMessage> data);    // RFC 3311 mid-dialog UPDATE
+
+	// SDP admission failure (T-7). Requests that take a final response get a
+	// 488 Not Acceptable Here whose Warning header names the reason; ACK and
+	// responses, which take none, are dropped. Either way the body never reaches
+	// a decoder or a peer phone. Called from handle() under _mutex.
+	void rejectSdp(const std::shared_ptr<SipMessage>& request, SipMessage::SdpVerdict verdict);
 
 	// onSubscribe: thin dispatch-table shim into the BlfSubscriptions machine
 	// (see BlfSubscriptions.hpp). Called from handle() — caller holds _mutex.
@@ -663,6 +674,7 @@ private:
 
 	std::atomic<uint64_t> _packetsProcessed{0};
 	std::atomic<uint64_t> _packetsDropped{0};
+	std::atomic<uint64_t> _sdpRejected{0};    // T-7 SDP admission refusals
 
 	struct RegistrarSnapshot
 	{

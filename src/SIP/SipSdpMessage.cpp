@@ -72,8 +72,16 @@ const SipSdpMessage::SdpSpans& SipSdpMessage::ensureParsed() const
 	SdpSpans spans;
 
 	size_t pos_start = 0;
+	unsigned lineCount = 0;
 	while (pos_start < body.size())
 	{
+		// CWE-674 defense-in-depth (see SipSdpMessage.hpp): bound the scan so the
+		// work is a function of a fixed cap, never of attacker-chosen structure.
+		// A well-formed offer carries its session lines (v/o/s/c/t) and the m=
+		// line up front, so a legitimate body is never truncated; a hostile body
+		// padded past the cap simply stops being parsed. (On the wire path such a
+		// body was already refused by SipMessage::checkSdp() before reaching here.)
+		if (lineCount++ >= kMaxSdpLines) break;
 		const size_t lineStart = pos_start;
 		size_t pos_end = body.find("\r\n", pos_start);
 		size_t next_start = pos_end + 2;
