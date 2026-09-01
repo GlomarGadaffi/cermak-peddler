@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!-- Callee side of the codec-order pair: REGISTER as -s <extension> and then
+     just stay alive for 20 s so the PBX can fork the caller's INVITE to our
+     port. The INVITE itself is handled (and asserted on) by the out-of-call
+     scenario ooc-uas-check-order.xml -- see there for why. -->
+<scenario name="UAS: hold registration open">
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    Max-Forwards: 70
+    From: <sip:[service]@[remote_ip]>;tag=r[call_number]
+    To: <sip:[service]@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 1 REGISTER
+    Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>
+    Expires: 300
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+  <pause milliseconds="20000"/>
+</scenario>

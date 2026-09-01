@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!-- Open-mode registration: one REGISTER, expect 200 with our Contact echoed.
+     Run with -s <extension>. -->
+<scenario name="REGISTER (open registrar)">
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    Max-Forwards: 70
+    From: <sip:[service]@[remote_ip]>;tag=[call_number]
+    To: <sip:[service]@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 1 REGISTER
+    Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>
+    Expires: 300
+    User-Agent: sipp-interop
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200" rtd="true"/>
+  <!-- Give the register beep / keepalive a moment to arrive so ooc.xml can deal with it. -->
+  <pause milliseconds="1500"/>
+  <ResponseTimeRepartition value="10, 50, 100, 500"/>
+</scenario>

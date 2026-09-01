@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!-- REGISTER, then call the 777 echo service with a PCMU offer. 777 is a
+     server-terminated leg, so the answer's m-line must be the pinned
+     "0 8 101" (enforceG711), then BYE cleanly. Run with -s <extension>. -->
+<scenario name="777 echo, PCMU offer">
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    Max-Forwards: 70
+    From: <sip:[service]@[remote_ip]>;tag=r[call_number]
+    To: <sip:[service]@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 1 REGISTER
+    Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>
+    Expires: 300
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+  <pause milliseconds="1200"/>
+
+  <send retrans="500"><![CDATA[
+    INVITE sip:777@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    Max-Forwards: 70
+    From: <sip:[service]@[remote_ip]>;tag=i[call_number]
+    To: <sip:777@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 2 INVITE
+    Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>
+    Content-Type: application/sdp
+    Content-Length: [len]
+
+    v=0
+    o=sipp 1 1 IN IP4 [local_ip]
+    s=sipp
+    c=IN IP4 [local_ip]
+    t=0 0
+    m=audio [media_port] RTP/AVP 0 101
+    a=rtpmap:0 PCMU/8000
+    a=rtpmap:101 telephone-event/8000
+    a=fmtp:101 0-15
+    a=sendrecv
+  ]]></send>
+  <recv response="100" optional="true"/>
+  <recv response="180" optional="true"/>
+  <recv response="200" rtd="true" rrs="true">
+    <action>
+      <ereg regexp="m=audio [0-9]+ RTP/AVP 0 8 101" search_in="body" check_it="true" assign_to="1"/>
+    </action>
+  </recv>
+  <nop><action><log message="answer m-line ok: [$1]"/></action></nop>
+  <send><![CDATA[
+    ACK sip:777@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    Max-Forwards: 70
+    From: <sip:[service]@[remote_ip]>;tag=i[call_number]
+    To: [last_To:]
+    Call-ID: [call_id]
+    CSeq: 2 ACK
+    Content-Length: 0
+
+  ]]></send>
+  <pause milliseconds="500"/>
+  <send retrans="500"><![CDATA[
+    BYE sip:777@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    Max-Forwards: 70
+    From: <sip:[service]@[remote_ip]>;tag=i[call_number]
+    To: [last_To:]
+    Call-ID: [call_id]
+    CSeq: 3 BYE
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>

@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!-- Out-of-call handler for the CALLEE sipp instance of the codec-order pair
+     (pair with uas-hold-registration.xml + uac-g722-first.xml).
+
+     SIPp keys calls by Call-ID, so the INVITE the PBX forks to us is by
+     definition out-of-call -- this is where it lands. Two kinds arrive:
+       * the register beep (From: "PocketDial" <sip:pbx@...>) -- just answer it;
+       * the real forked call -- CHECK that the caller's G.722-first offer
+         reached us with its order intact and its rtpmap ("RTP/AVP 9 0 101"),
+         i.e. filterAudioCodecs() preserved it and added nothing. A failed
+         check routes into a receive that can never match, so the call times
+         out and the sipp run fails.
+     Both are answered 200 with a PCMU-only SDP, then ACK and BYE are taken.
+     OPTIONS keepalives get 200. All matching happens inside the <recv>
+     (a nop has no message context). -->
+<scenario name="ooc UAS: check forked offer order, auto-answer">
+  <recv request="OPTIONS" optional="true" next="options"/>
+  <recv request="INVITE" rrs="true">
+    <action>
+      <ereg regexp="sip:pbx@" search_in="hdr" header="From:" assign_to="3"/>
+      <ereg regexp="m=audio [0-9]+ RTP/AVP 9 0 101" search_in="body" assign_to="1"/>
+      <ereg regexp="a=rtpmap:9 G722/8000" search_in="body" assign_to="2"/>
+      <log message="INVITE beep=[$3] order=[$1] rtpmap=[$2]"/>
+    </action>
+  </recv>
+  <nop test="3" next="answer"/>
+  <nop test="1" next="orderok"/>
+  <!-- order check FAILED: nothing ever matches this, the call times out. -->
+  <recv request="CHECKFAILED_ORDER" timeout="500"/>
+  <label id="orderok"/>
+  <nop test="2" next="ring"/>
+  <recv request="CHECKFAILED_RTPMAP" timeout="500"/>
+
+  <!-- Real call: ring first like a phone would. The beep skips straight to
+       200 -- drawbridge answers a 180 on its beep dialog with a stray 404. -->
+  <label id="ring"/>
+  <send><![CDATA[
+    SIP/2.0 180 Ringing
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=u[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>
+    Content-Length: 0
+
+  ]]></send>
+  <label id="answer"/>
+  <send retrans="500"><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=u[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>
+    Content-Type: application/sdp
+    Content-Length: [len]
+
+    v=0
+    o=sipp 2 2 IN IP4 [local_ip]
+    s=sipp
+    c=IN IP4 [local_ip]
+    t=0 0
+    m=audio [media_port] RTP/AVP 0 101
+    a=rtpmap:0 PCMU/8000
+    a=rtpmap:101 telephone-event/8000
+    a=sendrecv
+  ]]></send>
+  <recv request="ACK" timeout="5000"/>
+  <recv request="BYE" timeout="15000"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+  <nop next="done"/>
+
+  <label id="options"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+  <label id="done"/>
+</scenario>

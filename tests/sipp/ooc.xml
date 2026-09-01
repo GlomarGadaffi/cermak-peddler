@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!-- Out-of-call handler (sipp -oocsf): the PBX sends every freshly registered
+     phone an auto-answer "register beep" INVITE and 15 s OPTIONS keepalives.
+     Neither belongs to the scenario's own call, so handle them here exactly
+     like a real phone: OPTIONS -> 200; the beep INVITE -> 200 with SDP, take
+     the ACK, then the server's BYE -> 200. (Refusing the beep with 486 makes
+     drawbridge answer with a stray 404 + BYE; auto-answering is what phones
+     do, so that is what we do.) -->
+<scenario name="out-of-call: OPTIONS 200 / beep INVITE auto-answer">
+  <recv request="OPTIONS" optional="true" next="options"/>
+  <recv request="INVITE"/>
+  <send retrans="500"><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=sipp-ooc-[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:beep@[local_ip]:[local_port];transport=[transport]>
+    Content-Type: application/sdp
+    Content-Length: [len]
+
+    v=0
+    o=sipp 3 3 IN IP4 [local_ip]
+    s=sipp-beep
+    c=IN IP4 [local_ip]
+    t=0 0
+    m=audio [media_port] RTP/AVP 0
+    a=rtpmap:0 PCMU/8000
+    a=sendrecv
+  ]]></send>
+  <recv request="ACK" timeout="5000"/>
+  <recv request="BYE" timeout="15000"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+  <nop next="done"/>
+
+  <label id="options"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+  <label id="done"/>
+</scenario>
