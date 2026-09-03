@@ -1,0 +1,38 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Heap-debug profile. Layered ON TOP of sdkconfig.defaults — later files win:
+#
+#   idf.py -B build_heapdbg -D SIP_TRANSPORT=eth \
+#          -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.heap_debug" \
+#          build
+#
+# This is a BUG-FINDING build, not a shipping one. Do not cut a release from it.
+#
+# Why it exists: the shipped default enables HEAP_POISONING_LIGHT, which only
+# verifies an allocation's canaries when it is freed. That catches overflow and
+# double-free, but it cannot see a read of memory that was never initialised, or
+# a use-after-free that never reaches another free().
+#
+# We shipped exactly that first class of bug: draw_qr() in main/ui/ui.cpp used to
+# return before lv_canvas_fill_bg() when qrcode_initText failed, painting the
+# contents of a freshly malloc'd 19,602-byte buffer to the display. Uninitialised
+# heap looks like plausible noise, so it rendered as a QR-ish smear that nobody
+# questioned. COMPREHENSIVE fills fresh allocations with 0xCE and freed ones with
+# 0xFE, which would have made that a flat, obviously-wrong pattern the first time
+# anyone looked at the screen.
+#
+# Cost, and why it is not the default: COMPREHENSIVE memsets on every allocation
+# AND every free. That is a real per-call cost on a device whose media path is
+# already latency-sensitive, and it is exactly the wrong trade on the
+# 4 MB/no-PSRAM profile in sdkconfig.defaults.esp32_constrained.
+# ─────────────────────────────────────────────────────────────────────────────
+
+CONFIG_HEAP_POISONING_COMPREHENSIVE=y
+
+# Deliberately NOT setting CONFIG_HEAP_ABORT_WHEN_ALLOCATION_FAILS. It sounds
+# like it belongs in a debug profile, but it aborts when an allocation FAILS --
+# it has nothing to do with corruption detection, which poisoning already panics
+# on by itself. Turning it on would abort instead of returning NULL, which would
+# skip exactly the graceful out-of-memory paths worth exercising: draw_qr()'s
+# fallback to a printed key when the ~19 KB canvas cannot be allocated, and
+# HttpServer's detached-thread spawn backing off under heap pressure. A debug
+# build should exercise those, not bypass them.

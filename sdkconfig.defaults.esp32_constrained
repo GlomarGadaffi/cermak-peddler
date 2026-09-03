@@ -17,6 +17,15 @@
 # SPIRAM on makes the PSRAM init fail/hang at boot. Hard off.
 CONFIG_SPIRAM=n
 
+# ── Heap poisoning: off here ────────────────────────────────────────────────
+# The base file enables HEAP_POISONING_LIGHT. This profile exists to fit a
+# 520 KB/no-PSRAM part, and LIGHT adds a canary to EVERY allocation -- on a
+# device this size, dominated by many small allocations, that overhead lands
+# where there is least room for it. Turned off explicitly rather than by
+# accident, so the trade is visible: this profile gives up heap-corruption
+# detection to fit. Re-enable it when chasing a heap bug on this hardware.
+CONFIG_HEAP_POISONING_DISABLED=y
+
 # ── Flash: 4MB, DIO ─────────────────────────────────────────────────────────
 # WROOM is DIO (not QIO/OPI). 40MHz is the most compatible default for unknown
 # cheap boards; bump to 80M if yours is stable.

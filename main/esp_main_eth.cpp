@@ -27,22 +27,16 @@
 #include "esp_log.h"
 #include "esp_idf_version.h"
 #include "esp_eth.h"
-// W5500 driver headers: ESP-IDF v6.0+ split the W5500 MAC/PHY driver out of the
-// core esp_eth component into the standalone `espressif/w5500` managed component,
-// which ships these dedicated headers. On v5.x the W5500 API (eth_w5500_config_t,
-// ETH_W5500_DEFAULT_CONFIG, esp_eth_mac_new_w5500, esp_eth_phy_new_w5500) is
-// declared by esp_eth.h above, and these headers do not exist — including them
-// unconditionally is what broke the `eth` CI matrix on v5.1.2/v5.2.1.
-//
-// cppcheck (Issue #112): the host lint job's include path (-I src/Helpers
-// -I src/SIP -I main) has no ESP-IDF tree on it, so it can't see the real
-// `esp_idf_version.h` that defines ESP_IDF_VERSION_VAL — a genuine ESP-IDF
-// build (idf.py, Job 2 of this workflow) has it and evaluates this #if fine.
-// cppcheck-suppress syntaxError
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+// W5500 driver headers. ESP-IDF v6.0 split the W5500 MAC/PHY driver out of the
+// core esp_eth component into the standalone `espressif/w5500` managed component
+// (see main/idf_component.yml), which ships these dedicated headers. On v5.x the
+// same API was declared by esp_eth.h and these headers did not exist, so this
+// used to be gated behind `#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6,0,0)`.
+// v6.0 is now the enforced floor (main/CMakeLists.txt fails at configure time
+// below it), so the gate — and the cppcheck syntaxError suppression the host
+// lint job needed to get past it — are gone.
 #include "esp_eth_mac_w5500.h"
 #include "esp_eth_phy_w5500.h"
-#endif
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "nvs.h"

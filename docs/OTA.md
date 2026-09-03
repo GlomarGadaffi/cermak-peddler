@@ -164,6 +164,10 @@ curl -s -b "$JAR" \
 > response as shown above. Unprovisioned devices are unaffected — there is no
 > session, so there is no token to check.
 
+Note the gate on these endpoints is **three** checks, not two: same-origin, then the
+session cookie, then the per-session CSRF token on the mutating ones (§2.1 of
+[API.md](API.md)). A recipe that sends only the cookie gets `403`.
+
 If **no PIN is set yet** (fresh/unprovisioned device) you can skip step 1 — the
 upload only requires same-origin in that state. **Set a PIN first in
 production**; an open AP with an ungated OTA endpoint is a remote-compromise

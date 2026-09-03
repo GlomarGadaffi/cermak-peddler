@@ -135,9 +135,9 @@ To prevent slow-client TCP connections from stalling the main HTTP accept thread
        │
  [Read body (Max 16KB)]
        │
- [Validate Same-Origin]
+ [requireAdmin: origin -> session -> CSRF]
        │
- [Send HTTP Response]
+ [Send HTTP Response + security headers]
        │
   [Close Socket]
 ```
@@ -147,9 +147,36 @@ To prevent slow-client TCP connections from stalling the main HTTP accept thread
 2. Upon activity, `accept()` is called to retrieve the client socket.
 3. The server immediately dispatches client processing to a detached thread context (`std::thread([this, clientSock]() { handleClient(clientSock); }).detach()`), instantly freeing the accept thread to monitor subsequent connections.
 
+### The Admission Gate (`requireAdmin`)
+Every non-public endpoint passes through one function rather than open-coding its own
+checks, in this order:
+
+1. **Same-origin** — `Origin` host vs `Host`. A request with **no** `Origin` header is
+   admitted by design, because `curl`, native clients and the CI smoke suite do not send
+   one. That is exactly why step 3 exists: the origin check is a browser-only control and
+   cannot stand alone.
+2. **Session** — a valid `pd_session` cookie, *once the device is provisioned*. While
+   unprovisioned the check is skipped so captive-portal onboarding still works and the
+   device can be claimed at all (`docs/THREAT_MODEL.md` §5.1).
+3. **CSRF** — for mutating requests, a matching `X-CSRF` token bound to that session. It is
+   rendered into the dashboard document and returned by login, never set as a cookie: the
+   browser attaches a cookie to a same-site request on its own, so only a value our own
+   script has to read and echo back proves the request came from our page.
+
+**Why it is centralised.** These three checks used to be copy-pasted at roughly fifteen
+routes, and two had drifted: `POST /api/configuring` had no gate at all, and `/api/pcap`,
+`/api/trace` and `/api/diagnostics/pcap` had no same-origin check despite serving raw SIP
+message bytes including `Authorization` digests. A single gate makes "forgot to gate this
+route" a structural impossibility rather than a review question.
+
+Responses carry CSP, `X-Frame-Options`, `X-Content-Type-Options`, `Cache-Control: no-store`
+and `Referrer-Policy` from one place in `sendResponseWithHeader`, for the same reason.
+There is deliberately no HSTS — this is plain HTTP on a LAN appliance, and pinning it would
+make the device permanently unreachable over `http://`.
+
 ### Worker Protection & Robustness (Issue #23)
 * **Slowloris Protection**: The worker thread sets a strict 5-second socket receive timeout (`SO_RCVTIMEO`) using `setsockopt` to terminate slow-sending or dead TCP connections.
-* **Heap Stack-Safety**: Rather than allocating a raw stack-local character buffer (which would overflow the tiny standard `pthread` thread stack on ESP32), the worker utilizes a heap-allocated `std::vector<char>` read buffer.
+* **Heap Stack-Safety**: Rather than allocating a raw stack-local character buffer, the worker uses a heap-allocated `std::vector<char>` read buffer. `sdkconfig.defaults` sets `CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192`, so a 4 KB stack-local buffer would consume half the thread's stack before any handler ran.
 * **Buffer Overflow Cap**: The worker parses the `Content-Length` header and enforces a maximum payload limit of **16 KB** (16,384 bytes). If a client attempts to upload a larger body (e.g., in a malicious POST flood to `/api/wifi/connect`), the worker immediately responds with `413 Payload Too Large` and aborts the connection, securing the target's RAM.
 
 ---

@@ -43,7 +43,7 @@
 // Host builds: this file compiles on the desktop/CI simulator, where there is no
 // NVS and no `cfgseed` partition. Settings live in process memory for a single
 // run (the AdminAuth.cpp pattern) and applyFlashSeed() is a no-op. This keeps
-// the ~289-test host suite able to exercise the dashboard endpoints.
+// the host test suite able to exercise the dashboard endpoints.
 
 #include <string>
 #include <cstdint>

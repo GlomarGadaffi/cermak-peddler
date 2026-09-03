@@ -128,7 +128,7 @@ cmake --build build --config Release
 ctest --test-dir build/tests --output-on-failure
 ```
 
-CI cross-compiles firmware for ESP-IDF v5.1–v6.0.1, tests across esp32/esp32s3, WiFi/Ethernet, and runs the full GoogleTest suite.
+CI cross-compiles firmware on ESP-IDF v6.0.1 (the supported floor — v5.x no longer builds, and `main/CMakeLists.txt` says so at configure time), across esp32/esp32s3 and WiFi/Ethernet/display, and runs the full GoogleTest suite.
 
 See **[CONTRIBUTING_FIRMWARE.md](CONTRIBUTING_FIRMWARE.md)** before sending firmware PRs.
 

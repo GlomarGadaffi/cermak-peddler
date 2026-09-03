@@ -58,7 +58,8 @@ by a firmware update. Enable it deliberately, in one of two ways:
   Tick the box and save. The change takes effect the next time the access point starts.
 * **At flash time** — the [browser flasher](https://glomargadaffi.github.io/pocket-dial/flasher/)
   can write the setting and the passphrase directly to the board. This is the easiest
-  route for the headless `esp32s3-eth` / `esp32s3-wifi` variants.
+  route for the headless `esp32s3-wifi` variant. (The `esp32s3-eth` build has no SoftAP
+  at all — it is a node on your wired LAN — so access-point security does not apply to it.)
 
 **Finding the passphrase.** The device generates its own, per unit — there is no
 factory default, and nothing is baked into the firmware image. It is 20 characters from
@@ -68,7 +69,8 @@ read off a screen and retyped into a desk phone. Read it from whichever applies:
 | Build | Where the passphrase appears |
 |-------|------------------------------|
 | `display` | On the LVGL screen during captive-portal onboarding |
-| `wifi` / `eth` (headless) | Logged over serial at boot (`idf.py monitor`) |
+| `wifi` (headless) | Logged over serial at boot (`idf.py monitor`) |
+| `eth` | Not applicable — this build has no SoftAP |
 | Any | The dashboard panel above, once logged in as admin |
 | Any | The browser flasher, if you set it at flash time |
 

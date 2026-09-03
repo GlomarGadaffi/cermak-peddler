@@ -257,6 +257,16 @@ jobs:
           - idf-version: 'v6.0.1'
             target-chip: 'esp32s3'
             sip-transport: 'display'
+          # lan8720: internal-EMAC Ethernet on the CLASSIC esp32 (no other target
+          # has the EMAC, and main/CMakeLists.txt hard-errors at configure time
+          # if you try). Added because it was the one transport nothing verified:
+          # not this matrix, and not the release workflow either. It carries its
+          # own PHY driver include from the espressif/lan87xx managed component,
+          # so a change to that include path could break it silently and only
+          # surface on a user's board.
+          - idf-version: 'v6.0.1'
+            target-chip: 'esp32'
+            sip-transport: 'lan8720'
 
     container:
       image: espressif/idf:${{ matrix.idf-version }}
@@ -287,6 +297,34 @@ jobs:
           idf.py -D SIP_TRANSPORT=${{ matrix.sip-transport }} build
           
           echo "Successful compilation for ${{ matrix.target-chip }} on ESP-IDF ${{ matrix.idf-version }} (Transport: ${{ matrix.sip-transport }})"
+
+  # Job 2b: Heap-poisoning build.
+  # The shipped default is HEAP_POISONING_LIGHT, which only checks an
+  # allocation's canaries when it is freed. COMPREHENSIVE also fills on alloc and
+  # free, catching uninitialised reads and use-after-free -- the class of bug
+  # that shipped in draw_qr() (a freshly malloc'd 19 KB canvas painted to the
+  # display when QR encoding failed). Too costly to ship on a device carrying
+  # real-time audio, so it is exercised here instead of in the default build.
+  # One leg is enough: this proves the profile still compiles and links, which is
+  # what rots. Actually exercising the poisoning needs the code running on
+  # hardware.
+  build-heap-poisoning:
+    name: Build Firmware (heap poisoning)
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.0.1
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build with COMPREHENSIVE heap poisoning
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py set-target esp32s3
+          idf.py -D SIP_TRANSPORT=eth \
+                 -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.heap_debug" \
+                 build
+          echo "Heap-poisoning profile builds (esp32s3 / eth)."
 
   # Job 3: Security & Guardrails
   # Explicitly validates that no accidental GCP or outside deployment files are configured.

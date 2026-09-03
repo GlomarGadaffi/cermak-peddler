@@ -737,6 +737,28 @@ throughout `RequestsHandler.cpp`.
 1. Introduced compile-time guard `POCKETDIAL_OPEN_REGISTRAR` in `RequestsHandler.hpp`, defined by default so that the registrar starts "open" for easy deployment.
 2. If `POCKETDIAL_OPEN_REGISTRAR` is commented/undefined, the registrar switches to closed mode, rejecting unauthenticated or non-matching registrations and invites with a secure `403 Forbidden` response.
 
+#### Superseded — read this before relying on the above
+The compile-time guard is **not** a usable knob and never was, in two ways worth recording
+so nobody re-derives them:
+
+* The symbol is `#define`d **unconditionally** at the top of `RequestsHandler.hpp`, so
+  `-UPOCKETDIAL_OPEN_REGISTRAR` on the compiler command line is simply undone by the header.
+  Point 2 above is only reachable by *editing the header*, not by configuring a build. The
+  `#else` branch that selects `Registrar::Mode::Secure` was therefore unreachable in any
+  normal build.
+* Admission is now a **runtime** setting — `Registrar::Mode` (`open` / `learn` / `secure`),
+  persisted in NVS as `reg_mode` and loaded by `Registrar::loadMode()` at construction, which
+  overrides whatever the compile-time symbol seeded.
+
+Until recently nothing in production wrote `reg_mode` either: `setRegistrarMode()` was called
+from unit tests only, so SIP digest authentication was fully implemented, fully tested and
+**unreachable on a shipped device**. Three operator paths now write it — the dashboard's
+*Extension Registration & Onboarding* panel, `POST /api/registrar`, and the flash-time
+`cfgseed` record for headless boards. See [docs/API.md](docs/API.md),
+[docs/LEARN_MODE.md](docs/LEARN_MODE.md) and [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) §9.
+
+The shipped default is still `open`, so this makes the gap **closable, not closed**.
+
 ---
 
 ### 🟢 Issue #57 (B): Thread-Safe Buffered Logging Under Lock

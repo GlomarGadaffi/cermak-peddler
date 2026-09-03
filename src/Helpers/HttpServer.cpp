@@ -2221,12 +2221,11 @@ void HttpServer::sendApiOtaReboot(int sock)
 
 void HttpServer::sendRedirect(int sock, const std::string& location)
 {
-	std::ostringstream resp;
-	resp << "HTTP/1.1 302 Found\r\n";
-	resp << "Location: " << location << "\r\n";
-	resp << "Content-Length: 0\r\n";
-	resp << "Connection: close\r\n\r\n";
-
-	std::string data = resp.str();
-	::send(sock, data.c_str(), static_cast<int>(data.size()), 0);
+	// Routed through sendResponseWithHeader rather than writing the socket
+	// directly. This used to hand-roll the response, which meant the captive-
+	// portal redirect was the one reply that carried NONE of the security
+	// headers every other response gets, and the only one whose write was a
+	// single ::send() with no short-write retry.
+	sendResponseWithHeader(sock, 302, "Found", "text/plain", "",
+	                       "Location: " + location);
 }

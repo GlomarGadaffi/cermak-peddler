@@ -4372,18 +4372,13 @@ void RequestsHandler::onDtmfInfo(std::shared_ptr<SipMessage> data)
 			// PIN verified — execute the command code.
 			if (code == "001")
 			{
-				// NTP resync (esp_sntp_restart is ESP-IDF v5+; fall back to log if absent)
+				// NTP resync. The inner ESP_IDF_VERSION >= 5.0.0 gate (and its
+				// "not available on this IDF version" fallback) is gone: v6.0 is
+				// the enforced floor, so esp_sntp_restart always exists here. The
+				// outer platform guard stays — this file also builds on the host,
+				// where there is no SNTP at all.
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-				// cppcheck (Issue #112): same ESP_IDF_VERSION_VAL analysis-path
-				// gap as esp_main_eth.cpp/esp_main_eth_lan8720.cpp -- the host
-				// lint job has no ESP-IDF tree on its include path to resolve
-				// esp_idf_version.h from. A genuine idf.py build has it.
-				// cppcheck-suppress syntaxError
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
 				esp_sntp_restart();
-#else
-				queueLog("[admin] NTP sync requested via DTMF (esp_sntp_restart not available on this IDF version)");
-#endif
 #endif
 				queueLog("[admin] NTP sync requested via DTMF");
 				adminMatched = true;

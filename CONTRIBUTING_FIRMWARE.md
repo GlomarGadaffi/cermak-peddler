@@ -21,10 +21,64 @@ Before any PR can be merged into `main`, it must receive at least **two approval
 - [ ] **Checked Returns**: All NVS flash, driver registrations, and socket syscall return codes are explicitly checked and handled.
 - [ ] **No Unchecked Pointers**: Any pointer dereferencing has been pre-verified against `nullptr` (particularly in fallback/onboarding modes).
 - [ ] **Core Affinity Alignment**: Pinned tasks match the dual-core topology and do not unbalance Core 0/1 workloads.
+- [ ] **Gated HTTP Routes**: Every new route in `HttpServer::handleClient()` passes through `requireAdmin()`, with `needCsrf = true` for anything that mutates state. No route implements its own origin, session, or token check.
+- [ ] **Central Response Path**: Buffered responses go out through `sendResponseWithHeader()` so the security headers (CSP, `X-Frame-Options`, `X-Content-Type-Options`, `Cache-Control`, `Referrer-Policy`) are emitted. New code does not write a response to the socket directly — the captive-portal `302` in `sendRedirect()` is the sole existing exception, and it should not gain company.
+- [ ] **Partition Contract Intact**: `nvs`, `otadata`, `phy_init`, `ota_0` and `ota_1` keep their exact offsets and sizes in `partitions.csv`. Moving any of them breaks OTA compatibility with every deployed board.
+- [ ] **`cfgseed` Stays Read-Only**: No firmware code calls `esp_partition_write()` or `esp_partition_erase_range()` on `cfgseed`. The browser flasher is its only writer.
+- [ ] **Seed Format In Lockstep**: A change to the seed record in `src/Helpers/DeviceConfig.hpp` is mirrored in `docs/flasher/index.html` in the same PR.
+- [ ] **Docs Ship With The Change**: A new or re-gated endpoint updates `docs/API.md` and `docs/API_TESTS.md`; a partition or flash-procedure change updates `docs/FLASHING.md`.
 
 ---
 
-## 2. Prohibited Patterns & Technical Antipatterns
+## 2. Security-Sensitive Areas
+
+Three parts of this firmware have a single correct implementation and a
+tempting-looking wrong one. Reviewers should treat a diff touching any of them as
+requiring a second look.
+
+### The HTTP gate is one function, not a per-route habit
+
+`HttpServer::requireAdmin(sock, req, needCsrf)` applies same-origin → session →
+CSRF in that order, and it is the only place any of those three checks belongs.
+The reason is empirical: `POST /api/configuring` shipped with no gate at all, and
+`/api/pcap`, `/api/trace` and `/api/diagnostics/pcap` shipped with no same-origin
+check, precisely because each route was expected to remember on its own. Route
+handlers must contain no auth logic.
+
+The same-origin check deliberately admits a request with **no** `Origin` header —
+that is what `curl`, native clients and `tests/http/test_api.sh` send — so it is a
+browser-only control and cannot stand alone. The per-session `X-CSRF` token is
+what closes that gap on a provisioned device. Do not "simplify" the Origin check
+to reject missing origins; it would break the smoke suite and the captive portal
+without adding anything the token does not already cover.
+
+### The seed record is append-only, and the version does not move
+
+`regMode` was added at byte 13 behind `kSeedHasRegMode` (bit 5) **without**
+bumping `kSeedVersion`, and that was the point: every field is gated by its own
+`has-*` flag and every reader ignores flags it does not recognise, so old
+firmware skips the new bit and applies the rest, and new firmware reading an
+older record leaves the field alone. Bumping the version would have made older
+firmware reject the whole record.
+
+Add future fields the same way — in the reserved space, behind a new flag bit —
+and never repurpose an existing bit. Also keep the "unwritten partition reads as
+`0xFF` and must be silently ignored" property: an absent or blank `cfgseed` is
+the normal case on OTA-updated boards and on the 4 MB constrained layout, not an
+error to report.
+
+### Defaults stay conservative
+
+The shipped posture is an **open** SoftAP, an **`open`** SIP registrar, plain
+HTTP, and unsigned OTA. WPA2 on the SoftAP (`ap_secure`) and the `learn`/`secure`
+registrar modes are opt-in, because each of them breaks an already-deployed fleet
+the moment it is turned on. A PR that flips one of these defaults is a
+breaking change and needs to be argued as one, not slipped in as a hardening
+tidy-up.
+
+---
+
+## 3. Prohibited Patterns & Technical Antipatterns
 
 The following code patterns are strictly prohibited. The CI static analysis pipeline will flag and reject any commits containing these blocks.
 
@@ -141,8 +195,49 @@ void setupNetworkMode() {
 
 ---
 
-## 3. Concurrency & Task Affinity Directives
+## 4. Concurrency & Task Affinity Directives
 
 1. **Keep lvgl_task Isolated**: Under no circumstances should non-UI networking or file I/O operations be dispatched onto Core 1 on display-enabled hardware configurations.
 2. **Utilize Double-Buffered Getters**: Any state data required by the HTTP server or display tasks from the registrar must be queried via snapshotted APIs (`getActiveClients()`, `getActiveSessions()`). Do not introduce raw mutex sharing across Core 0 and Core 1.
 3. **Interrupt Service Routines (ISRs)**: ISR handlers must strictly avoid blocking calls, standard RTOS queue inserts, or any console print operations. Only `FromISR` suffix functions (e.g. `xQueueSendFromISR`) are permitted inside hardware interrupts.
+
+---
+
+## 5. Host Test Suite
+
+The gtest suite under `tests/` is the gate every PR clears before hardware is
+touched. It is currently **310 cases** (by static count of `TEST`/`TEST_F` in
+`tests/*.cpp`).
+
+The same three commands CI runs, from a WSL shell:
+
+```bash
+unset IDF_PATH                                        # see below
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+ctest --test-dir build/tests --output-on-failure
+```
+
+* **Unset `IDF_PATH` first.** The root `CMakeLists.txt` branches on it: with the
+  variable defined it includes `$ENV{IDF_PATH}/tools/cmake/project.cmake` and
+  configures an ESP-IDF cross-build, so the host tests are never generated.
+* **`--test-dir build/tests` is required.** Testing is enabled only inside the
+  `tests/` subdirectory, so the CTest set lives there, not at the build root.
+* **Run it from WSL, not natively.** Several suites open real sockets; running
+  them on Windows triggers firewall authorisation prompts.
+* Keep the count in this section current when you add or remove cases.
+
+### 🔴 The `AdminHttpGate_test` trap
+
+Any new case in `tests/AdminHttpGate_test.cpp` that **provisions a PIN** must
+construct a real `RequestsHandler` and attach it. From the file's own comment:
+
+> A real `RequestsHandler` is required: once a PIN exists the listen socket is
+> dark by default and only opens inside an admin-open window, which set-pin
+> grants. Without the handler the test measures a refused connection rather than
+> the gate.
+
+The failure this produces looks nothing like the thing under test — you get a
+connection error instead of the `401`/`403` you were asserting on, and the gate
+logic is never reached. Copy the setup from an existing provisioning case rather
+than writing a fresh one.

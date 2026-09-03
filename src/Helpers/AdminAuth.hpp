@@ -31,7 +31,11 @@ namespace AdminAuth
 	constexpr size_t   kMinPinLength      = 4;        // reject PINs shorter than this
 	constexpr size_t   kSessionTokenHex   = 32;       // >= 32 hex chars (128 bits)
 	constexpr size_t   kMaxSessions       = 8;        // fixed-capacity session table
-	constexpr uint64_t kSessionTtlMs      = 30ULL * 60ULL * 1000ULL;   // 30 min absolute expiry
+	// 30 min, SLIDING: every successful validateSession() pushes the deadline out
+	// by a full TTL so an actively-working admin is not logged out mid-session.
+	// (This constant was long commented as an *absolute* expiry, and
+	// docs/THREAT_MODEL.md §5.3 repeated that; the code has always slid it.)
+	constexpr uint64_t kSessionTtlMs      = 30ULL * 60ULL * 1000ULL;
 	constexpr int      kMaxFailedAttempts = 5;        // consecutive failures before lockout
 	constexpr uint64_t kLockoutMs         = 60ULL * 1000ULL;           // 60 s cooldown
 	constexpr uint32_t kHashIterations    = 50000;    // PBKDF-style iterated SHA-256 rounds

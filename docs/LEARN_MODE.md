@@ -1,6 +1,6 @@
 # Learn Mode — Fleet-Cutover Runbook
 
-**Status:** Forward-looking (feature in build now — digest auth + Learn mode, milestone M1). | **Audience:** Installers / field operators converting an existing phone deployment to pocket-dial. | **Scope:** Operational runbook, not implementation spec.
+**Status:** Shipped on `main` (digest auth + Learn mode), and now operator-selectable from the dashboard, `POST /api/registrar`, or the flash-time seed. The registrar default is still `open`, so this runbook describes a mode you must switch **to**. | **Audience:** Installers / field operators converting an existing phone deployment to pocket-dial. | **Scope:** Operational runbook, not implementation spec.
 
 > **TL;DR.** Learn mode lets you drop pocket-dial into a *running* phone deployment and
 > adopt the handsets that are already there — without re-typing a SIP account into every
@@ -74,7 +74,7 @@ plainly in [THREAT_MODEL.md](THREAT_MODEL.md) §9.
 ### Step 1 — Drop in and choose Learn
 Bring pocket-dial up as the registrar the phones point at (point the phones' SIP server at
 the box, or take over the address the old registrar held). At onboarding, choose **Learn**
-as the registrar mode (writes `registrar_mode = 1`).
+as the registrar mode (writes `reg_mode = 1`).
 
 ### Step 2 — Phones adopt on first REGISTER (TOFU)
 As each phone's registration refreshes, it REGISTERs to pocket-dial. In Learn mode an
@@ -112,7 +112,7 @@ for M1).
 Mark each adopted device **Secured** once its new secret is on the handset and it
 digest-authenticates cleanly. A secured device is now **locked to its MAC**: a REGISTER for
 that extension from a *different* MAC is rejected (`403`/`401`). When every device is
-secured and verified, flip the **registrar mode to Secure** (`registrar_mode = 2`) so the
+secured and verified, flip the **registrar mode to Secure** (`reg_mode = 2`) so the
 whole box challenges every REGISTER and no new unverified phone can be adopted.
 
 ### Lock semantics (what "Secured" enforces)

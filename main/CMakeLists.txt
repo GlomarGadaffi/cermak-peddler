@@ -9,19 +9,27 @@ endif()
 
 set(ADDITIONAL_SRCS "")
 
-if(IDF_VERSION_MAJOR GREATER_EQUAL 6)
-    set(IDF_V6_DRIVERS esp_driver_gpio esp_driver_spi esp_driver_i2c)
-else()
-    set(IDF_V6_DRIVERS driver)
+# ESP-IDF v6.0 is the supported floor. Fail here, at configure time, rather than
+# ~1400 objects into a build with "component esp_driver_ledc could not be found"
+# — LEDC (and gpio/spi/i2c) were split out of the monolithic `driver` component
+# in v5.3+, main/CMakeLists.txt requires them by their split names, and two
+# managed components in idf_component.yml carry `idf_version >= 6.0.0` rules.
+# That missing-component error is exactly what silently broke the
+# v1.3.0-pre-alpha release run, which was still pinned to v5.2.1.
+if(IDF_VERSION_MAJOR LESS 6)
+    message(FATAL_ERROR
+        "pocket-dial requires ESP-IDF v6.0 or later; this is v${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}. "
+        "Both .github/workflows/ci.yml and release.yml build on v6.0.1. "
+        "Install a v6.x toolchain (see docs/FLASHING.md) and re-run idf.py.")
 endif()
+
+# The v6 split-driver components. Kept as one variable because four transport
+# branches below need the same set.
+set(IDF_V6_DRIVERS esp_driver_gpio esp_driver_spi esp_driver_i2c)
 
 if(SIP_TRANSPORT STREQUAL "eth")
     set(MAIN_SRC "esp_main_eth.cpp")
-    if(IDF_VERSION_MAJOR GREATER_EQUAL 6)
-        set(EXTRA_REQUIRES esp_eth espressif__w5500 ${IDF_V6_DRIVERS})
-    else()
-        set(EXTRA_REQUIRES esp_eth ${IDF_V6_DRIVERS})
-    endif()
+    set(EXTRA_REQUIRES esp_eth espressif__w5500 ${IDF_V6_DRIVERS})
     # W5500 boards differ only in their SPI pin map. Select with -D PD_ETH_BOARD=<board>:
     #   elite     → LilyGO T-ETH-ELITE S3 (default; the board on the bench)
     #   waveshare → Waveshare ESP32-S3-ETH (PoE)
@@ -58,11 +66,7 @@ elseif(SIP_TRANSPORT STREQUAL "lan8720")
             "or set-target esp32 for the internal-EMAC LAN8720 board.")
     endif()
     set(MAIN_SRC "esp_main_eth_lan8720.cpp")
-    if(IDF_VERSION_MAJOR GREATER_EQUAL 6)
-        set(EXTRA_REQUIRES esp_eth espressif__lan87xx ${IDF_V6_DRIVERS})
-    else()
-        set(EXTRA_REQUIRES esp_eth ${IDF_V6_DRIVERS})
-    endif()
+    set(EXTRA_REQUIRES esp_eth espressif__lan87xx ${IDF_V6_DRIVERS})
     message(STATUS "SipServer transport: LAN8720 Ethernet (internal EMAC / RMII, classic ESP32)")
 elseif(SIP_TRANSPORT STREQUAL "display")
     set(MAIN_SRC "esp_main_display.cpp")
@@ -72,11 +76,7 @@ elseif(SIP_TRANSPORT STREQUAL "display")
     message(STATUS "SipServer transport: Guition AXS15231B Touch Display (LVGL)")
 else()
     set(MAIN_SRC "esp_main.cpp")
-    if(IDF_VERSION_MAJOR GREATER_EQUAL 6)
-        set(EXTRA_REQUIRES ${IDF_V6_DRIVERS})
-    else()
-        set(EXTRA_REQUIRES "")
-    endif()
+    set(EXTRA_REQUIRES ${IDF_V6_DRIVERS})
     message(STATUS "SipServer transport: WiFi SoftAP")
 endif()
 

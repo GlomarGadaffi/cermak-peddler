@@ -56,8 +56,16 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Build ESP-IDF firmware for the primary targets: esp32s3 x {wifi, eth} plus
-  # the esp32s3 display build (added via the include leg below; verified to build
-  # on ESP-IDF v5.2.1).
+  # the esp32s3 display build (added via the include leg below).
+  #
+  # Toolchain: v6.0.1, matching the ci.yml matrix. This was pinned to v5.2.1 long
+  # after that stopped working — the v1.3.0-pre-alpha release run (2026-06-24)
+  # failed on every leg with "component esp_driver_ledc could not be found",
+  # because LEDC was split out of the monolithic `driver` component in a later
+  # IDF and main/CMakeLists.txt requires it unconditionally. dependencies.lock
+  # resolves idf 6.0.2 and two managed components carry `idf_version >= 6.0.0`
+  # rules, so v5.x had no way to work. Keep this in step with ci.yml: a release
+  # built on a toolchain CI does not exercise is an untested artifact.
   # ---------------------------------------------------------------------------
   build-firmware:
     name: Build Firmware (${{ matrix.target-chip }} / ${{ matrix.sip-transport }})
@@ -67,13 +75,13 @@ jobs:
       matrix:
         target-chip: [ 'esp32s3' ]
         sip-transport: [ 'wifi', 'eth' ]
-        # display: esp32s3-only, verified to build on ESP-IDF v5.2.1.
+        # display: esp32s3-only; pulls lvgl, esp_lcd_touch and the AXS15231B driver.
         include:
           - target-chip: 'esp32s3'
             sip-transport: 'display'
 
     container:
-      image: espressif/idf:v5.2.1
+      image: espressif/idf:v6.0.1
 
     steps:
       - name: Checkout Repository

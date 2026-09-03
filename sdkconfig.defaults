@@ -108,3 +108,28 @@ CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
 # return. A smashed return address becomes an abort in __stack_chk_fail rather
 # than a jump. The code-size cost is a few percent on the parser TUs only.
 CONFIG_COMPILER_STACK_CHECK_MODE_STRONG=y
+
+# ── Heap corruption detection ────────────────────────────────────────────────
+# The two settings above cover the STACK. Until now the heap had nothing
+# (HEAP_POISONING_DISABLED, the IDF default), which was defensible when the
+# hardening focus was the SIP parser's stack recursion (T-7) but is not any
+# more: the HTTP plane runs a detached thread per connection, each with a heap
+# read buffer, serves a ~55 KB page blob that is copied more than once per
+# request, and the display build malloc()s ~19 KB for the QR canvas.
+#
+# LIGHT adds a canary to each allocation and verifies it on free()/realloc(),
+# so a heap overflow or double-free aborts at the next free instead of quietly
+# corrupting a neighbour. The cost is a few bytes per allocation and a check on
+# a path that is not hot.
+#
+# Deliberately LIGHT, not COMPREHENSIVE: the latter memsets on every alloc and
+# free, which is the wrong trade on a device carrying real-time audio. It lives
+# in sdkconfig.defaults.heap_debug for CI and bug hunts instead.
+#
+# Worth being honest about what this is: a DETECTOR, not a mitigation. The stack
+# canary turns a smashed return address into an abort before it is used; heap
+# poisoning only notices at the next free(), by which time the corruption has
+# been live for a while. It also converts corruption into a reboot on a device
+# that may be carrying calls -- which is still better than serving from a
+# corrupt heap, but it is a trade, not a free win.
+CONFIG_HEAP_POISONING_LIGHT=y

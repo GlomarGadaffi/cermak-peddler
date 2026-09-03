@@ -47,6 +47,10 @@ namespace
 	constexpr const char* kKeyApSecure  = "ap_secure";
 	constexpr const char* kKeyApPsk     = "ap_psk";
 	constexpr const char* kKeySeedGen   = "cfgseed_gen";
+	// Owned by Registrar (src/SIP/Registrar.cpp reads it); written here from the
+	// flash seed and cleared here by factory reset. Kept as a literal rather than
+	// an include so DeviceConfig stays free of any src/SIP dependency.
+	constexpr const char* kKeyRegMode   = "reg_mode";
 
 	// Alphabet size, computed rather than written as a literal: the modulo-bias
 	// rejection threshold below depends on it, and a hand-copied constant that
@@ -603,6 +607,15 @@ namespace DeviceConfig
 			// Dropping cfgseed_gen is deliberate — see DeviceConfig.hpp: the next
 			// boot re-applies the flash-time seed, so "factory" means "as flashed".
 			nvs_erase_key(h, kKeySeedGen);
+			// The registrar admission mode goes too. This key belongs to
+			// Registrar, but DeviceConfig is what writes it from the flash seed,
+			// and leaving it behind made factory reset unable to rescue the one
+			// state that most needs rescuing: a device switched to `secure`
+			// before any extension was secured rejects every REGISTER, and the
+			// DTMF *4887 trigger that reopens the HTTP plane needs the admin
+			// extension REGISTERED — exactly what `secure` prevents. Without
+			// this, the only way back was USB.
+			nvs_erase_key(h, kKeyRegMode);
 			nvs_commit(h);
 			nvs_close(h);
 		}

@@ -194,11 +194,19 @@
                     <div class="security-list">
                         <div class="sec-item">
                             <span class="badge badge-trust">TRUST MODEL</span>
-                            <p><strong>Flat Trusted Networks:</strong> The zero-friction registrar trusts all local devices. This minimizes overhead, making it ideal for isolated labs, temporary networks, or rapid demonstrations.</p>
+                            <p><strong>Flat trusted networks by default:</strong> out of the box the registrar accepts any local device and the Wi-Fi access point is open, which is what makes it zero-friction for isolated labs, temporary networks and demos. Treat that default as &ldquo;everyone in radio range is a peer&rdquo;.</p>
+                        </div>
+                        <div class="sec-item">
+                            <span class="badge badge-trust">HARDENING</span>
+                            <p><strong>Opt-in, not automatic:</strong> WPA2 on the access point (one change that encrypts the dashboard, SIP signalling <em>and</em> call audio), SIP digest authentication with a Learn mode for adopting an existing phone fleet, and an admin PIN with a dark-by-default admin plane are all available and all off until you turn them on. See the <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/THREAT_MODEL.md">threat model</a> and <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/SETUP_GUIDE.md">setup guide</a>.</p>
                         </div>
                         <div class="sec-item">
                             <span class="badge badge-warning">SECURITY LIMIT</span>
                             <p><strong>WAN Isolation:</strong> Do not bind or port-forward UDP port 5060 or TCP port 8080 to public internet interfaces. Always run within secure local subnets or isolated VPN segments.</p>
+                        </div>
+                        <div class="sec-item">
+                            <span class="badge badge-warning">RELEASE GAP</span>
+                            <p><strong>Releases lag <code>main</code>:</strong> the newest published tag predates the admin PIN, the hardened dashboard and the access-point and registrar controls above. A board flashed from a release has none of them &mdash; build from <code>main</code> if you need them.</p>
                         </div>
                     </div>
                 </div>
