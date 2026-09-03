@@ -59,6 +59,7 @@
 #include "HttpServer.hpp"
 #include "OtaUpdater.hpp"
 #include "AdminAuth.hpp"
+#include "DeviceConfig.hpp"
 #include "LogQueue.hpp"
 
 // ── Tag for ESP_LOG ────────────────────────────────────────────────────────
@@ -336,6 +337,18 @@ extern "C" void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    // ── Flash-time configuration seed ───────────────────────────────
+    // Runs on the pure-Ethernet transports too, even though this build has no WiFi
+    // radio and the seed's AP/STA fields are meaningless here. The seed also carries
+    // wifi_mode (and will carry more fields), and applying it exactly once is gated
+    // on the cfgseed_gen counter — so skipping it on Ethernet would mean a board
+    // later reflashed to a WiFi variant silently ignores its flash-time config.
+    // DeviceConfig deliberately does NOT include esp_wifi.h, so this links here.
+    if (DeviceConfig::applyFlashSeed())
+    {
+        ESP_LOGI(TAG, "[boot] applied flash-time cfgseed");
+    }
 
     // ── Task 1B: install non-blocking log queue + drain task ────────────────
     LogQueue::create();

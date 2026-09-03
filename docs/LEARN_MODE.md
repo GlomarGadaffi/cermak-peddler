@@ -17,7 +17,9 @@
 ## 1. The three registrar modes
 
 The registrar mode is a runtime setting (NVS-backed, chosen at onboarding and changeable
-from the Security screen). It controls how a REGISTER is treated.
+from the dashboard's *Extension Registration & Onboarding* panel, or `POST /api/registrar`;
+on a headless board, from the browser flasher's flash-time configuration panel). It
+controls how a REGISTER is treated.
 
 | Mode | What it does | When to use it |
 |------|--------------|----------------|

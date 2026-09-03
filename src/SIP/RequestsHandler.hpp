@@ -1,7 +1,17 @@
 #ifndef REQUESTS_HANDLER_HPP
 #define REQUESTS_HANDLER_HPP
 
-// Gated open mode (Issue #56). Undefine/disable to run in closed/restricted mode.
+// Seeds the DEFAULT registrar admission mode at boot (Issue #56).
+//
+// NOTE: this #define is UNCONDITIONAL, so passing -UPOCKETDIAL_OPEN_REGISTRAR on
+// the compiler command line does nothing — the header simply re-defines it. That
+// also makes the #else branch further down (which would select Mode::Secure)
+// unreachable in practice. Do not document this as a build knob; it is not one.
+//
+// Mode selection is a RUNTIME setting, persisted in NVS as reg_mode and loaded by
+// Registrar::loadMode() at construction. Change it from the dashboard
+// (POST /api/registrar), or at flash time via the cfgseed record — see
+// docs/LEARN_MODE.md and src/Helpers/DeviceConfig.hpp.
 #define POCKETDIAL_OPEN_REGISTRAR
 
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)

@@ -120,13 +120,19 @@ image is >1.5 MB).
 DEVICE=http://192.168.4.1          # or http://pocketdial.local
 JAR=cookies.txt
 
-# 1) Log in with the admin PIN to obtain a pd_session cookie.
+# 1) Log in with the admin PIN to obtain a pd_session cookie AND the session's
+#    CSRF token. Every mutating request needs BOTH: the cookie proves who you
+#    are, the token proves the request came from something that was told the
+#    token rather than from a page that merely rode your cookie.
 #    (Send Origin so the same-origin check passes from a script.)
-curl -s -c "$JAR" \
+LOGIN=$(curl -s -c "$JAR" \
      -H "Origin: $DEVICE" \
      -X POST --data "pin=YOUR_PIN" \
-     "$DEVICE/api/admin/login"
-# -> {"status":"ok","authenticated":true}
+     "$DEVICE/api/admin/login")
+# -> {"status":"ok","authenticated":true,"csrf":"3f2a...e91c"}
+
+CSRF=$(printf '%s' "$LOGIN" | sed -n 's/.*"csrf":"\([0-9a-f]*\)".*/\1/p')
+[ -n "$CSRF" ] || { echo "login failed: $LOGIN" >&2; exit 1; }
 
 # 2) Inspect current OTA state (optional).
 curl -s "$DEVICE/api/ota/status"
@@ -136,6 +142,7 @@ curl -s "$DEVICE/api/ota/status"
 #    Content-Length is set automatically by --data-binary @file.
 curl -s -b "$JAR" \
      -H "Origin: $DEVICE" \
+     -H "X-CSRF: $CSRF" \
      -H "Content-Type: application/octet-stream" \
      -X POST --data-binary @build/SipServer.bin \
      "$DEVICE/api/ota/upload"
@@ -145,9 +152,17 @@ curl -s -b "$JAR" \
 # 4) Reboot into the new image.
 curl -s -b "$JAR" \
      -H "Origin: $DEVICE" \
+     -H "X-CSRF: $CSRF" \
      -X POST "$DEVICE/api/ota/reboot"
 # -> {"status":"ok","message":"rebooting into the new image..."}
 ```
+
+> [!NOTE]
+> The `X-CSRF` header is new. A script written against an earlier firmware sends
+> the cookie but no token and now gets `403 {"error":"missing or invalid CSRF
+> token"}` on the upload and reboot steps. Capture the token from the login
+> response as shown above. Unprovisioned devices are unaffected — there is no
+> session, so there is no token to check.
 
 If **no PIN is set yet** (fresh/unprovisioned device) you can skip step 1 — the
 upload only requires same-origin in that state. **Set a PIN first in

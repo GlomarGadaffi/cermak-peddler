@@ -18,12 +18,16 @@
 #include "HttpServer.hpp"
 #include "OtaUpdater.hpp"
 #include "AdminAuth.hpp"
+#include "DeviceConfig.hpp"
 #include "LogQueue.hpp"
 #include "host_compat.h"
 
 // ── Default INFRA (AP) profile settings ───────────────────────────────────────
 #define EXAMPLE_ESP_WIFI_SSID      "esp32-sipserver"
-#define EXAMPLE_ESP_WIFI_PASS      ""
+// No EXAMPLE_ESP_WIFI_PASS: the SoftAP passphrase is NOT a build-time constant.
+// It lives in NVS and is generated per device on first use — see DeviceConfig.hpp
+// and wifi_init_softap() below. A literal here would be identical on every unit
+// and published in this repo, which is no security at all.
 #define EXAMPLE_ESP_WIFI_CHANNEL   1
 #define EXAMPLE_MAX_STA_CONN       10
 
@@ -99,9 +103,28 @@ static std::string wifi_init_softap(void)
     strlcpy((char*)wifi_config.ap.ssid, EXAMPLE_ESP_WIFI_SSID, sizeof(wifi_config.ap.ssid));
     wifi_config.ap.ssid_len = strlen(EXAMPLE_ESP_WIFI_SSID);
     wifi_config.ap.channel = EXAMPLE_ESP_WIFI_CHANNEL;
-    strlcpy((char*)wifi_config.ap.password, EXAMPLE_ESP_WIFI_PASS, sizeof(wifi_config.ap.password));
     wifi_config.ap.max_connection = EXAMPLE_MAX_STA_CONN;
-    wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+
+    // SoftAP security. Previously this copied EXAMPLE_ESP_WIFI_PASS (which is "")
+    // into the config and then forced WIFI_AUTH_OPEN — the passphrase field was
+    // dead code and every byte on this AP, dashboard + SIP signalling + RTP media
+    // alike, went out in the clear. DeviceConfig owns the choice now; it defaults
+    // to open so an already-deployed fleet is not cut off by a firmware update
+    // (see DeviceConfig.hpp), and is flipped from the dashboard or at flash time.
+    const bool ap_secure = DeviceConfig::isApSecure();
+    if (ap_secure) {
+        std::string psk = DeviceConfig::getApPsk();
+        strlcpy((char*)wifi_config.ap.password, psk.c_str(), sizeof(wifi_config.ap.password));
+        wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+        // Yes, this logs the passphrase in the clear. This is the HEADLESS build:
+        // there is no screen, so the UART console is the operator's only way to
+        // learn a passphrase the device generated for itself. Anyone with a serial
+        // cable is already inside the physical trust boundary (docs/THREAT_MODEL.md).
+        ESP_LOGI(TAG, "INFRA: SoftAP passphrase (WPA2): %s", psk.c_str());
+    } else {
+        wifi_config.ap.password[0] = '\0';
+        wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+    }
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
@@ -113,8 +136,9 @@ static std::string wifi_init_softap(void)
         ESP_LOGW(TAG, "dhcps_start returned %d — phones may not get leases", dhcps_err);
     }
 
-    ESP_LOGI(TAG, "INFRA: SoftAP SSID:%s channel:%d  DHCP server active",
-             EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_CHANNEL);
+    ESP_LOGI(TAG, "INFRA: SoftAP SSID:%s channel:%d auth:%s  DHCP server active",
+             EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_CHANNEL,
+             ap_secure ? "WPA2-PSK" : "OPEN");
     return "192.168.4.1";  // Default ESP32 AP gateway / bind address
 }
 
@@ -254,6 +278,16 @@ extern "C" void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    // ── Flash-time configuration seed ────────────────────────────────────────
+    // Must run AFTER nvs_flash_init() (it writes NVS) and BEFORE anything reads
+    // wifi_mode / wifi_ssid / the AP security keys below — the whole point is that
+    // a board configured by the browser flasher comes up already configured on its
+    // very first boot. A board with no cfgseed partition (any OTA-updated unit, or
+    // the 4MB constrained layout) returns false here and is unaffected.
+    if (DeviceConfig::applyFlashSeed()) {
+        ESP_LOGI(TAG, "[boot] applied flash-time cfgseed");
+    }
 
     // ── Task 1B: install non-blocking log queue + drain task ────────────────
     LogQueue::create();

@@ -151,7 +151,11 @@ idf.py -p COM3 flash monitor
 
 Once flashing completes, the device boots and the serial monitor will show logging status. If running in **Wi-Fi SoftAP** or **Display** mode:
 
-1. **Connect to the Network:** On your laptop or phone, connect to the open Wi-Fi network named **`esp32-sipserver`** (no password required).
+1. **Connect to the Network:** On your laptop or phone, connect to the Wi-Fi network named
+   **`esp32-sipserver`**. It is **open by default** (no password). If access-point security
+   has been enabled — from the dashboard, or at flash time via the browser flasher — you will
+   need the device's own generated WPA2 passphrase instead; see
+   [SETUP_GUIDE.md](SETUP_GUIDE.md#turning-on-access-point-security-wpa2) for where to read it.
 2. **Retrieve Server IP:** The SoftAP gateway IP defaults to **`192.168.4.1`**.
 
 You can now manually query and control the firmware using standard terminal commands or by navigating your browser to `http://192.168.4.1/`.

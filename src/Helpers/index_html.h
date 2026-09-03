@@ -421,6 +421,66 @@ R"html1(    <div class="stat"><span class="k">Jacks</span><span class="v" id="s-
       <div class="msg" id="admin-msg"></div>
 
       <hr class="hr">
+      <div class="subhead">&#128246; Wi-Fi Access Point Security</div>
+      <div class="note">
+        This device&rsquo;s own access point carries the dashboard, SIP signalling and
+        call audio. Left open, anyone in radio range can join and record calls.
+        Turning WPA2 on encrypts all three at once &mdash; the single most effective
+        hardening available here.
+      </div>
+      <div class="msg warn" id="ap-break-note">
+        Switching this on is a <strong>breaking change</strong>: every phone already
+        associated with this access point must be re-joined using the passphrase
+        below. Nothing changes until the access point next comes up.
+      </div>
+      <div class="kv"><span class="k">Current mode</span><span id="ap-mode">&mdash;</span></div>
+      <div class="field">
+        <label for="ap-psk">Access point passphrase (8&ndash;63 characters)</label>
+        <input type="text" id="ap-psk" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="row">
+        <label class="note" for="ap-secure"><input type="checkbox" id="ap-secure"> Require WPA2 on the access point</label>
+      </div>
+      <div class="row">
+        <button class="btn primary" onclick="saveApSecurity()">Save</button>
+        <button class="btn" onclick="regenApPsk()">Generate new passphrase</button>
+      </div>
+      <div class="msg" id="ap-msg"></div>
+
+      <hr class="hr">
+      <div class="subhead">&#9990; Extension Registration &amp; Onboarding</div>
+      <div class="note">
+        Controls what a phone must prove before it can register as an extension.
+        <strong>Open</strong> accepts any endpoint with no credential &mdash; convenient
+        for a lab, but on a shared link anyone can register as any extension and tear
+        down calls. <strong>Learn</strong> adopts unknown phones on first contact and
+        locks each to its extension; run it briefly to onboard a fleet, then move on.
+        <strong>Secure</strong> digest-challenges every registration.
+      </div>
+      <div class="kv"><span class="k">Current mode</span><span id="reg-mode-cur">&mdash;</span></div>
+      <div class="field">
+        <label for="reg-mode">Registration mode</label>
+        <select id="reg-mode">
+          <option value="open">Open &mdash; no credential required</option>
+          <option value="learn">Learn &mdash; adopt new phones (temporary)</option>
+          <option value="secure">Secure &mdash; digest auth required</option>
+        </select>
+      </div>
+      <button class="btn primary" onclick="saveRegistrarMode()">Apply mode</button>
+      <div class="msg" id="reg-msg"></div>
+
+      <div class="subhead" style="margin-top:10px">Adopted extensions</div>
+      <div class="note" id="reg-roster-note">
+        Phones seen while in Learn mode. <strong>Secure</strong> locks one to its
+        extension and starts enforcing digest auth for it; <strong>Forget</strong> drops
+        the record so the phone is re-adopted on its next registration.
+      </div>
+      <table id="reg-roster">
+        <thead><tr><th>Extension</th><th>MAC</th><th>State</th><th></th></tr></thead>
+        <tbody id="reg-roster-body"></tbody>
+      </table>
+
+      <hr class="hr">
       <div class="subhead">&#8593; Firmware Update (OTA)</div>
       <div class="kv"><span class="k">OTA support</span><span id="ota-supported">&mdash;</span></div>
       <div class="kv"><span class="k">Running</span><span id="ota-running">&mdash;</span></div>
@@ -495,6 +555,13 @@ var selectedSSID="";
 var selectedJack=null;
 var failCount=0;
 var POOL=32;
+/* Per-session CSRF token. The literal below is replaced by the server when it
+   renders this page (HttpServer::sendHtml); an unauthenticated load leaves it
+   empty and adminLogin() fills it in from the login response. It is deliberately
+   NOT a cookie: the browser would attach a cookie to a same-site request on its
+   own, so only a value our own script has to read and echo back proves the
+   request came from this page rather than from someone else's. */
+var PD_CSRF="__PD_CSRF__";
 
 /* ── helpers ── */
 function $(id){return document.getElementById(id);}
@@ -789,10 +856,10 @@ function termExec(){
 
 /* ── networking ── */
 function post(url,body){
-  return fetch(url,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:body})
+  return fetch(url,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded","X-CSRF":PD_CSRF},body:body})
     .then(function(r){
       if(r.status===401){handleAuthExpired();throw new Error("session expired — please log in");}
-      if(r.status===403){throw new Error("rejected (cross-origin)");}
+      if(r.status===403){throw new Error("rejected (cross-origin or stale security token \u2014 reload the page)");}
       if(!r.ok){throw new Error("HTTP "+r.status);}
       return r.text();
     });
@@ -828,6 +895,7 @@ function fetchAdminStatus(){
   return fetch("/api/admin/status",{credentials:"same-origin"}).then(function(r){return r.json();}).then(function(d){
     adminState.provisioned=!!d.provisioned;adminState.authenticated=!!d.authenticated;
     renderAdminPanel();applyAuthGating();
+    if(adminState.authenticated){fetchApSecurity();fetchRegistrar();}
   }).catch(function(){});
 }
 function renderAdminPanel(){
@@ -861,6 +929,111 @@ R"html3(      if(r.status===400){setMsg("admin-msg","Invalid PIN (min 4 chars)."
       setMsg("admin-msg","Admin PIN updated.","ok");fetchAdminStatus();
     }).catch(function(e){setMsg("admin-msg","Error: "+e.message,"err");});
 }
+/* post() resolves to the raw response text, so the AP handlers parse it here. */
+function parseJsonOr(t){try{return JSON.parse(t);}catch(e){return {};}}
+function renderApSecurity(d){
+  $("ap-mode").textContent=d.secure?"WPA2 (encrypted)":"Open \u2014 unencrypted";
+  $("ap-secure").checked=!!d.secure;
+  $("ap-psk").value=d.psk||"";
+}
+function fetchApSecurity(){
+  return fetch("/api/ap-security",{credentials:"same-origin"})
+    .then(function(r){if(!r.ok){throw new Error("HTTP "+r.status);}return r.json();})
+    .then(renderApSecurity).catch(function(){});
+}
+function saveApSecurity(){
+  var psk=$("ap-psk").value;
+  if(psk.length<8||psk.length>63){setMsg("ap-msg","Passphrase must be 8\u201363 characters.","err");return;}
+  post("/api/ap-security","secure="+($("ap-secure").checked?"1":"0")+"&psk="+encodeURIComponent(psk))
+    .then(function(t){
+      renderApSecurity(parseJsonOr(t));
+      setMsg("ap-msg","Saved. Takes effect the next time the access point starts.","ok");
+    }).catch(function(e){setMsg("ap-msg","Error: "+e.message,"err");});
+}
+function regenApPsk(){
+  post("/api/ap-security","regenerate=1")
+    .then(function(t){
+      renderApSecurity(parseJsonOr(t));
+      setMsg("ap-msg","New passphrase generated \u2014 write it down before restarting the access point.","warn");
+    }).catch(function(e){setMsg("ap-msg","Error: "+e.message,"err");});
+}
+function renderRegistrar(d){
+  var mode=(d&&d.mode)||"unknown";
+  $("reg-mode-cur").textContent=(d&&d.attached===false)?"\u2014 (SIP engine not attached yet)":mode;
+  if(d&&d.attached!==false&&mode!=="unknown"){$("reg-mode").value=mode;}
+  var body=$("reg-roster-body");
+  body.innerHTML="";
+  var devs=(d&&d.devices)||[];
+  if(!devs.length){
+    var tr=document.createElement("tr");
+    var td=document.createElement("td");
+    td.colSpan=4;
+    td.textContent=(mode==="learn")
+      ? "No phones adopted yet \u2014 register one now and it will appear here."
+      : "No phones adopted. Switch to Learn mode to onboard them.";
+    tr.appendChild(td);body.appendChild(tr);return;
+  }
+  devs.forEach(function(x){
+    var tr=document.createElement("tr");
+    /* textContent throughout: MAC and extension come off the wire from a phone,
+       so they are never interpolated as HTML. */
+    var tdE=document.createElement("td");tdE.textContent=x.extension||"\u2014";
+    var tdM=document.createElement("td");tdM.textContent=x.mac||"\u2014";
+    var tdS=document.createElement("td");
+    tdS.textContent=(x.state==="secured"?"secured":"learned")+(x.online?" \u00b7 online":"");
+    var tdA=document.createElement("td");
+    if(x.state!=="secured"){
+      var b=document.createElement("button");
+      b.className="btn";b.textContent="Secure";
+      b.onclick=function(){registrarDevice("secure",x.mac);};
+      tdA.appendChild(b);
+    }
+    var f=document.createElement("button");
+    f.className="btn danger";f.textContent="Forget";
+    f.onclick=function(){registrarDevice("forget",x.mac);};
+    tdA.appendChild(f);
+    tr.appendChild(tdE);tr.appendChild(tdM);tr.appendChild(tdS);tr.appendChild(tdA);
+    body.appendChild(tr);
+  });
+}
+function fetchRegistrar(){
+  return fetch("/api/registrar",{credentials:"same-origin"})
+    .then(function(r){if(!r.ok){throw new Error("HTTP "+r.status);}return r.json();})
+    .then(renderRegistrar).catch(function(){});
+}
+function saveRegistrarMode(){
+  var mode=$("reg-mode").value;
+  postRegistrarMode(mode,false);
+}
+function postRegistrarMode(mode,confirmLockout){
+  var body="mode="+encodeURIComponent(mode)+(confirmLockout?"&confirm=LOCKOUT":"");
+  post("/api/registrar",body)
+    .then(function(t){
+      renderRegistrar(parseJsonOr(t));
+      setMsg("reg-msg","Registration mode is now "+mode+".","ok");
+    })
+    .catch(function(e){
+      /* 409 = switching to secure with nothing secured yet would reject every
+         phone. Make the operator say so explicitly rather than silently doing it. */
+      if(/HTTP 409/.test(e.message)){
+        if(confirm("No extensions are secured yet.\n\nSwitching to Secure now will reject EVERY phone until each one is adopted and secured.\n\nSwitch anyway?")){
+          postRegistrarMode(mode,true);
+        }else{
+          setMsg("reg-msg","Left unchanged. Use Learn mode to adopt phones first.","warn");
+          fetchRegistrar();
+        }
+        return;
+      }
+      setMsg("reg-msg","Error: "+e.message,"err");
+    });
+}
+function registrarDevice(action,target){
+  post("/api/registrar/device","action="+encodeURIComponent(action)+"&target="+encodeURIComponent(target))
+    .then(function(t){
+      renderRegistrar(parseJsonOr(t));
+      setMsg("reg-msg",(action==="secure"?"Extension secured.":"Device forgotten."),"ok");
+    }).catch(function(e){setMsg("reg-msg","Error: "+e.message,"err");});
+}
 function adminLogin(){
   var pin=$("adm-pin").value;if(!pin){setMsg("admin-msg","Enter your PIN.","err");return;}
   fetch("/api/admin/login",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"pin="+encodeURIComponent(pin)})
@@ -870,6 +1043,9 @@ function adminLogin(){
       if(r.status===429){setMsg("admin-msg","Locked — wait a minute.","err");return;}
       if(r.status===409){setMsg("admin-msg","No PIN set yet.","err");fetchAdminStatus();return;}
       if(!r.ok){setMsg("admin-msg","Login failed (HTTP "+r.status+").","err");return;}
+      /* The login response carries this session's CSRF token so a fetch()-based
+         login can start making mutating calls immediately. */
+      r.json().then(function(d){if(d&&d.csrf){PD_CSRF=d.csrf;}}).catch(function(){});
       setMsg("admin-msg","Logged in.","ok");toast("Admin unlocked","ok");fetchAdminStatus();
     }).catch(function(e){setMsg("admin-msg","Error: "+e.message,"err");});
 }
@@ -909,6 +1085,7 @@ function otaUpload(){
   var xhr=new XMLHttpRequest();
   xhr.open("POST","/api/ota/upload",true);xhr.withCredentials=true;
   xhr.setRequestHeader("Content-Type","application/octet-stream");
+  xhr.setRequestHeader("X-CSRF",PD_CSRF);
   xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);bar.style.width=p+"%";pct.textContent=p+"%";}};
   xhr.onload=function(){
     otaUploading=false;applyAuthGating();

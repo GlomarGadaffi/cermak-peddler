@@ -75,8 +75,34 @@ private:
 		std::string origin;  // value of the Origin: header, if present
 		std::string host;    // value of the Host: header, if present
 		std::string cookie;  // value of the Cookie: header, if present
+		std::string csrf;    // value of the X-CSRF: header, if present
+		// Peer address, filled from getpeername() in handleClient(). Used only as
+		// the brute-force accounting key for /api/admin/login, never for authz:
+		// a source address is trivially spoofable on the shared link (see
+		// docs/THREAT_MODEL.md), so it buys fairness between clients, not trust.
+		std::string clientIp;
 	};
 	HttpRequest parseRequest(const std::string& raw);
+
+	// The single admission gate for every non-public endpoint. Replaces the
+	// same-origin/auth block that used to be copy-pasted at each route — two
+	// endpoints had already been missed that way (/api/configuring had no gate
+	// at all; /api/pcap, /api/trace and /api/diagnostics/pcap had no same-origin
+	// check despite serving raw SIP bytes including Authorization digests).
+	//
+	// Returns true if the handler may run. On false it has ALREADY written the
+	// error response, so the caller must not write another.
+	//
+	// `needCsrf` should be true for every mutating request and false for reads;
+	// the token is only checked when a session actually exists to bind it to.
+	bool requireAdmin(int sock, const HttpRequest& req, bool needCsrf);
+
+	// Same-origin check only, for the pre-session endpoints (login, logout).
+	// Same contract: on false the response has already been written.
+	bool requireSameOrigin(int sock, const HttpRequest& req);
+
+	// The pd_session cookie value, or "" if absent.
+	std::string sessionToken(const HttpRequest& req) const;
 
 	// Response builders
 	void sendResponse(int sock, int statusCode, const std::string& statusText,
@@ -88,8 +114,24 @@ private:
 	                   const std::string& contentType, const std::string& body,
 	                   const std::string& extraHeader);
 	void sendRedirect(int sock, const std::string& location);
-	void sendHtml(int sock);
+	// Takes the request so the rendered page can carry this session's CSRF token.
+	void sendHtml(int sock, const HttpRequest& req);
 	void sendApiStatus(int sock);
+	// SoftAP security (docs/THREAT_MODEL.md §6 / FEATURE_ROADMAP P0): report and
+	// toggle WPA2 on the standalone AP, and show/rotate its passphrase. Turning
+	// it on is a breaking change for already-associated phones, so it is an
+	// explicit operator action rather than a default.
+	void sendApiApSecurity(int sock);
+	void sendApiApSecuritySet(int sock, const std::string& body);
+
+	// SIP registrar admission mode + the Learn-mode adopted-extension roster.
+	// Until these landed, RequestsHandler::setRegistrarMode() was called from unit
+	// tests ONLY: digest authentication was fully implemented and fully unreachable
+	// on a shipped device, because nothing in production ever wrote the persisted
+	// mode. These endpoints (and the flash-time seed) are what make it operable.
+	void sendApiRegistrar(int sock);
+	void sendApiRegistrarSet(int sock, const std::string& body);
+	void sendApiRegistrarDevice(int sock, const std::string& body);
 	void sendApiKill(int sock, const std::string& body);
 	// Phase 2: read-only Call Detail Records (newest first). Ungated like /api/status.
 	void sendApiCdr(int sock);

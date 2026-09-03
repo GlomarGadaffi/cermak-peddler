@@ -308,8 +308,25 @@ namespace
 	struct Session
 	{
 		std::string token;
+		// Per-session CSRF token. Bound to the session by living in the same slot;
+		// never sent as a cookie, so SameSite/HttpOnly protect the session id while
+		// this protects against a same-site page that can still drive fetch().
+		std::string csrf;
 		uint64_t    expiresAtMs = 0;
 		bool        used = false;
+	};
+
+	// One brute-force accounting bucket per client identity (see
+	// AdminAuth::kMaxAttemptBuckets). `key` is the HTTP peer address; the empty
+	// key is the unkeyed bucket used by callers with no peer (the DTMF menu).
+	struct AttemptBucket
+	{
+		std::string key;
+		bool        used = false;
+		int         failures = 0;        // failures inside the current window
+		int         trips = 0;           // lockouts engaged since the last success
+		uint64_t    lockoutUntilMs = 0;
+		uint64_t    lastSeenMs = 0;      // for least-recently-seen eviction
 	};
 
 	struct AuthState
@@ -323,9 +340,14 @@ namespace
 		std::string salt;               // hex
 		std::string hash;               // hex (salted, iterated digest)
 
-		// Brute-force lockout (in-process; see threat model re: per-IP).
-		int      failedAttempts = 0;
-		uint64_t lockoutUntilMs = 0;
+		// Brute-force lockout, tracked per client (docs/THREAT_MODEL.md §5.2, D-3).
+		std::array<AttemptBucket, AdminAuth::kMaxAttemptBuckets> attempts{};
+
+		// Aggregate backstop across every client, so that rotating source addresses
+		// cannot buy an unbounded guess rate (see kMaxFailedAttemptsGlobal).
+		int      globalFailures = 0;
+		int      globalTrips = 0;
+		uint64_t globalLockoutUntilMs = 0;
 
 		std::array<Session, AdminAuth::kMaxSessions> sessions{};
 	};
@@ -392,6 +414,58 @@ namespace
 #endif
 	}
 
+	// --- Brute-force accounting buckets. Caller must hold state().mutex. ---
+
+	// The bucket for `key`, or nullptr if this client has no history. Read-only:
+	// used by isLockedOut(), which must not allocate a slot for a client that has
+	// never guessed (otherwise merely asking would evict a real attacker's record).
+	AttemptBucket* findBucketLocked(AuthState& s, const std::string& key)
+	{
+		for (auto& b : s.attempts)
+		{
+			if (b.used && b.key == key)
+			{
+				return &b;
+			}
+		}
+		return nullptr;
+	}
+
+	// The bucket for `key`, creating one if needed. When the table is full the
+	// least-recently-seen entry is reused; a client that keeps guessing keeps
+	// touching its bucket, so the entry that gets dropped is always the most
+	// stale one. This bounds memory against a flood of spoofed source addresses
+	// at the cost of letting a large enough flood eventually recycle a record —
+	// an accepted trade on a device whose AP holds ten stations.
+	AttemptBucket& acquireBucketLocked(AuthState& s, const std::string& key)
+	{
+		if (AttemptBucket* existing = findBucketLocked(s, key))
+		{
+			existing->lastSeenMs = nowMs();
+			return *existing;
+		}
+
+		AttemptBucket* victim = &s.attempts[0];
+		for (auto& b : s.attempts)
+		{
+			if (!b.used)
+			{
+				victim = &b;
+				break;
+			}
+			if (b.lastSeenMs < victim->lastSeenMs)
+			{
+				victim = &b;
+			}
+		}
+
+		*victim = AttemptBucket{};
+		victim->key = key;
+		victim->used = true;
+		victim->lastSeenMs = nowMs();
+		return *victim;
+	}
+
 	// Caller must hold state().mutex.
 	void eraseCredentialLocked()
 	{
@@ -453,20 +527,38 @@ namespace AdminAuth
 			return false;
 		}
 
-		// A credential (re)set resets the lockout counter.
-		s.failedAttempts = 0;
-		s.lockoutUntilMs = 0;
+		// A credential (re)set clears brute-force accounting for every client.
+		s.attempts = {};
+		s.globalFailures = 0;
+		s.globalTrips = 0;
+		s.globalLockoutUntilMs = 0;
 		return true;
 	}
 
 	bool isLockedOut()
 	{
+		return isLockedOut(std::string());
+	}
+
+	bool isLockedOut(const std::string& clientKey)
+	{
 		AuthState& s = state();
 		std::lock_guard<std::mutex> lock(s.mutex);
-		return s.lockoutUntilMs != 0 && nowMs() < s.lockoutUntilMs;
+		const uint64_t now = nowMs();
+		if (s.globalLockoutUntilMs != 0 && now < s.globalLockoutUntilMs)
+		{
+			return true;   // aggregate backstop is engaged: everyone waits
+		}
+		AttemptBucket* b = findBucketLocked(s, clientKey);
+		return b != nullptr && b->lockoutUntilMs != 0 && now < b->lockoutUntilMs;
 	}
 
 	bool verifyPin(const std::string& pin)
+	{
+		return verifyPin(pin, std::string());
+	}
+
+	bool verifyPin(const std::string& pin, const std::string& clientKey)
 	{
 		AuthState& s = state();
 		std::lock_guard<std::mutex> lock(s.mutex);
@@ -477,8 +569,15 @@ namespace AdminAuth
 			return false;
 		}
 
-		// Honor the lockout without hashing while it is engaged.
-		if (s.lockoutUntilMs != 0 && nowMs() < s.lockoutUntilMs)
+		AttemptBucket& b = acquireBucketLocked(s, clientKey);
+
+		// Honor this client's lockout — and the aggregate backstop — without
+		// hashing while either is engaged.
+		if (b.lockoutUntilMs != 0 && nowMs() < b.lockoutUntilMs)
+		{
+			return false;
+		}
+		if (s.globalLockoutUntilMs != 0 && nowMs() < s.globalLockoutUntilMs)
 		{
 			return false;
 		}
@@ -488,22 +587,41 @@ namespace AdminAuth
 
 		if (ok)
 		{
-			s.failedAttempts = 0;
-			s.lockoutUntilMs = 0;
+			b.failures = 0;
+			b.trips = 0;
+			b.lockoutUntilMs = 0;
+			// A correct PIN proves a legitimate operator is present, so it clears
+			// the aggregate backstop too — otherwise a burst of noise from the AP
+			// would keep punishing the admin after they had demonstrably arrived.
+			s.globalFailures = 0;
+			s.globalTrips = 0;
+			s.globalLockoutUntilMs = 0;
 		}
 		else
 		{
-			if (s.failedAttempts < kMaxFailedAttempts)
+			++b.failures;
+			++s.globalFailures;
+			if (s.globalFailures >= kMaxFailedAttemptsGlobal)
 			{
-				++s.failedAttempts;
+				++s.globalTrips;
+				const int gshift = (s.globalTrips - 1 < kMaxLockoutShift)
+					? (s.globalTrips - 1) : kMaxLockoutShift;
+				s.globalLockoutUntilMs = nowMs() + (kLockoutMs << gshift);
+				s.globalFailures = 0;
 			}
-			if (s.failedAttempts >= kMaxFailedAttempts)
+			if (b.failures >= kMaxFailedAttempts)
 			{
-				s.lockoutUntilMs = nowMs() + kLockoutMs;
-				// Reset the counter so that, after the cooldown, the attacker
-				// gets a fresh window of kMaxFailedAttempts rather than being
-				// locked out permanently after one bad streak.
-				s.failedAttempts = 0;
+				// Escalating backoff. The previous implementation zeroed the trip
+				// count here, which handed the attacker a fresh kMaxFailedAttempts
+				// window after every cooldown — a steady ~5 guesses/minute forever,
+				// which walks a 4-digit PIN in about a day and a half. Keeping the
+				// trip count and doubling the cooldown turns that into hours per
+				// handful of guesses. Only a correct PIN clears it.
+				++b.trips;
+				const int shift = (b.trips - 1 < kMaxLockoutShift)
+					? (b.trips - 1) : kMaxLockoutShift;
+				b.lockoutUntilMs = nowMs() + (kLockoutMs << shift);
+				b.failures = 0;
 			}
 		}
 		return ok;
@@ -545,6 +663,7 @@ namespace AdminAuth
 		(void)found;
 
 		s.sessions[slot].token = token;
+		s.sessions[slot].csrf = randomHex(kCsrfTokenHex);
 		s.sessions[slot].expiresAtMs = now + kSessionTtlMs;
 		s.sessions[slot].used = true;
 		return token;
@@ -572,6 +691,7 @@ namespace AdminAuth
 				// Lazily reap expired sessions.
 				sess.used = false;
 				sess.token.clear();
+				sess.csrf.clear();
 				sess.expiresAtMs = 0;
 				continue;
 			}
@@ -604,6 +724,7 @@ namespace AdminAuth
 			{
 				sess.used = false;
 				sess.token.clear();
+				sess.csrf.clear();
 				sess.expiresAtMs = 0;
 			}
 		}
@@ -620,15 +741,61 @@ namespace AdminAuth
 		s.hash.clear();
 		s.provisioned = false;
 		s.loaded = true;          // we know the (now empty) state; don't reload
-		s.failedAttempts = 0;
-		s.lockoutUntilMs = 0;
+		s.attempts = {};
+		s.globalFailures = 0;
+		s.globalTrips = 0;
+		s.globalLockoutUntilMs = 0;
 
 		for (auto& sess : s.sessions)
 		{
 			sess.used = false;
 			sess.token.clear();
+			sess.csrf.clear();
 			sess.expiresAtMs = 0;
 		}
+	}
+
+	std::string sessionCsrf(const std::string& token)
+	{
+		if (token.empty())
+		{
+			return "";
+		}
+
+		AuthState& s = state();
+		std::lock_guard<std::mutex> lock(s.mutex);
+
+		uint64_t now = nowMs();
+		for (auto& sess : s.sessions)
+		{
+			if (!sess.used)
+			{
+				continue;
+			}
+			if (sess.expiresAtMs != 0 && now >= sess.expiresAtMs)
+			{
+				continue;
+			}
+			if (constantTimeEquals(sess.token, token))
+			{
+				return sess.csrf;
+			}
+		}
+		return "";
+	}
+
+	bool validateCsrf(const std::string& token, const std::string& csrf)
+	{
+		if (csrf.empty())
+		{
+			return false;
+		}
+		const std::string want = sessionCsrf(token);
+		if (want.empty())
+		{
+			return false;
+		}
+		return constantTimeEquals(want, csrf);
 	}
 
 	// credentialIsSet: lightweight NVS probe used by the boot provisioning gate.

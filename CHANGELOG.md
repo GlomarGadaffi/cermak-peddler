@@ -1,5 +1,179 @@
 # Changelog
 
+## Unreleased (feat/ap-wpa2-and-web-hardening) - 2026-09-03
+
+### Security — SoftAP WPA2, CSRF tokens, and a centralised admin gate
+
+Context: this started as an evaluation of a proposal to port
+ESP32_AdBlocker_Reborn's mandatory-HTTPS web GUI onto pocket-dial. That proposal was
+declined on its headline item — `docs/THREAT_MODEL.md` §6 and
+`docs/FEATURE_ROADMAP.md` already record self-signed HTTPS as *not* the primary control
+for a LAN appliance, and it would have protected only the dashboard while leaving SIP
+and RTP in the clear. The link-layer and app-layer fixes it displaced are what landed
+instead.
+
+**SoftAP WPA2 (docs/THREAT_MODEL.md §6, FEATURE_ROADMAP P0)**
+
+- `WIFI_AUTH_WPA2_PSK` on the standalone access point, gated by the new NVS flag
+  `ap_secure` and **defaulting to off**. Turning it on forces every already-associated
+  phone to be re-paired, so it is an explicit operator action, never something a
+  firmware update does to a live fleet. Encrypts the dashboard, SIP signalling and RTP
+  media at once — the confidentiality gap I-1/I-2 that no amount of dashboard TLS
+  would have closed.
+- Per-device passphrase generated from `esp_random()` on first access and stored in NVS
+  (`ap_psk`): 20 characters over a 30-symbol alphabet with no ambiguous glyphs
+  (no `0`/`O`, `1`/`I`/`L`, `U`), because it gets read off a small LCD or a serial log
+  and retyped into a desk phone. Drawn by rejection sampling, not `byte % 30`.
+- **Fixes a real bug**: the captive-portal onboarding AP was already `WPA_WPA2_PSK` but
+  used `#define ONBOARDING_PASS "12345678"` — identical on every unit and published in
+  this repo, so anyone who captured the 4-way handshake could derive the PTK. Its
+  encryption was decorative.
+- `main/esp_main.cpp` previously copied a passphrase into the AP config and then
+  discarded it by forcing `WIFI_AUTH_OPEN`; the field was dead code.
+- New `GET`/`POST /api/ap-security` to report, toggle and rotate it, plus a dashboard
+  panel. The radio is deliberately not restarted on save — that would drop the client
+  reading the passphrase and tear down live calls; the change lands at the next AP
+  bringup.
+
+**Flash-time configuration (new `cfgseed` partition)**
+
+- `partitions.csv` gains `cfgseed` (data, subtype 0x41, 4 KB at `0xFFF000`), carved out
+  of the reserved `prompts` region. `nvs`, `otadata`, `phy_init`, `ota_0` and `ota_1`
+  keep their exact offsets, per that file's own contract.
+- The browser flasher can write a 256-byte fixed-layout record (Wi-Fi mode, AP security,
+  passphrase, optional upstream credentials, CRC-32) which the firmware applies to NVS
+  once on boot, keyed by a generation counter so a reboot never re-clobbers later
+  changes. Opt-in per flash and defaulting to "leave the device alone", so a plain
+  reflash cannot silently reset a configured board.
+- A seed blob rather than an NVS image on purpose: generating a valid NVS partition in
+  JavaScript means reimplementing page headers, entry-state bitmaps and CRCs, and
+  writing it at `0x9000` would destroy the saved Wi-Fi credentials and admin PIN.
+- **Absent partition is the normal case, not an error** — an OTA update does not rewrite
+  the partition table, so this firmware runs on boards flashed before `cfgseed` existed,
+  and on the 4 MB constrained layout. `applyFlashSeed()` returns false silently.
+
+**Centralised admin gate — closes two holes**
+
+- The same-origin/auth block was copy-pasted at roughly fifteen routes. Two had been
+  missed: `POST /api/configuring` had **no gate at all** (waived in a comment as
+  "harmless" despite mutating device state), and `/api/pcap`, `/api/trace` and
+  `/api/diagnostics/pcap` had **no same-origin check** while serving raw SIP message
+  bytes including `Authorization` digests. All routes now go through one
+  `HttpServer::requireAdmin()`.
+
+**Per-session CSRF tokens (T-2)**
+
+- 128-bit token minted with each session, rendered into the dashboard document and
+  returned in the login response — never set as a cookie, since the browser would attach
+  a cookie to a same-site request on its own. Required in an `X-CSRF` header on every
+  mutating request.
+- The same-origin check still admits a request with no `Origin` header (that is what
+  lets `curl`, native clients and `tests/http/test_api.sh` work), so the token is what
+  actually closes the CSRF gap on a provisioned device.
+- Exempt, with reasons documented in `docs/API.md` §2.1: login (no session yet), logout
+  (a forced logout is a nuisance, not a compromise, and `SameSite=Strict` already blocks
+  it), and anything while unprovisioned (no session exists; demanding one would make the
+  device unclaimable and break onboarding).
+- **Breaking change for scripts**: `docs/OTA.md`'s curl workflow now captures the token
+  from the login response and sends it on the upload and reboot steps. A script written
+  against earlier firmware gets `403` on a provisioned device.
+
+**Brute-force lockout (§5.2, retires D-3)**
+
+- `verifyPin` used to zero the failure counter the moment the lockout engaged, handing
+  the attacker a fresh window of five after every cooldown — a steady ~5 guesses/minute
+  indefinitely, which walks a 4-digit PIN in about a day and a half. The trip count now
+  survives and each successive lockout doubles (capped at 16 minutes). Only a correct
+  PIN clears it.
+- Failures are counted per client address in a bounded, least-recently-seen-evicted
+  table, so one guessing client can no longer lock the legitimate admin out of new
+  logins.
+- Per-client accounting *alone* would have been a regression — source addresses are
+  spoofable, so rotating them would buy a fresh bucket and a fresh escalation ladder
+  every five guesses. An aggregate backstop (20 failures across all clients, same
+  doubling) bounds the total guess rate regardless of how many identities are invented,
+  and sits far enough above ordinary typos not to reintroduce the self-DoS.
+
+**Security response headers**
+
+- Emitted centrally in `sendResponseWithHeader`, so no endpoint can omit them: CSP
+  (`default-src 'none'` plus the inline script/style the single-page dashboard needs),
+  `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`,
+  `Referrer-Policy: same-origin`.
+- Deliberately **no HSTS**: the dashboard is plain HTTP on a LAN appliance, and pinning
+  it would make the device permanently unreachable over `http://` with no user override.
+
+**SIP registrar mode + extension onboarding — making digest auth reachable**
+
+The larger finding behind this section: **SIP digest authentication was fully implemented,
+fully tested, and completely unreachable on a shipped device.** `SipDigest`,
+`SipSecretStore`, the `Registrar::Mode` state machine and its NVS persistence are all on
+`main`, and `Registrar::loadMode()` runs at boot — but `RequestsHandler::setRegistrarMode()`
+was called from **unit tests only**. No HTTP endpoint, no dashboard control, nothing in
+production ever wrote `reg_mode`. Every device came up in the compiled-in `open` default
+(any phone may register as any extension, with no credential) and stayed there.
+`POCKETDIAL_OPEN_REGISTRAR` is `#define`d unconditionally at `RequestsHandler.hpp:5`, so
+the `-UPOCKETDIAL_OPEN_REGISTRAR` build-flag workaround that had been documented could not
+work either. `docs/LEARN_MODE.md` described selecting the mode from a "Security screen"
+that did not exist.
+
+- **`GET /api/registrar`** — the admission mode plus the adopted-extension roster
+  (`{attached, mode, devices:[{mac, extension, state, online}]}`). `attached:false` when
+  the SIP engine is not bound yet, which is a normal transient state on an unprovisioned
+  device rather than an error.
+- **`POST /api/registrar`** — sets `open` / `learn` / `secure`. Switching to `secure` while
+  **no** extension is yet secured is refused with `409` unless `confirm=LOCKOUT`: that
+  transition digest-challenges every `REGISTER` at once, so on a device that has never run
+  Learn mode it rejects every phone and leaves the operator no working handset to notice
+  with. Mirrors the existing `confirm=ERASE` convention on `/api/factory-reset`.
+- **`POST /api/registrar/device`** — `action=secure|forget`, `target=<12-hex MAC or
+  extension>`. `secure` promotes a first-seen device to MAC-locked + digest-enforced;
+  `forget` drops the record so a later `REGISTER` re-adopts it, which is how an extension
+  is re-homed to different hardware.
+- **Dashboard panel** *Extension Registration & Onboarding*: the mode selector and the
+  roster with per-device Secure / Forget. Roster cells are written with `textContent` —
+  the MAC and extension arrive off the wire from a phone and are never interpolated as HTML.
+- **Flash-time `regMode`** in the `cfgseed` record (byte 13, flag bit 5), settable from the
+  browser flasher. This is the only way to set the mode on a headless board before first
+  boot. `kSeedVersion` was deliberately **not** bumped: each field is gated by its own flag
+  and readers ignore unknown flags, so old firmware skips bit 5 and applies the rest, and
+  new firmware reading an old record leaves `reg_mode` alone. Bumping the version would
+  instead have made older firmware reject the whole record.
+
+Honest scope: this makes the S-3/D-2 registrar gap **closable in the field**, not closed.
+The shipped default is still `open`, so it protects deployments that actually switch. The
+MAC lock is learned from the ARP table and is spoofable on a hostile L2 — defence in depth
+alongside digest auth, not a substitute for it.
+
+**Display: the AP passphrase reaches the glass**
+
+On the touchscreen build the standalone-AP path called `ui_set_onboarding_mode(false)`, so
+with WPA2 enabled the generated passphrase went to the serial log and nowhere else — on the
+one build with a screen. It is now shown on the display. Relatedly, `main/ui/ui.h` still
+carried `const char* pass = "12345678"` as a **default argument**: dead, but it was the
+exact literal removed above, sitting ready to be reintroduced. The defaults are gone
+(`nullptr`, with a guard in `ui.cpp`), and that header's comment no longer tells readers
+configuration is "SSH-only afterward" — the SSH surface was deleted a phase ago.
+
+**Documentation corrections**
+
+- `AdminAuth.hpp` and `THREAT_MODEL.md` §5.3 both described a 30-minute *absolute*
+  session expiry; the code has always implemented *sliding* expiry. Corrected in the
+  docs — sliding is the intended behaviour.
+- A comment in `HttpServer.cpp` claimed a ~3 KB pthread stack; `sdkconfig.defaults` has
+  set 8192 for some time.
+
+**Tests**
+
+- Host suite 289 → 306. New coverage for CSRF (missing/wrong/valid token, and that it is
+  *not* demanded while unprovisioned), the newly-gated endpoints, the security headers,
+  the lockout counter surviving a trip, per-client isolation, and the aggregate backstop.
+- New `tests/DeviceConfig_test.cpp`: default-off, generation, persistence, rotation, and
+  the WPA2 length/charset bounds that stop a typo from bringing the AP up open.
+- Note `tests/AdminHttpGate_test.cpp` cases that provision a PIN must attach a real
+  `RequestsHandler` — otherwise the dark-by-default gate closes the listen socket and the
+  test measures a refused connection instead of the gate.
+
 ## Unreleased (feat/sdp-negotiation-invite-auth) - 2026-09-01
 
 ### Security — SDP admission gate (docs/THREAT_MODEL.md T-7)

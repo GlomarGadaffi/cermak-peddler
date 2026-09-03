@@ -80,6 +80,55 @@ To prevent Cross-Site Request Forgery (CSRF) exploits when operating as an open 
    }
    ```
 
+### 2.1 Per-session CSRF token (`X-CSRF`)
+
+The Origin check above is a **browser-only** control, and it deliberately admits requests
+with no `Origin` header at all so that `curl`, native clients and the CI smoke suite keep
+working. On a **provisioned** device that gap is closed by a per-session CSRF token:
+
+* A 128-bit token is minted alongside the session at login and stored server-side beside it.
+* It is delivered two ways: rendered into the dashboard document, and returned in the login
+  response body as `"csrf"`. It is **never** set as a cookie — the browser would attach a
+  cookie to a same-site request on its own, so only a value our own page has to read and
+  echo back proves where the request came from.
+* Every **mutating** request must send it in an `X-CSRF` header. It is checked centrally,
+  in `HttpServer::requireAdmin()`, so no endpoint can forget it.
+
+A mutating request with a valid session but a missing or wrong token is rejected with
+**`403 Forbidden`**:
+
+```json
+{ "error": "missing or invalid CSRF token" }
+```
+
+**Exemptions**, and why:
+
+| Endpoint | Why no token |
+|----------|--------------|
+| `POST /api/admin/login` | There is no session yet, so there is nothing to bind a token to. |
+| `POST /api/admin/logout` | A forced logout is a nuisance, not a compromise, and `SameSite=Strict` already blocks it. Requiring a token would strand a user on a stale page. |
+| Any request while **unprovisioned** | A factory-fresh device has no session. Demanding a token would make the device unclaimable and would break captive-portal onboarding. |
+| All `GET` endpoints | Reads are not state changes. They are still same-origin checked and, where sensitive, session-gated. |
+
+### 2.2 Security response headers
+
+Emitted centrally on **every** response (`HttpServer::sendResponseWithHeader`):
+
+| Header | Value |
+|--------|-------|
+| `Content-Security-Policy` | `default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'` |
+| `X-Frame-Options` | `DENY` |
+| `X-Content-Type-Options` | `nosniff` |
+| `Cache-Control` | `no-store` |
+| `Referrer-Policy` | `same-origin` |
+
+The dashboard is one self-contained page with inline `<script>`/`<style>` and no external
+origins, which is why the policy can be this tight.
+
+There is deliberately **no** `Strict-Transport-Security`. The dashboard is plain HTTP on a
+LAN appliance; pinning HSTS would make the device permanently unreachable over `http://`
+with no way for a user to override it.
+
 ---
 
 ## 3. Captive Portal Redirect Mechanism
@@ -103,28 +152,40 @@ When booting into onboarding mode, the device intercepts client browser check do
 
 ## 4. REST API Endpoint Catalog
 
+> **Reading the "Auth Required" column.** "Gated" means the request goes through
+> `HttpServer::requireAdmin()`: same-origin, plus — once the device is provisioned — a
+> valid `pd_session` cookie, plus (for mutating requests) a matching `X-CSRF` token.
+> While the device is **unprovisioned** the session and token checks are skipped so
+> onboarding remains possible (§2.1). Endpoints marked "None" are read-only and
+> intentionally reachable without a session.
+
 | Endpoint | Method | Security Level | Auth Required | Description |
 | :--- | :---: | :---: | :---: | :--- |
 | [`/`](#get-) | `GET` | Low | None | Serves the web dashboard HTML interface. |
 | [`/api/status`](#get-apistatus) | `GET` | Low | None | Retrieves registrar uptime, packet statistics, active extensions, and ongoing sessions. |
-| [`/api/kill`](#post-apikill) | `POST` | High | Same-Origin (+session once provisioned) | Forcefully disconnects and de-registers an active SIP extension. |
+| [`/api/kill`](#post-apikill) | `POST` | High | Gated (+ `X-CSRF`) | Forcefully disconnects and de-registers an active SIP extension. |
 | [`/api/cdr`](#get-apicdr) | `GET` | Low | None | Returns the in-memory Call Detail Record ring (most recent calls, newest first). |
-| [`/api/pcap`](#get-apipcap) | `GET` | Medium | Session once provisioned | Downloads the last `POCKETDIAL_PCAP_RING_SIZE` SIP signaling packets as a `.pcap` (Wireshark-readable). |
-| [`/api/diagnostics/pcap`](#get-apipcap) | `GET` | Medium | Session once provisioned | Alias for `/api/pcap` (Issue #33's originally-requested path) — identical response, same ring, same gate. |
-| [`/api/trace`](#get-apitrace) | `GET` | Medium | Session once provisioned | The same capture ring as JSON, for the dashboard's polling live SIP tracer. |
+| [`/api/pcap`](#get-apipcap) | `GET` | Medium | Gated (same-origin + session once provisioned) | Downloads the last `POCKETDIAL_PCAP_RING_SIZE` SIP signaling packets as a `.pcap` (Wireshark-readable). |
+| [`/api/diagnostics/pcap`](#get-apipcap) | `GET` | Medium | Gated (same-origin + session once provisioned) | Alias for `/api/pcap` (Issue #33's originally-requested path) — identical response, same ring, same gate. |
+| [`/api/trace`](#get-apitrace) | `GET` | Medium | Gated (same-origin + session once provisioned) | The same capture ring as JSON, for the dashboard's polling live SIP tracer. |
 | [`/config/<mac>.cfg`](#get-configmaccfg) | `GET` | Low | None (MAC is the bearer token) | Yealink auto-provisioning config for an already-adopted device. |
-| [`/api/dnd`](#post-apidnd) | `POST` | High | Same-Origin (+session once provisioned) | Sets or clears Do-Not-Disturb on an extension. |
-| [`/api/forward`](#post-apiforward) | `POST` | High | Same-Origin (+session once provisioned) | Configures call forwarding (`always`/`busy`/`noanswer`) for an extension. |
-| [`/api/group`](#post-apigroup) | `POST` | High | Same-Origin (+session once provisioned) | Creates, updates, or deletes a ring/hunt group. |
-| [`/api/dialplan`](#post-apidialplan) | `POST` | High | Same-Origin (+session once provisioned) | Creates, updates, or deletes one dial-plan rule (pattern → action). |
+| [`/api/dnd`](#post-apidnd) | `POST` | High | Gated (+ `X-CSRF`) | Sets or clears Do-Not-Disturb on an extension. |
+| [`/api/forward`](#post-apiforward) | `POST` | High | Gated (+ `X-CSRF`) | Configures call forwarding (`always`/`busy`/`noanswer`) for an extension. |
+| [`/api/group`](#post-apigroup) | `POST` | High | Gated (+ `X-CSRF`) | Creates, updates, or deletes a ring/hunt group. |
+| [`/api/dialplan`](#post-apidialplan) | `POST` | High | Gated (+ `X-CSRF`) | Creates, updates, or deletes one dial-plan rule (pattern → action). |
 | [`/api/wifi/scan`](#get-apiwifiscan) | `GET` | Low | None | Triggers a scan of nearby Wi-Fi APs and returns their SSIDs and signal strengths. |
-| [`/api/wifi/connect`](#post-apiwificonnect) | `POST` | High | Same-Origin (+session once provisioned) | Saves Wi-Fi credentials to NVS and schedules an ESP32 system reboot into Station Mode. |
-| [`/api/wifi/mode_ap`](#post-apiwifimode_ap) | `POST` | High | Same-Origin (+session once provisioned) | Sets the device to Standalone Access Point Mode and schedules a system reboot. |
-| [`/api/configuring`](#post-apiconfiguring) | `POST` | Low | None | Pauses the captive-portal auto-switch-to-Standalone decay while a user is mid-setup. |
-| [`/api/factory-reset`](#post-apifactory-reset) | `POST` | High | Same-Origin (+session once provisioned) | Wipes the admin credential and Wi-Fi/mode NVS state, then reboots to captive-portal setup. ESP-only (`501` on desktop). |
+| [`/api/wifi/connect`](#post-apiwificonnect) | `POST` | High | Gated (+ `X-CSRF`) | Saves Wi-Fi credentials to NVS and schedules an ESP32 system reboot into Station Mode. |
+| [`/api/wifi/mode_ap`](#post-apiwifimode_ap) | `POST` | High | Gated (+ `X-CSRF`) | Sets the device to Standalone Access Point Mode and schedules a system reboot. |
+| [`/api/configuring`](#post-apiconfiguring) | `POST` | Low | Gated | Pauses the captive-portal auto-switch-to-Standalone decay while a user is mid-setup. Previously ungated entirely; it still mutates device state, so it now takes the standard gate (which admits it unchanged during onboarding, the only time the portal calls it). |
+| [`/api/factory-reset`](#post-apifactory-reset) | `POST` | High | Gated (+ `X-CSRF`) | Wipes the admin credential and Wi-Fi/mode NVS state, then reboots to captive-portal setup. ESP-only (`501` on desktop). |
+| [`/api/ap-security`](#get-apiap-security) | `GET` | Medium | Gated | Reports whether the SoftAP requires WPA2 and returns its passphrase. |
+| [`/api/ap-security`](#post-apiap-security) | `POST` | High | Gated (+ `X-CSRF`) | Enables/disables WPA2 on the SoftAP and sets or regenerates the passphrase. Takes effect at the next AP bringup. |
+| [`/api/registrar`](#get-apiregistrar) | `GET` | Medium | Gated | Reports the SIP registrar admission mode and the adopted-extension roster. |
+| [`/api/registrar`](#post-apiregistrar) | `POST` | High | Gated (+ `X-CSRF`) | Sets the admission mode (`open`/`learn`/`secure`). |
+| [`/api/registrar/device`](#post-apiregistrardevice) | `POST` | High | Gated (+ `X-CSRF`) | Secures (MAC-locks + digest-enforces) or forgets one adopted device. |
 | [`/api/ota/status`](#get-apiotastatus) | `GET` | Low | None | Reports the running/boot/next OTA partition labels and pending-verify flag. |
-| [`/api/ota/upload`](#post-apiotaupload) | `POST` | High | Same-Origin (+session once provisioned) | Streams a firmware image into the inactive OTA slot. ESP-only (`501` on desktop). |
-| [`/api/ota/reboot`](#post-apiotareboot) | `POST` | High | Same-Origin (+session once provisioned) | Reboots into the freshly staged OTA image. Simulated (`200`, no-op) on desktop. |
+| [`/api/ota/upload`](#post-apiotaupload) | `POST` | High | Gated (+ `X-CSRF`) | Streams a firmware image into the inactive OTA slot. ESP-only (`501` on desktop). |
+| [`/api/ota/reboot`](#post-apiotareboot) | `POST` | High | Gated (+ `X-CSRF`) | Reboots into the freshly staged OTA image. Simulated (`200`, no-op) on desktop. |
 
 ---
 
@@ -333,6 +394,127 @@ Sets the operational mode of the device back to **Standalone Access Point Mode**
 ```
 
 ---
+
+### `GET /api/registrar`
+
+Reports how a `REGISTER` is admitted, and which phones have been adopted.
+
+```json
+{
+  "attached": true,
+  "mode": "learn",
+  "devices": [
+    { "mac": "805ec079c37f", "extension": "1001", "state": "secured", "online": true },
+    { "mac": "805ec079c380", "extension": "1002", "state": "learned",  "online": false }
+  ]
+}
+```
+
+* `attached` — `false` when the SIP engine has not been bound to the dashboard yet (an
+  unprovisioned device holds SIP dark until a credential exists). A normal transient
+  state, not an error; `mode` reads `"unknown"` and `devices` is empty.
+* `mode` — `open`, `learn` or `secure` (see `POST` below).
+* `state` — `learned` (adopted on first contact, not yet enforced) or `secured`
+  (MAC-locked and digest-enforced for its extension).
+* `online` — volatile registration state; never persisted.
+
+> **Why this endpoint exists.** SIP digest authentication has been implemented and tested
+> for some time, but `setRegistrarMode()` was called from **unit tests only** — nothing in
+> production ever wrote the persisted `reg_mode`, so every device came up in the
+> compiled-in `open` default and stayed there regardless of what the docs claimed. This
+> and the flash-time `cfgseed` field are what make it operable.
+
+### `POST /api/registrar`
+
+| Param | Values | Effect |
+| :--- | :--- | :--- |
+| `mode` | `open` \| `learn` \| `secure` | Required. The admission policy. |
+| `confirm` | `LOCKOUT` | Only consulted when switching to `secure`; see below. |
+
+* **`open`** — every `REGISTER` is accepted with no credential. The shipped default. Any
+  endpoint on the link can register as any extension and tear down calls with a spoofed
+  `BYE`. Fine for a lab; not for a shared link.
+* **`learn`** — trust-on-first-use. An unknown MAC registering an unclaimed extension is
+  adopted and locked to it, while already-secured devices stay digest-enforced. A
+  deliberate, **temporary** weakening to adopt an existing fleet — bound the window, review
+  the roster, then move on. Run it on a trusted/WPA2 link.
+* **`secure`** — every `REGISTER` is digest-challenged; an extension is registrable only by
+  a party that knows its secret.
+
+Switching to `secure` while **no** extension is yet `secured` is refused with `409`:
+
+```json
+{ "error": "no extensions are secured yet; switching to secure now would reject every phone. Adopt them in learn mode first, or resend with confirm=LOCKOUT to override." }
+```
+
+That transition would otherwise reject every handset at once, leaving no working phone to
+notice with. Resend with `confirm=LOCKOUT` to override — the same shape as
+`/api/factory-reset`'s `confirm=ERASE`.
+
+Responds with the same body as the `GET`.
+
+### `POST /api/registrar/device`
+
+| Param | Values | Effect |
+| :--- | :--- | :--- |
+| `action` | `secure` \| `forget` | Required. |
+| `target` | 12-hex MAC, or an extension | Required. An extension resolves to the device currently bound to it. |
+
+`secure` promotes a `learned` device to `secured`. `forget` drops the adoption record
+entirely — in `learn` mode the phone is re-adopted on its next registration, which is the
+way to re-home an extension to different hardware.
+
+`404` if no adopted device matches. Responds with the same body as the `GET`.
+
+> **The MAC lock is not a cryptographic boundary.** It is learned from the ARP table, and
+> ARP/MAC are spoofable on a hostile L2. It defeats accidental collisions and casual
+> impersonation and composes with digest auth as defence in depth — it is not a substitute
+> for it. See [THREAT_MODEL.md](THREAT_MODEL.md) §9.2 E-3.
+
+### `GET /api/ap-security`
+
+Reports the SoftAP's security setting and its passphrase.
+
+```json
+{ "secure": false, "psk": "DD9T4GZKQ4AHY5KGRZP8" }
+```
+
+* `secure` — `true` when the standalone SoftAP comes up `WIFI_AUTH_WPA2_PSK`. **Defaults
+  to `false`**: enabling WPA2 forces every already-associated phone to be re-paired, so it
+  is an explicit operator action rather than something a firmware update does to a live
+  fleet.
+* `psk` — the device's own passphrase, generated from the hardware CSPRNG on first access
+  and stored in NVS. 20 characters from an alphabet with no ambiguous glyphs (no `0`/`O`,
+  `1`/`I`/`L`, `U`), because it gets read off a small LCD or a serial log and retyped into
+  a desk phone.
+
+Returning the passphrase in clear to an authenticated admin is deliberate — on the
+headless `eth`/`wifi` builds this response is the only way to learn it, and it is exactly
+what the operator needs in order to re-associate the phones.
+
+### `POST /api/ap-security`
+
+Form-encoded. All parameters optional; omitted ones are left unchanged.
+
+| Param | Values | Effect |
+| :--- | :--- | :--- |
+| `secure` | `1`/`true`/`0`/`false` | Enable or disable WPA2 on the standalone SoftAP. |
+| `psk` | 8-63 printable ASCII | Set the passphrase explicitly. Rejected with `400` if out of range, leaving the stored value untouched. |
+| `regenerate` | `1`/`true` | Replace the passphrase with a freshly generated one. |
+
+Responds with the same body as the `GET`. **The radio is not restarted**: doing so would
+drop the client that just made the request — losing the response, and the passphrase it
+still has to display — and would tear down live calls. The change lands at the next AP
+bringup.
+
+```
+POST /api/ap-security HTTP/1.1
+Host: 192.168.4.1
+Content-Type: application/x-www-form-urlencoded
+X-CSRF: 3f2a...e91c
+
+secure=1&psk=DD9T4GZKQ4AHY5KGRZP8
+```
 
 ### `GET /api/cdr`
 Returns the in-memory Call Detail Record ring (most recent calls first). Read-only, ungated — same reachability posture as `/api/status`.

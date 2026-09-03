@@ -5,7 +5,7 @@ test call. It assumes a Wi-Fi SoftAP build (the default standalone Access Point 
 notes call out where the wired-Ethernet and touch-display variants differ.
 
 If you have not flashed firmware yet, do that first — see the build instructions in
-[../README.md](../README.md#building) and, for updating an already-flashed device,
+[../README.md](../README.md#building--testing) and, for updating an already-flashed device,
 [OTA.md](OTA.md). This document picks up **after** the firmware is on the board.
 
 **What you will do:**
@@ -38,14 +38,42 @@ dashboard to `192.168.4.1:80`.
 
 1. Power the board over USB-C (or PoE on a wired board).
 2. On your laptop or phone, open Wi-Fi settings and join **`esp32-sipserver`**. No
-   password is required.
+   password is required *unless* access-point security has been switched on (below).
 3. Wait for your client to receive a DHCP lease (an address in the `192.168.4.x` range).
 
 > [!IMPORTANT]
-> The SoftAP is **open** by default — anyone in radio range can join. Treat the device
-> as exposed to everyone on its link and set the admin PIN immediately (step 3). See
-> [THREAT_MODEL.md](THREAT_MODEL.md) for the full security posture and the recommended
-> WPA2 hardening.
+> The SoftAP is **open by default** — anyone in radio range can join, and the dashboard,
+> SIP signalling and call audio all cross that link in the clear. Set the admin PIN
+> immediately (step 3), then **turn access-point security on** — it is the single most
+> effective hardening available on this device, because it encrypts all three at once.
+> See [THREAT_MODEL.md](THREAT_MODEL.md) §6.
+
+### Turning on access-point security (WPA2)
+
+It is **off by default on purpose**: switching it on forces every phone already
+associated with the access point to be re-paired, so it is never done to a live fleet
+by a firmware update. Enable it deliberately, in one of two ways:
+
+* **From the dashboard** — *Admin / Security & Firmware* → *Wi-Fi Access Point Security*.
+  Tick the box and save. The change takes effect the next time the access point starts.
+* **At flash time** — the [browser flasher](https://glomargadaffi.github.io/pocket-dial/flasher/)
+  can write the setting and the passphrase directly to the board. This is the easiest
+  route for the headless `esp32s3-eth` / `esp32s3-wifi` variants.
+
+**Finding the passphrase.** The device generates its own, per unit — there is no
+factory default, and nothing is baked into the firmware image. It is 20 characters from
+an alphabet with no ambiguous glyphs (no `0`/`O`, no `1`/`I`/`L`), so it survives being
+read off a screen and retyped into a desk phone. Read it from whichever applies:
+
+| Build | Where the passphrase appears |
+|-------|------------------------------|
+| `display` | On the LVGL screen during captive-portal onboarding |
+| `wifi` / `eth` (headless) | Logged over serial at boot (`idf.py monitor`) |
+| Any | The dashboard panel above, once logged in as admin |
+| Any | The browser flasher, if you set it at flash time |
+
+You can rotate it from the same dashboard panel. Write the new one down **before**
+restarting the access point — rotating it drops every associated phone.
 
 ### Variant: captive-portal onboarding (touch-display build)
 
@@ -230,7 +258,7 @@ registered extension** at once, injecting auto-answer headers; the first device 
 
 ## 6. Quick-start checklist
 
-- [ ] Firmware flashed (see [README.md](../README.md#building) / [OTA.md](OTA.md)).
+- [ ] Firmware flashed (see [README.md](../README.md#building--testing) / [OTA.md](OTA.md)).
 - [ ] Powered on; joined Wi-Fi SSID **`esp32-sipserver`** (open) — or completed the
       `My-Ap` captive portal on the display build.
 - [ ] Dashboard reachable at `http://192.168.4.1` (or `http://pocketdial.local`).

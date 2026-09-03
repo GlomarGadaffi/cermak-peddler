@@ -38,6 +38,7 @@
 #include "HttpServer.hpp"
 #include "OtaUpdater.hpp"
 #include "DnsServer.hpp"
+#include "DeviceConfig.hpp"
 #include "IPHelper.hpp"
 #include "host_compat.h"
 
@@ -62,9 +63,27 @@ static const char *TAG = "main_display";
 // the microSD CMD/CLK lines on this board. We therefore drive touch in polled mode
 // (int/rst = GPIO_NUM_NC); see hardware_touch_init().
 
-// Onboarding credentials
+// Onboarding credentials.
+//
+// ONBOARDING_PASS used to be the literal "12345678", baked into every unit and
+// published in this repo. The captive-portal AP below is WPA_WPA2_PSK, so the
+// encryption was purely decorative: anyone within radio range knew the key, and
+// with it the dashboard, the SIP signalling and the RTP media on that AP. The
+// passphrase is now per-device, generated from the hardware CSPRNG on first use
+// and persisted in NVS — see DeviceConfig.hpp. It is still shown on the LVGL
+// onboarding screen (and encoded into the join QR), which is the whole reason
+// this variant can afford a secret nobody wrote down in advance.
 #define ONBOARDING_SSID "My-Ap"
-#define ONBOARDING_PASS "12345678"
+
+// Standalone (normal operating) AP SSID. Named once because it is now used twice:
+// by the bringup AND by the on-glass credentials splash, which would silently show
+// the wrong network to join if the two ever drifted apart.
+#define STANDALONE_SSID "esp32-sipserver"
+
+// Cached at boot in app_main() and held for the process lifetime. ui.cpp copies
+// the string into its labels/QR immediately, but the AP itself is re-read on any
+// later bringup, so a file-scope home for it is both cheap and unambiguous.
+static std::string g_apPsk;
 
 // Active server objects. g_sipServer is built by sip_server_task and read by the
 // http/status tasks; atomic with acquire/release so a reader never observes a
@@ -615,6 +634,19 @@ extern "C" void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
+    // Flash-time configuration seed. Must land AFTER nvs_flash_init() (it writes
+    // NVS) and BEFORE the wifi_mode / wifi_ssid / wifi_pass read further down, so
+    // a board configured by the browser flasher boots straight into its configured
+    // role instead of the captive portal. No cfgseed partition (OTA-updated units,
+    // the 4MB constrained layout) → returns false and changes nothing.
+    if (DeviceConfig::applyFlashSeed()) {
+        ESP_LOGI(TAG, "[boot] applied flash-time cfgseed");
+    }
+
+    // The AP passphrase is generated on first access, so pull it once here — well
+    // before any bringup path needs it — rather than at three separate call sites.
+    g_apPsk = DeviceConfig::getApPsk();
+
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
@@ -810,10 +842,37 @@ extern "C" void app_main(void) {
     }
 
     if (go_standalone) { // ─── Standalone AP (explicit radio choice, or decayed fallback) ───
-        ESP_LOGI(TAG, "Standalone AP Mode (open network, SIP up).");
-        if (lvgl_lock(-1)) { ui_set_onboarding_mode(false); lvgl_unlock(); }
+        // Standalone used to be unconditionally open. It now follows the operator's
+        // DeviceConfig choice, which still DEFAULTS to open so an already-deployed
+        // fleet is not cut off by a firmware update (see DeviceConfig.hpp).
+        const bool ap_secure = DeviceConfig::isApSecure();
+        ESP_LOGI(TAG, "Standalone AP Mode (%s, SIP up).", ap_secure ? "WPA2-PSK" : "open network");
+        if (ap_secure) {
+            // Also logged to serial for anyone with a cable (already inside the
+            // physical trust boundary) and for CI captures — but serial is no longer
+            // the ONLY place this appears: on this variant the passphrase is now put
+            // on the glass by ui_show_ap_credentials() below, which is the whole
+            // point of the board having a screen.
+            ESP_LOGI(TAG, "Standalone AP passphrase (WPA2): %s", g_apPsk.c_str());
+        }
+        if (lvgl_lock(-1)) {
+            ui_set_onboarding_mode(false);
+            if (ap_secure) {
+                // A timed, dismissible splash over the live wallboard — NOT an
+                // onboarding screen: standalone is the normal operating state, so
+                // the board must not be trapped in a setup view. It clears itself
+                // after ~90 s (or on a tap) and a long press re-summons it. Nothing
+                // is shown for an open AP; there is no passphrase to read.
+                //
+                // Deliberately BEFORE wifi_init_softap(): the SSID string below is a
+                // compile-time literal, so the credentials on the glass are correct
+                // the moment the radio comes up rather than a second later.
+                ui_show_ap_credentials(STANDALONE_SSID, g_apPsk.c_str());
+            }
+            lvgl_unlock();
+        }
         g_localIp = "192.168.4.1";
-        wifi_init_softap("esp32-sipserver", "", true); // open network
+        wifi_init_softap(STANDALONE_SSID, g_apPsk.c_str(), !ap_secure);
         xTaskCreatePinnedToCore(&sip_server_task,  "sip_server_task",  8192, NULL, 5, NULL, 0);
         xTaskCreatePinnedToCore(&http_server_task, "http_server_task", 8192, NULL, 4, NULL, 0);
         g_setupComplete = true;
@@ -821,8 +880,13 @@ extern "C" void app_main(void) {
 
     if (go_captive) { // ─── Captive portal onboarding + decay watchdog ───
         ESP_LOGI(TAG, "Captive portal Setup AP: SSID=%s", ONBOARDING_SSID);
-        if (lvgl_lock(-1)) { ui_set_onboarding_mode(true, ONBOARDING_SSID, ONBOARDING_PASS); lvgl_unlock(); }
-        wifi_init_softap(ONBOARDING_SSID, ONBOARDING_PASS, false); // secure onboarding AP
+        // The generated passphrase is rendered on the LVGL onboarding screen and
+        // encoded into the join QR by ui_set_onboarding_mode(), which is what makes
+        // a per-device secret usable here at all — the operator reads it off the
+        // glass instead of off this source file. Also logged for the serial console.
+        ESP_LOGI(TAG, "Captive portal passphrase (WPA2): %s", g_apPsk.c_str());
+        if (lvgl_lock(-1)) { ui_set_onboarding_mode(true, ONBOARDING_SSID, g_apPsk.c_str()); lvgl_unlock(); }
+        wifi_init_softap(ONBOARDING_SSID, g_apPsk.c_str(), false); // secure onboarding AP
 
         // DNS redirect (port 53) + config web portal (port 80), both at 192.168.4.1
         g_dnsServer = new DnsServer();

@@ -4,6 +4,7 @@
 #include "DialPlan.hpp"          // Issue #69: dial-rule validation shared with setDialRule
 #include "CallDetailRecord.hpp"
 #include "AdminAuth.hpp"
+#include "DeviceConfig.hpp"
 #include "OtaUpdater.hpp"
 #include "ProvisioningConfig.hpp"
 #include "index_html.h"
@@ -251,6 +252,27 @@ void HttpServer::acceptLoop()
 
 void HttpServer::handleClient(int clientSock)
 {
+	// Peer address, for per-client brute-force accounting on /api/admin/login.
+	// Best-effort: an empty string falls back to AdminAuth's shared unkeyed
+	// bucket, which is the old global behaviour rather than an open door.
+	std::string peerIp;
+	{
+		struct sockaddr_in peer{};
+#if defined _WIN32 || defined _WIN64
+		int peerLen = static_cast<int>(sizeof(peer));
+#else
+		socklen_t peerLen = sizeof(peer);
+#endif
+		if (getpeername(clientSock, reinterpret_cast<struct sockaddr*>(&peer), &peerLen) == 0)
+		{
+			char ipbuf[INET_ADDRSTRLEN] = {0};
+			if (inet_ntop(AF_INET, &peer.sin_addr, ipbuf, sizeof(ipbuf)) != nullptr)
+			{
+				peerIp = ipbuf;
+			}
+		}
+	}
+
 	// Issue #23 resolved: Added SO_RCVTIMEO per-client socket timeout and capped Content-Length to 16KB to prevent Accept thread DoS
 #if defined _WIN32 || defined _WIN64
 	DWORD tv = 5000; // 5 seconds timeout
@@ -260,9 +282,12 @@ void HttpServer::handleClient(int clientSock)
 	setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
 
-	// Heap-allocate the read buffer. On ESP32 the accept loop runs on a std::thread
-	// whose default pthread stack is ~3 KB; a 4 KB stack-local buffer would overflow
-	// on the first request. Using std::vector keeps the data on the heap.
+	// Heap-allocate the read buffer. On ESP32 each connection runs on a detached
+	// std::thread, i.e. an IDF pthread; sdkconfig.defaults sets
+	// CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192, so a 4 KB stack-local buffer
+	// would consume half the stack before any handler ran. Using std::vector keeps
+	// the data on the heap. (This comment previously claimed a ~3 KB stack, which
+	// has not matched sdkconfig for some time.)
 	std::vector<char> buf(4096, 0);
 
 	// Read initial data. A follow-up loop below handles POST bodies that span
@@ -305,20 +330,13 @@ void HttpServer::handleClient(int clientSock)
 				// Parse just the header block (parseRequest tolerates a truncated
 				// body) to get method/path/origin/host/cookie for the auth gate.
 				HttpRequest otaReq = parseRequest(raw.substr(0, hdrEnd + 4));
+				otaReq.clientIp = peerIp;
 
-				// Same-origin + (provisioned ? authed) gate — identical policy to
-				// the other mutating endpoints.
-				if (!isSameOrigin(otaReq))
+				// Same gate as every other mutating endpoint. Flashing firmware is
+				// the most consequential thing this server does, so it gets the CSRF
+				// check too — the dashboard's upload path sends the token.
+				if (!requireAdmin(clientSock, otaReq, true))
 				{
-					sendResponse(clientSock, 403, "Forbidden", "application/json",
-					             "{\"error\":\"cross-origin request rejected\"}");
-					closeSocket(clientSock);
-					return;
-				}
-				if (AdminAuth::isProvisioned() && !isAuthed(otaReq))
-				{
-					sendResponse(clientSock, 401, "Unauthorized", "application/json",
-					             "{\"error\":\"authentication required\"}");
 					closeSocket(clientSock);
 					return;
 				}
@@ -431,7 +449,7 @@ void HttpServer::handleClient(int clientSock)
 	// Route
 	if (req.method == "GET" && (req.path == "/" || req.path == "/index.html"))
 	{
-		sendHtml(clientSock);
+		sendHtml(clientSock, req);
 	}
 	else if (req.method == "GET" && isProvisioningConfigPath(req.path))
 	{
@@ -449,17 +467,7 @@ void HttpServer::handleClient(int clientSock)
 	}
 	else if (req.method == "POST" && req.path == "/api/kill")
 	{
-		if (!isSameOrigin(req))
-		{
-			sendResponse(clientSock, 403, "Forbidden", "application/json",
-			             "{\"error\":\"cross-origin request rejected\"}");
-		}
-		else if (AdminAuth::isProvisioned() && !isAuthed(req))
-		{
-			sendResponse(clientSock, 401, "Unauthorized", "application/json",
-			             "{\"error\":\"authentication required\"}");
-		}
-		else
+		if (requireAdmin(clientSock, req, true))
 		{
 			sendApiKill(clientSock, req.body);
 		}
@@ -473,12 +481,7 @@ void HttpServer::handleClient(int clientSock)
 	{
 		// Session-gated (see sendApiPcap): full message bytes are more sensitive
 		// than /api/cdr's call metadata.
-		if (AdminAuth::isProvisioned() && !isAuthed(req))
-		{
-			sendResponse(clientSock, 401, "Unauthorized", "application/json",
-			             "{\"error\":\"authentication required\"}");
-		}
-		else
+		if (requireAdmin(clientSock, req, false))
 		{
 			sendApiPcap(clientSock);
 		}
@@ -486,12 +489,7 @@ void HttpServer::handleClient(int clientSock)
 	else if (req.method == "GET" && req.path == "/api/trace")
 	{
 		// Same sensitivity/gate as /api/pcap — this is the same capture ring.
-		if (AdminAuth::isProvisioned() && !isAuthed(req))
-		{
-			sendResponse(clientSock, 401, "Unauthorized", "application/json",
-			             "{\"error\":\"authentication required\"}");
-		}
-		else
+		if (requireAdmin(clientSock, req, false))
 		{
 			sendApiTrace(clientSock);
 		}
@@ -504,12 +502,7 @@ void HttpServer::handleClient(int clientSock)
 		// work without `-L`, and there is no second capture mechanism here:
 		// sendApiPcap() reads the same PcapCapture ring either way. Same
 		// sensitivity/gate as /api/pcap for the same reason.
-		if (AdminAuth::isProvisioned() && !isAuthed(req))
-		{
-			sendResponse(clientSock, 401, "Unauthorized", "application/json",
-			             "{\"error\":\"authentication required\"}");
-		}
-		else
+		if (requireAdmin(clientSock, req, false))
 		{
 			sendApiPcap(clientSock);
 		}
@@ -517,17 +510,7 @@ void HttpServer::handleClient(int clientSock)
 	else if (req.method == "POST" && req.path == "/api/dnd")
 	{
 		// Mutating: same gate as /api/kill (same-origin + auth once provisioned).
-		if (!isSameOrigin(req))
-		{
-			sendResponse(clientSock, 403, "Forbidden", "application/json",
-			             "{\"error\":\"cross-origin request rejected\"}");
-		}
-		else if (AdminAuth::isProvisioned() && !isAuthed(req))
-		{
-			sendResponse(clientSock, 401, "Unauthorized", "application/json",
-			             "{\"error\":\"authentication required\"}");
-		}
-		else
+		if (requireAdmin(clientSock, req, true))
 		{
 			sendApiDnd(clientSock, req.body);
 		}
@@ -535,17 +518,7 @@ void HttpServer::handleClient(int clientSock)
 	else if (req.method == "POST" && req.path == "/api/forward")
 	{
 		// Mutating: same gate as /api/dnd (same-origin + auth once provisioned).
-		if (!isSameOrigin(req))
-		{
-			sendResponse(clientSock, 403, "Forbidden", "application/json",
-			             "{\"error\":\"cross-origin request rejected\"}");
-		}
-		else if (AdminAuth::isProvisioned() && !isAuthed(req))
-		{
-			sendResponse(clientSock, 401, "Unauthorized", "application/json",
-			             "{\"error\":\"authentication required\"}");
-		}
-		else
+		if (requireAdmin(clientSock, req, true))
 		{
 			sendApiForward(clientSock, req.body);
 		}
@@ -553,17 +526,7 @@ void HttpServer::handleClient(int clientSock)
 	else if (req.method == "POST" && req.path == "/api/group")
 	{
 		// Mutating: same gate as /api/dnd (same-origin + auth once provisioned).
-		if (!isSameOrigin(req))
-		{
-			sendResponse(clientSock, 403, "Forbidden", "application/json",
-			             "{\"error\":\"cross-origin request rejected\"}");
-		}
-		else if (AdminAuth::isProvisioned() && !isAuthed(req))
-		{
-			sendResponse(clientSock, 401, "Unauthorized", "application/json",
-			             "{\"error\":\"authentication required\"}");
-		}
-		else
+		if (requireAdmin(clientSock, req, true))
 		{
 			sendApiGroup(clientSock, req.body);
 		}
@@ -571,17 +534,7 @@ void HttpServer::handleClient(int clientSock)
 	else if (req.method == "POST" && req.path == "/api/dialplan")
 	{
 		// Mutating: same gate as /api/group (same-origin + auth once provisioned).
-		if (!isSameOrigin(req))
-		{
-			sendResponse(clientSock, 403, "Forbidden", "application/json",
-			             "{\"error\":\"cross-origin request rejected\"}");
-		}
-		else if (AdminAuth::isProvisioned() && !isAuthed(req))
-		{
-			sendResponse(clientSock, 401, "Unauthorized", "application/json",
-			             "{\"error\":\"authentication required\"}");
-		}
-		else
+		if (requireAdmin(clientSock, req, true))
 		{
 			sendApiDialPlan(clientSock, req.body);
 		}
@@ -592,59 +545,72 @@ void HttpServer::handleClient(int clientSock)
 	}
 	else if (req.method == "POST" && req.path == "/api/wifi/connect")
 	{
-		if (!isSameOrigin(req))
-		{
-			sendResponse(clientSock, 403, "Forbidden", "application/json",
-			             "{\"error\":\"cross-origin request rejected\"}");
-		}
-		else if (AdminAuth::isProvisioned() && !isAuthed(req))
-		{
-			sendResponse(clientSock, 401, "Unauthorized", "application/json",
-			             "{\"error\":\"authentication required\"}");
-		}
-		else
+		if (requireAdmin(clientSock, req, true))
 		{
 			sendApiWifiConnect(clientSock, req.body);
 		}
 	}
 	else if (req.method == "POST" && req.path == "/api/wifi/mode_ap")
 	{
-		if (!isSameOrigin(req))
-		{
-			sendResponse(clientSock, 403, "Forbidden", "application/json",
-			             "{\"error\":\"cross-origin request rejected\"}");
-		}
-		else if (AdminAuth::isProvisioned() && !isAuthed(req))
-		{
-			sendResponse(clientSock, 401, "Unauthorized", "application/json",
-			             "{\"error\":\"authentication required\"}");
-		}
-		else
+		if (requireAdmin(clientSock, req, true))
 		{
 			sendApiWifiModeAp(clientSock);
 		}
 	}
 	else if (req.method == "POST" && req.path == "/api/configuring")
 	{
-		// "I'm configuring" — hold the captive-portal decay so it doesn't switch to
-		// Standalone out from under the user. Harmless, so no same-origin gate.
-		sendApiConfiguring(clientSock);
+		// "I'm configuring" — hold the captive-portal decay so it doesn't switch
+		// to Standalone out from under the user. Previously ungated entirely on a
+		// "harmless" argument; it still moves device state on a POST, so it now
+		// takes the standard gate. Unprovisioned (i.e. mid-onboarding, which is the
+		// only time the captive portal calls it) requireAdmin admits it unchanged.
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiConfiguring(clientSock);
+		}
 	}
 	else if (req.method == "POST" && req.path == "/api/factory-reset")
 	{
-		if (!isSameOrigin(req))
-		{
-			sendResponse(clientSock, 403, "Forbidden", "application/json",
-			             "{\"error\":\"cross-origin request rejected\"}");
-		}
-		else if (AdminAuth::isProvisioned() && !isAuthed(req))
-		{
-			sendResponse(clientSock, 401, "Unauthorized", "application/json",
-			             "{\"error\":\"authentication required\"}");
-		}
-		else
+		if (requireAdmin(clientSock, req, true))
 		{
 			sendApiFactoryReset(clientSock, req.body);
+		}
+	}
+	else if (req.method == "GET" && req.path == "/api/ap-security")
+	{
+		// Returns the AP passphrase in clear to an authenticated admin — that is
+		// the point: on the headless builds this is the only way to read it.
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiApSecurity(clientSock);
+		}
+	}
+	else if (req.method == "POST" && req.path == "/api/ap-security")
+	{
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiApSecuritySet(clientSock, req.body);
+		}
+	}
+	else if (req.method == "GET" && req.path == "/api/registrar")
+	{
+		if (requireAdmin(clientSock, req, false))
+		{
+			sendApiRegistrar(clientSock);
+		}
+	}
+	else if (req.method == "POST" && req.path == "/api/registrar")
+	{
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiRegistrarSet(clientSock, req.body);
+		}
+	}
+	else if (req.method == "POST" && req.path == "/api/registrar/device")
+	{
+		if (requireAdmin(clientSock, req, true))
+		{
+			sendApiRegistrarDevice(clientSock, req.body);
 		}
 	}
 	else if (req.method == "GET" && req.path == "/api/admin/status")
@@ -654,48 +620,30 @@ void HttpServer::handleClient(int clientSock)
 	}
 	else if (req.method == "POST" && req.path == "/api/admin/set-pin")
 	{
-		if (!isSameOrigin(req))
-		{
-			sendResponse(clientSock, 403, "Forbidden", "application/json",
-			             "{\"error\":\"cross-origin request rejected\"}");
-		}
-		else
+		// Unprovisioned this is onboarding (requireAdmin admits it); provisioned it
+		// is a credential change, so it needs the session and the CSRF token.
+		if (requireAdmin(clientSock, req, true))
 		{
 			sendApiAdminSetPin(clientSock, req);
 		}
 	}
 	else if (req.method == "POST" && req.path == "/api/admin/login")
 	{
-		if (!isSameOrigin(req))
-		{
-			sendResponse(clientSock, 403, "Forbidden", "application/json",
-			             "{\"error\":\"cross-origin request rejected\"}");
-		}
-		else
+		if (requireSameOrigin(clientSock, req))
 		{
 			sendApiAdminLogin(clientSock, req);
 		}
 	}
 	else if (req.method == "POST" && req.path == "/api/admin/logout")
 	{
-		if (!isSameOrigin(req))
-		{
-			sendResponse(clientSock, 403, "Forbidden", "application/json",
-			             "{\"error\":\"cross-origin request rejected\"}");
-		}
-		else
+		if (requireSameOrigin(clientSock, req))
 		{
 			sendApiAdminLogout(clientSock, req);
 		}
 	}
 	else if (req.method == "POST" && req.path == "/api/admin/keepalive")
 	{
-		if (!isSameOrigin(req))
-		{
-			sendResponse(clientSock, 403, "Forbidden", "application/json",
-			             "{\"error\":\"cross-origin request rejected\"}");
-		}
-		else
+		if (requireAdmin(clientSock, req, true))
 		{
 			sendApiAdminKeepAlive(clientSock, req);
 		}
@@ -708,17 +656,7 @@ void HttpServer::handleClient(int clientSock)
 	}
 	else if (req.method == "POST" && req.path == "/api/ota/reboot")
 	{
-		if (!isSameOrigin(req))
-		{
-			sendResponse(clientSock, 403, "Forbidden", "application/json",
-			             "{\"error\":\"cross-origin request rejected\"}");
-		}
-		else if (AdminAuth::isProvisioned() && !isAuthed(req))
-		{
-			sendResponse(clientSock, 401, "Unauthorized", "application/json",
-			             "{\"error\":\"authentication required\"}");
-		}
-		else
+		if (requireAdmin(clientSock, req, true))
 		{
 			sendApiOtaReboot(clientSock);
 		}
@@ -773,7 +711,8 @@ HttpServer::HttpRequest HttpServer::parseRequest(const std::string& raw)
 				// Strip trailing whitespaces from name
 				while (!hName.empty() && std::isspace(static_cast<unsigned char>(hName.back()))) hName.pop_back();
 
-				if (hName == "origin" || hName == "host" || hName == "cookie") {
+				if (hName == "origin" || hName == "host" || hName == "cookie" ||
+				    hName == "x-csrf") {
 					size_t valStart = colon + 1;
 					while (valStart < line.size() && std::isspace(static_cast<unsigned char>(line[valStart]))) valStart++;
 					std::string hVal = line.substr(valStart);
@@ -781,6 +720,7 @@ HttpServer::HttpRequest HttpServer::parseRequest(const std::string& raw)
 					if (hName == "origin") req.origin = hVal;
 					else if (hName == "host") req.host = hVal;
 					else if (hName == "cookie") req.cookie = hVal;
+					else if (hName == "x-csrf") req.csrf = hVal;
 				}
 			}
 			pos = lineEnd + 2;
@@ -807,6 +747,25 @@ void HttpServer::sendResponseWithHeader(int sock, int statusCode, const std::str
 	resp << "Content-Length: " << body.size() << "\r\n";
 	// No Access-Control-Allow-Origin header: wildcard CORS would allow any
 	// browser tab on the same AP to fire side-effecting POSTs without a preflight.
+
+	// --- Security headers, emitted centrally so no endpoint can forget them ---
+	// The dashboard is a single self-contained page with inline <script>/<style>
+	// and no external origins, so the policy can be this tight: nothing loads
+	// from anywhere, the page cannot be framed, and XHR/fetch is same-origin.
+	resp << "Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; "
+	        "style-src 'unsafe-inline'; img-src data:; connect-src 'self'; "
+	        "form-action 'self'; frame-ancestors 'none'; base-uri 'none'\r\n";
+	resp << "X-Frame-Options: DENY\r\n";
+	resp << "X-Content-Type-Options: nosniff\r\n";
+	// Responses carry call metadata, the CSRF token and (on /api/pcap) raw SIP
+	// bytes. None of it should sit in a shared browser cache or on disk.
+	resp << "Cache-Control: no-store\r\n";
+	// same-origin, not no-referrer: the Referer header stays available as a
+	// same-origin signal, and nothing here is linked off-device anyway.
+	resp << "Referrer-Policy: same-origin\r\n";
+	// Deliberately NO Strict-Transport-Security. The dashboard is plain HTTP on
+	// a LAN appliance; pinning HSTS here would make the host unreachable over
+	// http:// forever with no way for a user to override it.
 	if (!extraHeader.empty())
 	{
 		resp << extraHeader << "\r\n";
@@ -837,10 +796,28 @@ void HttpServer::sendResponse(int sock, int statusCode, const std::string& statu
 	sendResponseWithHeader(sock, statusCode, statusText, contentType, body, "");
 }
 
-void HttpServer::sendHtml(int sock)
+void HttpServer::sendHtml(int sock, const HttpRequest& req)
 {
-	sendResponse(sock, 200, "OK", "text/html; charset=utf-8",
-	             std::string(CGA_INDEX_HTML));
+	std::string page(CGA_INDEX_HTML);
+
+	// Bind the page to this session's CSRF token. It is rendered INTO the
+	// document rather than set as a cookie: the browser attaches cookies to
+	// same-site requests on its own, so a cookie would be forged as easily as the
+	// session itself, whereas a value a cross-origin page cannot read has to be
+	// echoed back deliberately by our own JavaScript.
+	//
+	// An unauthenticated load substitutes an empty token, which is correct: there
+	// is no session yet, and the login response carries the token the page then
+	// uses without needing a reload.
+	const std::string token = AdminAuth::sessionCsrf(sessionToken(req));
+	const std::string marker = "__PD_CSRF__";
+	const size_t at = page.find(marker);
+	if (at != std::string::npos)
+	{
+		page.replace(at, marker.size(), token);
+	}
+
+	sendResponse(sock, 200, "OK", "text/html; charset=utf-8", page);
 }
 
 // Helper: JSON-escape a string. Beyond the five named C0 escapes, JSON (RFC
@@ -1415,6 +1392,64 @@ std::string HttpServer::cookieValue(const HttpRequest& req, const std::string& n
 	return "";
 }
 
+std::string HttpServer::sessionToken(const HttpRequest& req) const
+{
+	return cookieValue(req, "pd_session");
+}
+
+bool HttpServer::requireSameOrigin(int sock, const HttpRequest& req)
+{
+	if (!isSameOrigin(req))
+	{
+		sendResponse(sock, 403, "Forbidden", "application/json",
+		             "{\"error\":\"cross-origin request rejected\"}");
+		return false;
+	}
+	return true;
+}
+
+bool HttpServer::requireAdmin(int sock, const HttpRequest& req, bool needCsrf)
+{
+	// 1. Same-origin. A request with NO Origin header is admitted by design (see
+	//    isSameOrigin): curl, native clients and tests/http/test_api.sh do not
+	//    send one. That is precisely why step 3 exists — the Origin check is a
+	//    browser-only control and cannot stand alone.
+	if (!requireSameOrigin(sock, req))
+	{
+		return false;
+	}
+
+	// 2. Session. An unprovisioned device keeps its pre-auth behaviour so
+	//    captive-portal onboarding still works and the device can be claimed at
+	//    all (docs/THREAT_MODEL.md §5.1 — this window is deliberate and is closed
+	//    by provisioning a PIN as the first onboarding step).
+	if (!AdminAuth::isProvisioned())
+	{
+		return true;
+	}
+
+	const std::string token = sessionToken(req);
+	if (!AdminAuth::validateSession(token))
+	{
+		sendResponse(sock, 401, "Unauthorized", "application/json",
+		             "{\"error\":\"authentication required\"}");
+		return false;
+	}
+
+	// 3. CSRF, for mutating requests only, and only once there is a session to
+	//    bind the token to. This is what closes the hole the Origin check leaves
+	//    open (docs/THREAT_MODEL.md T-2): a page that can drive fetch() at us
+	//    still cannot read a value that was rendered into our own document.
+	if (needCsrf && !AdminAuth::validateCsrf(token, req.csrf))
+	{
+		sendResponse(sock, 403, "Forbidden", "application/json",
+		             "{\"error\":\"missing or invalid CSRF token\"}");
+		return false;
+	}
+
+	return true;
+}
+
 bool HttpServer::isAuthed(const HttpRequest& req) const
 {
 	std::string token = cookieValue(req, "pd_session");
@@ -1640,6 +1675,11 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	// Clear the admin credential + all sessions so the device returns to the
 	// unprovisioned/open state on both ESP (NVS) and host (in-memory).
 	AdminAuth::clearCredential();
+	// Also drop ap_secure / ap_psk / cfgseed_gen. Clearing the seed generation is
+	// deliberate: the next boot re-applies whatever the flasher wrote, so a
+	// factory reset returns the board to how it was FLASHED rather than to a
+	// hardcoded default the operator never chose.
+	DeviceConfig::clearAll();
 #if defined(POCKETDIAL_HAS_WIFI)
 	nvs_handle_t nvs_handle;
 	if (nvs_open("storage", NVS_READWRITE, &nvs_handle) == ESP_OK) {
@@ -1660,6 +1700,208 @@ void HttpServer::sendApiFactoryReset(int sock, const std::string& body)
 	sendResponse(sock, 501, "Not Implemented", "application/json",
 	             "{\"error\":\"factory reset not available on desktop\"}");
 #endif
+}
+
+// Registrar admission mode, as the wire spells it. Kept next to the parser below
+// so the two stay in step; the JSON name is the operator-facing vocabulary from
+// docs/LEARN_MODE.md, not the enumerator spelling.
+static const char* registrarModeName(RequestsHandler::RegistrarMode m)
+{
+	switch (m)
+	{
+		case RequestsHandler::RegistrarMode::Learn:  return "learn";
+		case RequestsHandler::RegistrarMode::Secure: return "secure";
+		case RequestsHandler::RegistrarMode::Open:   break;
+	}
+	return "open";
+}
+
+static bool parseRegistrarMode(const std::string& s, RequestsHandler::RegistrarMode& out)
+{
+	if (s == "open")   { out = RequestsHandler::RegistrarMode::Open;   return true; }
+	if (s == "learn")  { out = RequestsHandler::RegistrarMode::Learn;  return true; }
+	if (s == "secure") { out = RequestsHandler::RegistrarMode::Secure; return true; }
+	return false;
+}
+
+// Shared body for every registrar response: the current mode plus the adopted
+// roster, so a mutation and a plain read return the same shape and the dashboard
+// has one render path.
+void HttpServer::sendApiRegistrar(int sock)
+{
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	if (!handler)
+	{
+		// The dashboard can be up before the SIP engine is attached (an
+		// unprovisioned device holds SIP dark until a credential exists), so this
+		// is a normal transient state, not an error. Say so explicitly rather than
+		// reporting a mode we cannot actually read.
+		sendResponse(sock, 200, "OK", "application/json",
+		             "{\"attached\":false,\"mode\":\"unknown\",\"devices\":[]}");
+		return;
+	}
+
+	std::ostringstream json;
+	json << "{\"attached\":true,\"mode\":\""
+	     << registrarModeName(handler->getRegistrarMode())
+	     << "\",\"devices\":[";
+
+	bool first = true;
+	for (const auto& d : handler->getAdoptedDevices())
+	{
+		if (!first)
+		{
+			json << ",";
+		}
+		first = false;
+		json << "{\"mac\":\"" << jsonEscape(d.mac)
+		     << "\",\"extension\":\"" << jsonEscape(d.extension)
+		     << "\",\"state\":\""
+		     << ((d.state == RequestsHandler::DeviceState::Secured) ? "secured" : "learned")
+		     << "\",\"online\":" << (d.online ? "true" : "false")
+		     << "}";
+	}
+	json << "]}";
+	sendResponse(sock, 200, "OK", "application/json", json.str());
+}
+
+void HttpServer::sendApiRegistrarSet(int sock, const std::string& body)
+{
+	RequestsHandler::RegistrarMode mode;
+	if (!parseRegistrarMode(getFormParam(body, "mode"), mode))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"mode must be one of: open, learn, secure\"}");
+		return;
+	}
+
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	if (!handler)
+	{
+		sendResponse(sock, 503, "Service Unavailable", "application/json",
+		             "{\"error\":\"SIP engine not attached yet\"}");
+		return;
+	}
+
+	// Guard the one transition that can take the whole phone system down in a
+	// single click. Switching to `secure` makes every REGISTER digest-challenged;
+	// a device that has never been through Learn mode has no secured extensions,
+	// so EVERY phone would fail to register and the operator would have no working
+	// handset left to notice with. Requiring an explicit confirm mirrors the
+	// confirm=ERASE convention already used by /api/factory-reset.
+	if (mode == RequestsHandler::RegistrarMode::Secure)
+	{
+		size_t secured = 0;
+		for (const auto& d : handler->getAdoptedDevices())
+		{
+			if (d.state == RequestsHandler::DeviceState::Secured)
+			{
+				++secured;
+			}
+		}
+		const std::string confirm = getFormParam(body, "confirm");
+		if (secured == 0 && confirm != "LOCKOUT")
+		{
+			sendResponse(sock, 409, "Conflict", "application/json",
+			             "{\"error\":\"no extensions are secured yet; switching to secure now would "
+			             "reject every phone. Adopt them in learn mode first, or resend with "
+			             "confirm=LOCKOUT to override.\"}");
+			return;
+		}
+	}
+
+	handler->setRegistrarMode(mode);
+	sendApiRegistrar(sock);
+}
+
+void HttpServer::sendApiRegistrarDevice(int sock, const std::string& body)
+{
+	const std::string action = getFormParam(body, "action");
+	const std::string target = getFormParam(body, "target");
+
+	if (target.empty())
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"missing target (a 12-hex MAC or an extension)\"}");
+		return;
+	}
+
+	RequestsHandler* handler = _handler.load(std::memory_order_acquire);
+	if (!handler)
+	{
+		sendResponse(sock, 503, "Service Unavailable", "application/json",
+		             "{\"error\":\"SIP engine not attached yet\"}");
+		return;
+	}
+
+	bool ok = false;
+	if (action == "secure")
+	{
+		ok = handler->secureDevice(target);
+	}
+	else if (action == "forget")
+	{
+		ok = handler->forgetDevice(target);
+	}
+	else
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"action must be one of: secure, forget\"}");
+		return;
+	}
+
+	if (!ok)
+	{
+		sendResponse(sock, 404, "Not Found", "application/json",
+		             "{\"error\":\"no adopted device matches that MAC or extension\"}");
+		return;
+	}
+
+	sendApiRegistrar(sock);
+}
+
+void HttpServer::sendApiApSecurity(int sock)
+{
+	// The passphrase is returned in clear to an authenticated admin on purpose.
+	// On the headless eth/wifi builds there is no screen, so this response is the
+	// only way to learn it — and it is exactly what the operator needs in hand in
+	// order to re-associate the phones after switching WPA2 on.
+	std::ostringstream json;
+	json << "{\"secure\":" << (DeviceConfig::isApSecure() ? "true" : "false")
+	     << ",\"psk\":\"" << jsonEscape(DeviceConfig::getApPsk()) << "\"}";
+	sendResponse(sock, 200, "OK", "application/json", json.str());
+}
+
+void HttpServer::sendApiApSecuritySet(int sock, const std::string& body)
+{
+	const std::string secure = getFormParam(body, "secure");
+	const std::string psk    = getFormParam(body, "psk");
+	const std::string regen  = getFormParam(body, "regenerate");
+
+	// Validate before changing anything, so a rejected passphrase cannot leave the
+	// AP half-configured (secure switched on with a passphrase esp_wifi refuses,
+	// which would bring the AP up open or not at all on the next boot).
+	if (!psk.empty() && !DeviceConfig::setApPsk(psk))
+	{
+		sendResponse(sock, 400, "Bad Request", "application/json",
+		             "{\"error\":\"passphrase must be 8-63 printable ASCII characters\"}");
+		return;
+	}
+	if (regen == "1" || regen == "true")
+	{
+		DeviceConfig::regenerateApPsk();
+	}
+	if (!secure.empty())
+	{
+		DeviceConfig::setApSecure(secure == "1" || secure == "true");
+	}
+
+	// The radio is deliberately NOT restarted here. Dropping the AP out from under
+	// the client that just made this request would lose the response — including
+	// the passphrase it still has to display — and on a device carrying live calls
+	// it would tear down SIP and RTP with it. The change takes effect at the next
+	// AP bringup; the dashboard says so.
+	sendApiApSecurity(sock);
 }
 
 void HttpServer::sendApiAdminStatus(int sock, const HttpRequest& req)
@@ -1738,8 +1980,11 @@ void HttpServer::sendApiAdminLogin(int sock, const HttpRequest& req)
 		return;
 	}
 
-	// Reject while locked out before doing any hashing work.
-	if (AdminAuth::isLockedOut())
+	// Reject while locked out before doing any hashing work. Accounting is keyed
+	// on the peer address so one guessing client cannot lock the real admin out
+	// of new logins (docs/THREAT_MODEL.md D-3). A spoofed source only ever buys
+	// the spoofer their own fresh bucket — the key is for fairness, not trust.
+	if (AdminAuth::isLockedOut(req.clientIp))
 	{
 		sendResponse(sock, 429, "Too Many Requests", "application/json",
 		             "{\"error\":\"too many failed attempts; try again later\"}");
@@ -1747,10 +1992,10 @@ void HttpServer::sendApiAdminLogin(int sock, const HttpRequest& req)
 	}
 
 	std::string pin = getFormParam(req.body, "pin");
-	if (!AdminAuth::verifyPin(pin))
+	if (!AdminAuth::verifyPin(pin, req.clientIp))
 	{
 		// verifyPin may have just engaged the lockout on this attempt.
-		if (AdminAuth::isLockedOut())
+		if (AdminAuth::isLockedOut(req.clientIp))
 		{
 			sendResponse(sock, 429, "Too Many Requests", "application/json",
 			             "{\"error\":\"too many failed attempts; try again later\"}");
@@ -1777,8 +2022,14 @@ void HttpServer::sendApiAdminLogin(int sock, const HttpRequest& req)
 	// dashboard is plain HTTP on a LAN appliance (see docs/THREAT_MODEL.md).
 	std::string cookie = "Set-Cookie: pd_session=" + token +
 	                     "; HttpOnly; Path=/; SameSite=Strict";
-	sendResponseWithHeader(sock, 200, "OK", "application/json",
-	                       "{\"status\":\"ok\",\"authenticated\":true}", cookie);
+
+	// Hand the page its CSRF token here as well as in the rendered document, so a
+	// login performed with fetch() can start making mutating calls immediately
+	// instead of needing a full reload to pick the token up.
+	std::ostringstream json;
+	json << "{\"status\":\"ok\",\"authenticated\":true,\"csrf\":\""
+	     << jsonEscape(AdminAuth::sessionCsrf(token)) << "\"}";
+	sendResponseWithHeader(sock, 200, "OK", "application/json", json.str(), cookie);
 }
 
 void HttpServer::sendApiAdminLogout(int sock, const HttpRequest& req)

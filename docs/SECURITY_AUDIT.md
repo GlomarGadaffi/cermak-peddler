@@ -13,7 +13,13 @@ This security audit and threat model report evaluates the network-facing and loc
 
 > [!WARNING]
 > **Summary of Findings:** The firmware has successfully mitigated two high-risk vulnerabilities—**Host/Origin Validation (DNS Rebinding)** and **SIP Signaling Input Injection**—via the recently integrated security patches. 
-> However, significant physical and local network security gaps remain. The most critical outstanding issues are **Missing Authentication on Admin HTTP/SIP Interfaces (SEC-04, Medium Severity)** and **Cleartext WiFi Credentials Storage in Flash NVS (SEC-03, Low/Medium Severity)**.
+> However, significant physical and local network security gaps remain. **SEC-04 has since been
+> remediated** on both planes — see its entry below. The most critical outstanding issue is now
+> **Cleartext WiFi Credentials Storage in Flash NVS (SEC-03, Low/Medium Severity)**, whose durable
+> fix is flash encryption + Secure Boot v2. The dominant *residual* risk is no longer an
+> authentication gap but the **open SoftAP link** itself; WPA2 for it now ships but defaults to
+> off for fleet compatibility, so it protects only deployments that enable it (see
+> [THREAT_MODEL.md](THREAT_MODEL.md) §6 and TB-1).
 
 ---
 
@@ -57,7 +63,7 @@ The pocket-dial PBX exposes multiple UDP/TCP listening services and interacts di
 | **SEC-01** | Host/Origin Header Validation Bypass (DNS Rebinding) | `CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:H/I:H/A:H` | 🟢 **Mitigated** | **Resolved** |
 | **SEC-02** | Missing Request Parsing Validation on SIP Signaling | `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:N` | 🟢 **Mitigated** | **Resolved** |
 | **SEC-03** | Cleartext WiFi Credentials Storage in Flash NVS | `CVSS:3.1/AV:P/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N` | 🟡 **Low/Medium (4.6)** | **Active** |
-| **SEC-04** | Lack of Authentication on Admin HTTP and SIP Interfaces| `CVSS:3.1/AV:A/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N` | 🟠 **Medium (6.5)** | **Active** |
+| **SEC-04** | Lack of Authentication on Admin HTTP and SIP Interfaces| `CVSS:3.1/AV:A/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N` | 🟢 **Mitigated** | **Resolved** |
 
 ---
 
@@ -153,8 +159,14 @@ Because Flash Encryption is disabled by default, an attacker with physical acces
 ---
 
 ### SEC-04: Lack of Authentication / Access Control on HTTP APIs and SIP Server
+
+> **Status: RESOLVED.** Both planes described below have since been given real
+> authentication. The description and proof-of-concept are kept verbatim as the
+> historical record of the finding; see **Remediation status** at the end of this entry
+> for what actually shipped and what residual risk remains.
+
 * **Classification:** CWE-306: Missing Authentication for Critical Function
-* **Severity:** 🟡 **Medium (CVSS v3.1 Score: 6.5)**
+* **Severity:** 🟡 **Medium (CVSS v3.1 Score: 6.5)** — as originally scored
 * **Vector:** `CVSS:3.1/AV:A/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N`
 * **Vulnerable Component:** `HttpServer` routing & `RequestsHandler` registrations.
 
@@ -172,7 +184,22 @@ Because Flash Encryption is disabled by default, an attacker with physical acces
    curl -X POST -H "Content-Type: application/x-www-form-urlencoded" -d "extension=101" http://192.168.4.1/api/kill
    ```
 
-#### Remediation
+#### Remediation status (what shipped)
+
+| Plane | Shipped control |
+|---|---|
+| HTTP admin | Admin PIN + server-side session (128-bit token, `HttpOnly`/`SameSite=Strict` cookie) on every mutating endpoint; per-client brute-force lockout with exponential backoff and an aggregate backstop; per-session CSRF token required in `X-CSRF`; same-origin checking; security response headers. All admission decisions go through one `HttpServer::requireAdmin()`. |
+| HTTP transport | **Dark by default**: on a provisioned device the listen socket is not bound at all except inside a bounded window opened by a source-IP-verified DTMF code, a fresh-provisioning grace period, or an authenticated keepalive. An attacker usually cannot even reach the login endpoint. |
+| SIP registrar | Digest authentication (RFC 2617, MD5, `qop=auth`) challenging `REGISTER`, with runtime-selectable `open` / `learn` / `secure` modes and a per-extension HA1 secret store. |
+
+Residual risk, stated plainly: the **first-run window is still open by design** (a
+factory-fresh device has no credential, so onboarding stays possible — THREAT_MODEL §5.1);
+the registrar's **default mode is still `open`**, so the digest control protects only
+deployments that switch to `secure`; **INVITE is not independently challenged** in the
+current phase; and the stored HA1 is a bearer credential at rest, which is what makes
+SEC-03's flash-encryption fix matter. See [THREAT_MODEL.md](THREAT_MODEL.md) §5 and §9.
+
+#### Original remediation guidance (historical)
 1. **HTTP Authentication:** Implement standard HTTP Basic Authentication or token-based session cookies for all web endpoints.
 2. **SIP Digest Authentication:** Implement standard MD5 Digest Authentication (RFC 3261 §22) inside `onRegister` and `onInvite` handlers to challenge registrations and outbound invites against a static list of authorized extension passwords:
    ```cpp

@@ -35,6 +35,25 @@ namespace AdminAuth
 	constexpr int      kMaxFailedAttempts = 5;        // consecutive failures before lockout
 	constexpr uint64_t kLockoutMs         = 60ULL * 1000ULL;           // 60 s cooldown
 	constexpr uint32_t kHashIterations    = 50000;    // PBKDF-style iterated SHA-256 rounds
+	constexpr size_t   kCsrfTokenHex      = 32;       // per-session CSRF token (128 bits)
+	// Brute-force accounting is per-client, not global. A single global counter
+	// lets one attacker lock the legitimate admin out of new logins (docs/THREAT_MODEL.md
+	// D-3), and it shares one budget across every peer on the AP. Buckets are a
+	// fixed-size, least-recently-seen-evicted table so a flood of distinct source
+	// addresses cannot grow memory.
+	constexpr size_t   kMaxAttemptBuckets = 8;
+	// Consecutive lockouts back off exponentially: kLockoutMs << min(trips-1, this).
+	// 4 caps a single client at 60 s << 4 = 16 minutes per window.
+	constexpr int      kMaxLockoutShift   = 4;
+	// Aggregate backstop across ALL clients. Per-client buckets alone are not
+	// enough on a shared link: source addresses are spoofable, so an attacker who
+	// rotates them gets a fresh bucket — and a fresh escalation ladder — every
+	// few guesses, which would be a WEAKER position than the single global
+	// counter this replaced. This ceiling bounds the aggregate guess rate no
+	// matter how many identities the attacker invents. It is set well above
+	// kMaxFailedAttempts so ordinary fat-fingering never reaches it, which is
+	// what keeps the D-3 self-DoS from coming back with it.
+	constexpr int      kMaxFailedAttemptsGlobal = 20;
 
 	// True iff an admin credential (salt + hash) is currently stored.
 	bool isProvisioned();
@@ -51,8 +70,17 @@ namespace AdminAuth
 	// increments it and may engage the lockout. Returns false if not provisioned.
 	bool verifyPin(const std::string& pin);
 
+	// As above, but accounts failures against `clientKey` (the HTTP client's IP)
+	// rather than the shared unkeyed bucket, so one attacker cannot lock everyone
+	// else out. An empty key selects the unkeyed bucket, which is what the DTMF
+	// admin-menu path uses (it has no HTTP peer).
+	bool verifyPin(const std::string& pin, const std::string& clientKey);
+
 	// True while the brute-force lockout is engaged (cooldown not yet elapsed).
 	bool isLockedOut();
+
+	// True while `clientKey`'s own cooldown is engaged. Other clients are unaffected.
+	bool isLockedOut(const std::string& clientKey);
 
 	// Create a new server-side session and return its opaque random token
 	// (kSessionTokenHex hex chars). Evicts the oldest/expired entry if the table
@@ -61,6 +89,18 @@ namespace AdminAuth
 
 	// True iff the token names a live (non-expired) session.
 	bool validateSession(const std::string& token);
+
+	// The CSRF token bound to a live session, or "" if the session is unknown or
+	// expired. Generated with the session and stored beside it, so it is bound by
+	// storage rather than derived from anything the client controls. It is rendered
+	// into the dashboard page (never set as a cookie), so a cross-site page cannot
+	// read it even though the browser would happily attach the cookie.
+	std::string sessionCsrf(const std::string& token);
+
+	// Constant-time check of a submitted CSRF token against the one bound to
+	// `token`'s session. False if the session is unknown/expired or the token does
+	// not match. Does NOT slide the session expiry (validateSession does that).
+	bool validateCsrf(const std::string& token, const std::string& csrf);
 
 	// Destroy a session by token (logout). No-op if unknown.
 	void destroySession(const std::string& token);

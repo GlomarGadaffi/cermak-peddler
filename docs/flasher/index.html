@@ -229,12 +229,28 @@ details summary { cursor: pointer; font-weight: 550; font-size: .92rem; }
 details[open] summary { margin-bottom: 10px; }
 
 input[type="file"] { font: inherit; font-size: .88rem; max-width: 100%; }
-input[type="text"] {
+input[type="text"], input[type="password"] {
   font: inherit; font-family: var(--mono); font-size: .88rem;
   padding: 7px 9px; border-radius: 7px;
   border: 1px solid var(--border-strong);
   background: var(--surface); color: var(--text);
   width: 8em;
+}
+/* The 8em default suits the hex offset boxes in the local-build panel; the
+   seed panel's passphrase and SSID boxes need room for 63 characters. */
+input.wide { width: 22em; max-width: 100%; }
+
+/* Flash-time configuration seed panel */
+fieldset.seed { border: 0; padding: 0; margin: 0 0 4px; min-width: 0; }
+fieldset.seed:disabled { opacity: .5; }
+.field { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 10px; }
+.field > label:first-child { min-width: 10.5em; font-size: .9rem; }
+.field .hint { flex-basis: 100%; margin: -4px 0 0; }
+.psk-out {
+  font-family: var(--mono); font-size: 1rem; font-weight: 600;
+  letter-spacing: .04em; word-break: break-all;
+  background: var(--surface); border: 1px solid var(--border-strong);
+  border-radius: 7px; padding: 6px 9px; display: inline-block;
 }
 
 .hidden { display: none !important; }
@@ -337,7 +353,7 @@ footer { color: var(--text-dim); font-size: .86rem; text-align: center; margin-t
         <input type="radio" name="mode" value="full" checked>
         <span class="mname">Full flash</span>
         <span class="badge">Recommended</span>
-        <div class="mdesc">Bootloader, partition table, OTA data, and the app. Writes only those four regions, so your saved Wi-Fi credentials, admin PIN, and extensions in NVS survive. Use this the first time, and after any partition or bootloader change.</div>
+        <div class="mdesc">Bootloader, partition table, OTA data, and the app &mdash; plus the settings seed if you opt into one below. Writes only those regions, so your saved Wi-Fi credentials, admin PIN, and extensions in NVS survive. Use this the first time, and after any partition or bootloader change.</div>
       </label>
       <label class="mode">
         <input type="radio" name="mode" value="app">
@@ -350,6 +366,120 @@ footer { color: var(--text-dim); font-size: .86rem; text-align: center; margin-t
       <input type="checkbox" id="erase-all">
       <span><strong>Erase the whole chip first.</strong> <span class="muted">Wipes NVS (saved Wi-Fi, admin PIN, extensions) and both OTA slots. Use when moving a board from an old single-<code>factory</code> image to the dual-OTA layout, or to start clean. Adds a few seconds.</span></span>
     </label>
+
+    <!-- Flash-time configuration seed. Collapsed and opted out by default:
+         the common case is "reflash this board, leave its settings alone". -->
+    <details id="seed-details">
+      <summary>Set Wi-Fi, AP security and SIP registrar mode while flashing</summary>
+
+      <p class="muted">Writes a small settings blob to the board's <code>cfgseed</code> partition. The firmware reads it
+        once on the next boot, copies what's flagged into NVS, and then ignores it until the flasher writes a newer one.
+        This is the only way to hand a passphrase to the headless <em>Ethernet</em> and <em>Wi-Fi access point</em> builds,
+        which have no screen to show one on &mdash; and, today, the only way to set the SIP registrar's admission mode on
+        any board before its first boot.</p>
+
+      <label class="check">
+        <input type="checkbox" id="seed-enable">
+        <span><strong>Apply these settings to the board.</strong>
+          <span class="muted">Leave this unchecked &mdash; the default &mdash; and <strong>nothing at all is written to
+          <code>cfgseed</code></strong>, so the board keeps whatever it is already configured with. That is what makes it
+          safe to reflash a board you have already set up.</span></span>
+      </label>
+
+      <fieldset class="seed" id="seed-fields" disabled>
+        <!-- The fieldset groups the controls the checkbox above governs, so it
+             needs a legend; it would only repeat the summary visually, so it is
+             positioned off-screen rather than hidden (display:none would take it
+             out of the accessibility tree too). -->
+        <legend style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)">Device settings to write</legend>
+
+        <div class="field">
+          <label for="seed-ap-secure">Access-point security</label>
+          <select id="seed-ap-secure">
+            <option value="keep" selected>Leave as is</option>
+            <option value="on">WPA2 &mdash; passphrase required</option>
+            <option value="off">Open &mdash; no passphrase</option>
+          </select>
+        </div>
+
+        <div class="notice warn">
+          <p style="margin-bottom:0"><strong>Switching the access point to WPA2 breaks every existing connection.</strong>
+            <span class="muted">Phones, ATAs and laptops already associated with the open network cannot rejoin until each
+            one is re-paired with the new passphrase. Write the passphrase down before you flash &mdash; on a headless board
+            the only other copy is the serial log.</span></p>
+        </div>
+
+        <div class="field">
+          <label for="seed-ap-psk">AP passphrase</label>
+          <input type="text" id="seed-ap-psk" class="wide" autocomplete="off" autocapitalize="off"
+                 spellcheck="false" aria-describedby="seed-psk-hint">
+          <button type="button" id="btn-gen-psk">Generate</button>
+          <p class="muted hint" id="seed-psk-hint">8&ndash;63 printable ASCII characters, the WPA2 limits. <em>Generate</em>
+            makes a 20-character one from an alphabet with no <code>0</code>/<code>O</code>, <code>1</code>/<code>I</code>/<code>L</code>
+            or <code>U</code>, because it gets read off a small screen and retyped into a phone. Leave it empty to keep the
+            board's current passphrase.</p>
+        </div>
+
+        <div class="field">
+          <label for="seed-wifi-mode">Wi-Fi mode</label>
+          <select id="seed-wifi-mode">
+            <option value="keep" selected>Leave as is</option>
+            <option value="0">Captive portal (default)</option>
+            <option value="1">Station &mdash; join an existing network</option>
+            <option value="2">Standalone access point</option>
+          </select>
+        </div>
+
+        <div id="seed-sta" class="hidden">
+          <div class="field">
+            <label for="seed-sta-ssid">Upstream SSID</label>
+            <input type="text" id="seed-sta-ssid" class="wide" autocomplete="off" autocapitalize="off"
+                   spellcheck="false" aria-describedby="seed-sta-hint">
+          </div>
+          <div class="field">
+            <label for="seed-sta-pass">Upstream password</label>
+            <input type="password" id="seed-sta-pass" class="wide" autocomplete="off" aria-describedby="seed-sta-hint">
+            <p class="muted hint" id="seed-sta-hint">Optional. Leave the SSID empty to keep whichever network the board
+              already has saved; leave the password empty for an open network.</p>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="seed-reg-mode">SIP registrar mode</label>
+          <select id="seed-reg-mode" aria-describedby="seed-reg-hint">
+            <option value="keep" selected>Leave as is</option>
+            <option value="0">Open &mdash; any endpoint, no password</option>
+            <option value="1">Learn &mdash; adopt phones on first sight</option>
+            <option value="2">Secure &mdash; every REGISTER is authenticated</option>
+          </select>
+          <p class="muted hint" id="seed-reg-hint">Who is allowed to register as an extension. A board that has never been
+            told otherwise runs in <strong>open</strong>, so on a fresh board <em>Leave as is</em> means open.
+            <br><strong>Open:</strong> any endpoint on the network can register as any extension, with no credential. That is
+            the current default. Fine on a bench, a lab or a classroom; not on a link anyone else shares.
+            <br><strong>Learn:</strong> trust-on-first-use. An unknown device is adopted and locked to the extension it asked
+            for by MAC address, while devices already secured are digest-enforced as usual. Meant for adopting a fleet of
+            phones you already own, then turning off again.
+            <br><strong>Secure:</strong> every REGISTER is digest-challenged, so an extension can only be claimed by
+            something that knows its secret. An extension with no secret stored yet cannot register at all &mdash; the
+            registrar answers <em>Extension Not Provisioned</em> &mdash; so provision your extensions before you switch a
+            working system over.</p>
+        </div>
+
+        <div class="notice warn hidden" id="seed-reg-learn-warn">
+          <p style="margin-bottom:0"><strong>Learn mode is a deliberate, temporary weakening.</strong>
+            <span class="muted">While it is on, anything that can reach the PBX can claim any extension that has not been
+            adopted yet &mdash; that is the whole point, and it is why it must not be left on as a steady state. Run it on a
+            trusted or WPA2 link, adopt the phones, then come back and set <em>Secure</em>. Until the dashboard control for
+            this lands, reflashing with this panel is how you change it back.</span></p>
+        </div>
+
+        <p class="muted" style="margin-bottom:0">The seed is written on both <em>Full flash</em> and <em>App only</em>, but a board
+          whose partition table predates this feature has no <code>cfgseed</code> partition to read &mdash; run a
+          <em>Full flash</em> so the new partition table lands too.</p>
+      </fieldset>
+
+      <div id="seed-notice"></div>
+    </details>
 
     <div class="row">
       <button id="btn-flash" class="primary" disabled>Flash board</button>
@@ -449,6 +579,23 @@ const APP_DESC_OFFSET = 0x20;    // esp_app_desc_t follows the 24-byte image
                                  // header + 8-byte first segment header
 const APP_DESC_MAGIC = 0xabcd5432;
 const PROJECT_NAME = "SipServer";
+
+// Fallback offset of the `cfgseed` partition (partitions.csv: 0xFFF000, 0x1000).
+//
+// Why a fallback and not the only source: the seed is generated here in the
+// browser, so it is not a release asset and has no place in manifest.json's
+// `parts` — but its *address* is a property of the release's partition table,
+// exactly like the app and otadata offsets the manifest already carries. So
+// release.yml now reads the real offset out of the published
+// partition-table-<variant>.bin and emits it as `cfgseed_offset`, and the page
+// prefers that (planFromManifest below). A partition move then follows
+// automatically, the same way `parts` offsets already do, instead of silently
+// writing 256 bytes into whatever now lives at 0xFFF000.
+//
+// Its absence is also a capability signal: a release built before the partition
+// existed emits no `cfgseed_offset`, and its firmware ignores seeds anyway — the
+// page warns rather than pretending the settings took effect.
+const CFGSEED_OFFSET = 0xfff000;
 const DEFAULT_FLASH = { size: "16MB", mode: "dio", freq: "80m" };
 
 const LOCAL_SLOTS = [
@@ -572,6 +719,268 @@ function activeSlot(entry0, entry1) {
 }
 
 // ---------------------------------------------------------------------------
+// Flash-time configuration seed
+//
+// ==== WIRE FORMAT — keep in lockstep with src/Helpers/DeviceConfig.hpp ====
+//
+// One 256-byte little-endian record at offset 0 of the `cfgseed` partition.
+// Strings are NUL-padded ASCII; every unlisted byte is zero.
+//
+//   off  size  field
+//   ---  ----  ---------------------------------------------------------------
+//     0     4  magic     SEED_MAGIC ("PDCS" as a LE u32)
+//     4     2  version   SEED_VERSION
+//     6     2  flags     SEED_HAS_* bitmask
+//     8     4  gen       generation counter; a UNIX timestamp, so every opt-in
+//                        write is a new value and the firmware applies it once
+//    12     1  wifiMode  0 = captive-portal default, 1 = STATION, 2 = AP
+//    13     1  regMode   SIP registrar admission: 0 = open, 1 = learn,
+//                        2 = secure (matches the NVS key "reg_mode")
+//    14     2  --        reserved, zero
+//    16    64  apPsk     SoftAP WPA2 passphrase
+//    80    33  staSsid   upstream Wi-Fi SSID
+//   113     3  --        reserved, zero
+//   116    64  staPass   upstream Wi-Fi passphrase
+//   180    72  --        reserved, zero
+//   252     4  crc32     CRC-32 (IEEE 802.3 / zlib) over bytes [0, 252)
+//
+// The firmware ignores a record whose magic, version or CRC does not check
+// out — an unwritten partition reads back as 0xFF and must not be an error.
+//
+// `regMode` was added after the first release of this format and deliberately
+// did NOT bump SEED_VERSION: every field is gated by its own "has" flag and
+// every reader ignores flags it does not know, so both directions are safe.
+// Older firmware skips bit 5 and applies the rest; newer firmware reading a
+// record written by an older copy of this page sees bit 5 clear and leaves
+// `reg_mode` alone. A version bump would instead have made older firmware
+// reject the whole record. Add future fields the same way — in the reserved
+// space, behind a new flag bit — never by repurposing an existing one.
+// ---------------------------------------------------------------------------
+
+const SEED_SIZE = 256;
+const SEED_MAGIC = 0x53434450;
+const SEED_VERSION = 1;
+
+// Each "has" bit says "this field is meaningful". A seed may carry any subset,
+// so we set only the bits for settings the user actually chose — see
+// readSeedForm() for why that matters more than it looks.
+const SEED_HAS_AP_SECURE = 1 << 0;
+const SEED_AP_SECURE_ON  = 1 << 1;
+const SEED_HAS_AP_PSK    = 1 << 2;
+const SEED_HAS_WIFI_MODE = 1 << 3;
+const SEED_HAS_STA_CREDS = 1 << 4;
+// The only operator-facing route to `learn`/`secure` on a headless board: SIP
+// digest auth has always been implemented, but nothing outside the firmware's
+// own tests ever wrote `reg_mode`, so a device came up in the compiled-in
+// default — open — and stayed there.
+const SEED_HAS_REG_MODE  = 1 << 5;
+
+// DeviceConfig::kPskAlphabet / kGeneratedPskChars / kMin|MaxPskChars.
+const PSK_ALPHABET = "23456789ABCDEFGHJKMNPQRSTVWXYZ";
+const PSK_GEN_CHARS = 20;
+const PSK_MIN = 8;
+const PSK_MAX = 63;
+
+// esp_wifi rejects an SSID longer than 32 bytes, and the field is 33 wide so
+// there is always room for the terminating NUL.
+const SSID_MAX_BYTES = 32;
+
+// CRC-32, IEEE 802.3 / zlib: reflected polynomial 0xEDB88320, init 0xFFFFFFFF,
+// final xor 0xFFFFFFFF. Table built once, lazily — 256 entries is nothing, but
+// there is no reason to pay for it on a page that never opts into a seed.
+let crcTable = null;
+function crc32(bytes) {
+  if (!crcTable) {
+    crcTable = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+      crcTable[n] = c >>> 0;
+    }
+  }
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) crc = (crcTable[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8)) >>> 0;
+  // >>> 0 throughout: JS bitwise ops yield *signed* 32-bit values, and a CRC
+  // with the top bit set would otherwise come back negative.
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+// Rejection sampling, not `% 30`. The alphabet is 30 symbols and 256 is not a
+// multiple of 30, so a plain modulo would make the first 16 symbols ~3% more
+// likely than the rest. Discarding bytes >= 240 costs a few extra draws and
+// keeps all 20 characters uniform (≈98 bits).
+function generatePsk() {
+  const n = PSK_ALPHABET.length;
+  const limit = 256 - (256 % n);
+  const buf = new Uint8Array(32);
+  let out = "";
+  while (out.length < PSK_GEN_CHARS) {
+    crypto.getRandomValues(buf);
+    for (const b of buf) {
+      if (b >= limit) continue;
+      out += PSK_ALPHABET[b % n];
+      if (out.length === PSK_GEN_CHARS) break;
+    }
+  }
+  return out;
+}
+
+// Write `s` as NUL-padded bytes into a fixed-width field. Throws rather than
+// truncating: a silently shortened passphrase would lock the user out of a
+// board they cannot see the screen of.
+function putField(bytes, offset, width, s) {
+  const enc = new TextEncoder().encode(s);
+  if (enc.length > width) throw new Error(`"${s}" is ${enc.length} bytes, too long for a ${width}-byte field.`);
+  bytes.set(enc, offset);
+}
+
+// cfg: { apSecure: "keep"|"on"|"off", apPsk, wifiMode: "keep"|"0"|"1"|"2",
+//        regMode: "keep"|"0"|"1"|"2", staSsid, staPass, gen? }
+//        ->  Uint8Array(256)
+function buildSeed(cfg) {
+  const bytes = new Uint8Array(SEED_SIZE);
+  const dv = new DataView(bytes.buffer);
+
+  let flags = 0;
+  if (cfg.apSecure === "on" || cfg.apSecure === "off") {
+    flags |= SEED_HAS_AP_SECURE;
+    if (cfg.apSecure === "on") flags |= SEED_AP_SECURE_ON;
+  }
+  if (cfg.apPsk) { flags |= SEED_HAS_AP_PSK; putField(bytes, 16, 64, cfg.apPsk); }
+
+  const modeGiven = cfg.wifiMode !== "keep" && cfg.wifiMode !== undefined && cfg.wifiMode !== "";
+  if (modeGiven) flags |= SEED_HAS_WIFI_MODE;
+
+  const regGiven = cfg.regMode !== "keep" && cfg.regMode !== undefined && cfg.regMode !== "";
+  if (regGiven) {
+    // The select cannot produce anything else, but buildSeed() is also called
+    // by hand through __pdFlasher; a value the firmware does not recognise
+    // would land in NVS as-is, so refuse it here rather than write it.
+    if (!["0", "1", "2"].includes(String(cfg.regMode))) {
+      throw new Error(`Registrar mode must be 0 (open), 1 (learn) or 2 (secure); got "${cfg.regMode}".`);
+    }
+    flags |= SEED_HAS_REG_MODE;
+  }
+
+  if (cfg.staSsid) {
+    flags |= SEED_HAS_STA_CREDS;
+    putField(bytes, 80, 33, cfg.staSsid);
+    putField(bytes, 116, 64, cfg.staPass || "");
+  }
+
+  // Explicit little-endian on every multi-byte field: DataView's default is
+  // big-endian, and the ESP32 is little-endian regardless of what this browser
+  // happens to run on.
+  dv.setUint32(0, SEED_MAGIC, true);
+  dv.setUint16(4, SEED_VERSION, true);
+  dv.setUint16(6, flags, true);
+  dv.setUint32(8, cfg.gen ?? Math.floor(Date.now() / 1000), true);
+  dv.setUint8(12, modeGiven ? Number(cfg.wifiMode) : 0);
+  dv.setUint8(13, regGiven ? Number(cfg.regMode) : 0);
+  dv.setUint32(252, crc32(bytes.subarray(0, 252)), true);
+  return bytes;
+}
+
+// ---------------------------------------------------------------------------
+// Seed panel UI
+// ---------------------------------------------------------------------------
+
+function seedPanelEnabled() {
+  return $("seed-enable").checked;
+}
+
+function syncSeedPanel() {
+  const on = seedPanelEnabled();
+  $("seed-fields").disabled = !on;
+  $("seed-sta").classList.toggle("hidden", $("seed-wifi-mode").value !== "1");
+  $("seed-reg-learn-warn").classList.toggle("hidden", $("seed-reg-mode").value !== "1");
+  if (!on) notice("seed-notice", null);
+}
+
+// Read and validate the panel. Returns { cfg } or { error }.
+//
+// The three-way "leave as is" defaults are load-bearing, not politeness: a
+// plain on/off checkbox would mean that somebody opting in only to set STATION
+// mode also writes has-ap-secure with the value 0 — quietly reopening a board
+// that had WPA2 on, with a fresh `gen` so the firmware really applies it. Every
+// control here has an explicit "don't touch this" position, and only the ones
+// moved off it contribute a flag.
+function readSeedForm() {
+  const apSecure = $("seed-ap-secure").value;
+  const wifiMode = $("seed-wifi-mode").value;
+  const regMode = $("seed-reg-mode").value;
+  let apPsk = $("seed-ap-psk").value;
+  const staSsid = wifiMode === "1" ? $("seed-sta-ssid").value : "";
+  const staPass = wifiMode === "1" ? $("seed-sta-pass").value : "";
+
+  // Turning WPA2 on with no passphrase would leave the firmware to generate
+  // one, and on the headless builds that generated value only ever reaches the
+  // serial log — the exact problem this panel exists to solve. Generate it here
+  // instead, and put it in the box so the user sees it before flashing too.
+  if (apSecure === "on" && !apPsk) {
+    apPsk = generatePsk();
+    $("seed-ap-psk").value = apPsk;
+    log(`No AP passphrase was set, so one was generated: ${apPsk}`);
+  }
+
+  if (apPsk && !/^[\x20-\x7e]{8,63}$/.test(apPsk)) {
+    return { error: `The AP passphrase must be ${PSK_MIN}–${PSK_MAX} printable ASCII characters; this one is ${apPsk.length}.` };
+  }
+  if (staSsid && new TextEncoder().encode(staSsid).length > SSID_MAX_BYTES) {
+    return { error: `The upstream SSID is longer than ${SSID_MAX_BYTES} bytes, which Wi-Fi does not allow.` };
+  }
+  if (staPass && !/^[\x20-\x7e]{8,63}$/.test(staPass)) {
+    return { error: `The upstream Wi-Fi password must be ${PSK_MIN}–${PSK_MAX} printable ASCII characters, or empty for an open network.` };
+  }
+  if (wifiMode === "1" && !staSsid && (staPass)) {
+    return { error: "Enter the upstream SSID, or clear the password to keep the board's saved network." };
+  }
+  if (apSecure === "keep" && !apPsk && wifiMode === "keep" && regMode === "keep") {
+    return { error: "Nothing to write — every setting is on “Leave as is”. Untick the box, or change a setting." };
+  }
+  return { cfg: { apSecure, apPsk, wifiMode, regMode, staSsid, staPass } };
+}
+
+// Build the extra flash part for the seed, or null when the user opted out.
+// Returns { part, psk } / { error } / null. Shaped exactly like the synthesised
+// otadata entry above — an inline `data` buffer — so doFlash and the progress
+// bars need no special case for it.
+function seedPart(plan) {
+  if (!seedPanelEnabled()) return null;
+  const read = readSeedForm();
+  if (read.error) return { error: read.error };
+
+  const offset = plan && plan.cfgseedOffset !== undefined ? plan.cfgseedOffset : CFGSEED_OFFSET;
+  if (plan && plan.cfgseedOffset === undefined) {
+    logWarn(`This release does not advertise a cfgseed partition; writing the seed at the default ${hex(CFGSEED_OFFSET)}. ` +
+            `Firmware older than the settings-seed feature ignores it.`);
+  }
+
+  let data;
+  try {
+    data = buildSeed(read.cfg);
+  } catch (err) {
+    return { error: err.message };
+  }
+
+  // The registrar mode has no screen to show it on afterwards and no dashboard
+  // control to read it back from, so the flash log is the operator's only
+  // record of what this board was set to.
+  if (read.cfg.regMode !== "keep") {
+    const name = { "0": "open", "1": "learn", "2": "secure" }[read.cfg.regMode];
+    log(`SIP registrar mode will be set to ${name}.`);
+    if (read.cfg.regMode === "1") {
+      logWarn("Learn mode is temporary by design — adopt the phones, then reflash with Secure.");
+    }
+  }
+
+  return {
+    part: { name: "cfgseed (generated)", offset, role: "cfgseed", data, size: SEED_SIZE },
+    psk: read.cfg.apPsk
+  };
+}
+
+// ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 
@@ -585,6 +994,7 @@ const state = {
   usbOtg: false,
   selectedVariant: DEFAULT_VARIANT,
   installedVersion: null,
+  seedPsk: null,      // passphrase written by the last flash, for showDone()
   releases: [],       // [{ tag, name, prerelease, url, assets: Map<name, url>, manifest?, resolved: Map<variantId, plan> }]
   release: null,      // the selected entry from `releases`
   releaseError: null
@@ -733,7 +1143,14 @@ function planFromManifest(rel, variantId) {
     if (!a) return { error: `Release is missing asset "${p.file}".` };
     parts.push({ name: p.file, offset: Number(p.offset), role: p.role, url: a.url, size: p.size ?? a.size });
   }
-  return { flash: { ...DEFAULT_FLASH, ...(v.flash || rel.manifest.flash || {}) }, parts };
+  // Not a member of `parts`: the seed is generated in this page, not shipped in
+  // the release. Only its address comes from the manifest — see CFGSEED_OFFSET.
+  const seedOff = v.cfgseed_offset ?? rel.manifest.cfgseed_offset;
+  return {
+    flash: { ...DEFAULT_FLASH, ...(v.flash || rel.manifest.flash || {}) },
+    parts,
+    cfgseedOffset: seedOff === undefined || seedOff === null ? undefined : Number(seedOff)
+  };
 }
 
 function planFromConvention(rel, variantId) {
@@ -1140,6 +1557,9 @@ async function doFlash(parts, flash, label, eraseAll) {
     showDone();
   } catch (err) {
     const msg = err && err.message ? err.message : String(err);
+    // Nothing is guaranteed to have reached the cfgseed partition, so don't
+    // tell the user a passphrase is now live on the board.
+    state.seedPsk = null;
     logErr(`Flashing failed: ${msg}`);
     notice("done-notice", "err",
       `<p style="margin-bottom:6px"><strong>Flashing failed.</strong> ${esc(msg)}</p>
@@ -1154,12 +1574,42 @@ async function doFlash(parts, flash, label, eraseAll) {
 function showDone() {
   const v = VARIANTS[state.selectedVariant];
   setStep("step-progress", "done");
+
+  // On the headless eth/wifi variants this page is the only place the
+  // passphrase is ever shown to a human — the firmware also puts it on the
+  // serial log, but nobody has a serial monitor open at this point. So repeat
+  // it here, in the log (so "Copy log" carries it), and behind a copy button.
+  let pskBlock = "";
+  if (state.seedPsk) {
+    logOk(`AP passphrase written to this board: ${state.seedPsk}`);
+    pskBlock = `
+      <p style="margin-bottom:6px"><strong>Write this down &mdash; the access-point passphrase:</strong></p>
+      <p style="margin-bottom:8px"><span class="psk-out" id="done-psk">${esc(state.seedPsk)}</span>
+        <button type="button" id="btn-copy-psk">Copy</button></p>
+      <p class="muted" style="margin-bottom:8px">Every device already joined to the board's network must be re-paired with it.
+        It is in the log below too.</p>`;
+  }
+
   notice("done-notice", "ok", `
     <p style="margin-bottom:8px"><strong>Done — the board is rebooting.</strong></p>
+    ${pskBlock}
     ${v.after}
     <p class="muted" style="margin-bottom:0">Later updates can go over the air from the dashboard (see
       <a href="https://github.com/GlomarGadaffi/pocket-dial/blob/main/docs/OTA.md">OTA.md</a>). You can unplug the board now;
       disconnecting the port here is safe.</p>`);
+
+  // The notice is rebuilt as innerHTML each time, so the button is wired after
+  // insertion rather than once at startup — same shape as btn-copy-log.
+  const copy = $("btn-copy-psk");
+  if (copy) copy.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText($("done-psk").textContent);
+      copy.textContent = "Copied";
+    } catch {
+      copy.textContent = "Copy failed — select it by hand";
+    }
+    setTimeout(() => { copy.textContent = "Copy"; }, 1500);
+  });
 }
 
 async function flashFromRelease() {
@@ -1181,6 +1631,19 @@ async function flashFromRelease() {
   let parts = plan.parts;
   if (mode === "app") parts = parts.filter((p) => p.role === "app" || p.role === "ota-data");
   if (!parts.length) { logErr("Nothing to flash for that variant and mode."); return; }
+
+  // Appended *after* the app-only filter: the seed is a user choice, not a
+  // release image, so it belongs in both modes.
+  const seed = seedPart(plan);
+  if (seed && seed.error) {
+    logErr(seed.error);
+    notice("seed-notice", "err", `<p style="margin-bottom:0">${esc(seed.error)}</p>`);
+    $("seed-details").open = true;
+    return;
+  }
+  notice("seed-notice", null);
+  state.seedPsk = seed ? (seed.psk || null) : null;
+  if (seed) parts = parts.concat(seed.part);
 
   const name = VARIANTS[state.selectedVariant].name;
   const label = `${mode === "full" ? "Full" : "App-only"} flash — ${name} ${rel.tag}`;
@@ -1212,6 +1675,18 @@ async function flashLocal() {
     $("local-status").textContent = "Pick at least one file.";
     return;
   }
+
+  // A local build has no manifest, so the seed lands at the page's fallback
+  // offset — which is what partitions.csv in this repository says.
+  const seed = seedPart(null);
+  if (seed && seed.error) {
+    $("local-status").textContent = seed.error;
+    $("seed-details").open = true;
+    return;
+  }
+  state.seedPsk = seed ? (seed.psk || null) : null;
+  if (seed) parts.push(seed.part);
+
   $("local-status").textContent = "";
   await doFlash(parts, DEFAULT_FLASH, `Local flash — ${parts.length} file(s)`, $("erase-all").checked);
 }
@@ -1234,6 +1709,22 @@ if (checkSupport()) {
   document.querySelectorAll('input[name="mode"]').forEach((r) =>
     r.addEventListener("change", updateFlashButton));
 
+  syncSeedPanel();
+  $("seed-enable").addEventListener("change", () => {
+    syncSeedPanel();
+    // Opening the panel on opt-in: the fields are the whole point of ticking it.
+    if (seedPanelEnabled()) $("seed-details").open = true;
+  });
+  $("seed-wifi-mode").addEventListener("change", syncSeedPanel);
+  $("seed-reg-mode").addEventListener("change", syncSeedPanel);
+  $("btn-gen-psk").addEventListener("click", () => {
+    $("seed-ap-psk").value = generatePsk();
+    // Choosing a passphrase without turning WPA2 on stores it but leaves the AP
+    // open, which is almost never what someone pressing "Generate" means.
+    if ($("seed-ap-secure").value === "keep") $("seed-ap-secure").value = "on";
+    notice("seed-notice", null);
+  });
+
   $("btn-copy-log").addEventListener("click", async () => {
     try {
       await navigator.clipboard.writeText($("log").textContent);
@@ -1250,6 +1741,14 @@ if (checkSupport()) {
 
   log("Ready. Connect your board to begin.");
 }
+
+// The script is an ES module, so nothing above is reachable from the devtools
+// console. Expose the seed helpers and the panel reader under one namespaced
+// handle so the 256-byte record, its CRC, and the "leave as is" flag semantics
+// can be checked by hand (or from a headless browser) without a build step or a
+// test framework:
+//   __pdFlasher.crc32(new TextEncoder().encode("123456789")) === 0xCBF43926
+window.__pdFlasher = { crc32, buildSeed, generatePsk, readSeedForm, CFGSEED_OFFSET, SEED_SIZE };
 </script>
 </body>
 </html>

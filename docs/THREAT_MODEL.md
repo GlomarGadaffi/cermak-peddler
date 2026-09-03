@@ -105,7 +105,7 @@ Each row: threat → current mitigation → **residual risk**.
 | ID | Threat | Mitigation | Residual risk |
 |----|--------|-----------|---------------|
 | T-1 | Rewriting WiFi credentials / operating mode via dashboard | Same-origin + admin session gate (post-provisioning). | First-run gap; physical attacker (T-4). |
-| T-2 | **CSRF** — a malicious page on the AP makes the victim's browser fire side-effecting POSTs | `isSameOrigin()` rejects requests whose `Origin` host ≠ `Host`; session cookie is `SameSite=Strict`; no wildcard `Access-Control-Allow-Origin`. | A request with **no** `Origin` (curl, native app) is allowed by design — but on a provisioned device it still needs the session cookie, which a cross-site page cannot read (HttpOnly) or send (SameSite=Strict). |
+| T-2 | **CSRF** — a malicious page on the AP makes the victim's browser fire side-effecting POSTs | `isSameOrigin()` rejects requests whose `Origin` host ≠ `Host`; session cookie is `SameSite=Strict`; no wildcard `Access-Control-Allow-Origin`. **Added this phase:** a per-session **CSRF token** (128-bit, from `esp_random()`, stored in the session slot) that every mutating request must echo in an `X-CSRF` header. It is rendered into the dashboard document and never set as a cookie, so a cross-origin page cannot read it even though the browser would attach the cookie for it. Checked centrally in `HttpServer::requireAdmin()`. | A request with **no** `Origin` (curl, native app) is still allowed by design — that is what lets scripts and `tests/http/test_api.sh` work — but on a provisioned device it now needs **both** the session cookie and a matching token, so the Origin check is no longer load-bearing on its own. |
 | T-3 | Request-body / parser abuse (oversized body, split TCP segments) | 16 KB body cap (`413`), `Content-Length` parsing with overflow guard, per-client `SO_RCVTIMEO`. | Low. |
 | T-4 | **Physical flash tamper** — rewrite NVS / reflash | None by default. | **High if device is physically obtained**: NVS (incl. WiFi password and admin hash) is readable/writable. Mitigation is Secure Boot v2 + flash encryption (roadmap P2). |
 | T-5 | **Firmware / OTA tampering** | OTA is being added by a parallel workstream. | Unsigned OTA = remote persistent compromise. **Durable fix: signed images + Secure Boot v2 + flash encryption** (roadmap). Until then, OTA must be admin-gated and ideally restricted to the local link. |
@@ -155,23 +155,43 @@ shown on the device's screen/serial on first boot to eliminate even this window.
 
 ### 5.2 PIN brute force
 - **Online**: `verifyPin` counts consecutive failures; after **5** it engages a **60 s**
-  lockout during which even a correct PIN is refused (`429`). The counter resets after the
-  cooldown (a bad streak does not permanently brick login) and on any successful login.
+  lockout during which even a correct PIN is refused (`429`).
+  **Revised this phase.** The counter used to be zeroed the moment the lockout engaged, so
+  every cooldown handed the attacker a fresh window of 5 — a steady ~5 guesses/minute for
+  as long as they cared to keep going, which walks a 4-digit PIN in about a day and a half.
+  The trip count now survives the cooldown and each successive lockout doubles
+  (`kLockoutMs << min(trips-1, 4)`, capped at 16 minutes). Only a **correct PIN** clears it.
 - **Offline**: a leaked hash (only obtainable via **physical NVS read**) is a salted,
   iterated SHA-256 (50,000 rounds, per-credential 128-bit salt). This defeats precomputation
   and slows guessing, but a 4-digit numeric PIN is only 10⁴ candidates — trivially crackable
   offline. **PIN strength is the user's responsibility**; recommend ≥6 alphanumeric chars,
   and note that the real backstop for offline attack is flash encryption (P2).
-- **Limitation**: the lockout is a single in-process counter, **not per-IP**. This is simple
-  and safe (auto-clearing) but means (a) one attacker IP can briefly lock the admin out of
-  *new logins* (D-3), and (b) a botnet of AP peers shares one global budget. **Per-IP (or
-  per-association) tracking would be stronger** and is recommended if the threat model later
-  includes many simultaneous local clients.
+- **Per-client accounting — DONE this phase.** Failures are counted against the HTTP peer
+  address in a fixed table of 8 least-recently-seen-evicted buckets, so one guessing client
+  can no longer lock the legitimate admin out of new logins (this retires **D-3**). The key
+  is for *fairness, not trust*: a source address is trivially spoofable on the shared link,
+  and a spoofer only ever buys themselves a fresh bucket. The bucket table is bounded, so a
+  flood of distinct addresses recycles records rather than growing memory — accepted on a
+  device whose AP holds ten stations. Callers with no HTTP peer (the DTMF admin menu) share
+  one unkeyed bucket, which is the old global behaviour.
+- **Aggregate backstop (why per-IP alone would have been a downgrade).** Source addresses
+  are spoofable on this link, so per-client buckets *by themselves* would hand an attacker a
+  fresh bucket and a fresh escalation ladder every 5 guesses — strictly better for them than
+  the single global counter it replaced. A second counter therefore runs across **all**
+  clients at a much higher threshold (**20** consecutive failures) with the same doubling
+  cooldown, bounding the aggregate guess rate no matter how many identities the attacker
+  invents. It sits far above ordinary fat-fingering, so a fumbling operator still only trips
+  their own short cooldown — which is what keeps D-3 retired. Any successful login clears it.
 
 ### 5.3 Session token theft & replay
-Tokens are 128-bit, server-side, with a **30-minute absolute expiry** and a fixed-capacity
-table (8 slots; oldest/expired evicted). Cookie flags: `HttpOnly` (no JS access → blunts
-XSS exfiltration) and `SameSite=Strict` (browser won't attach it cross-site → blunts CSRF).
+Tokens are 128-bit, server-side, with a **30-minute *sliding* expiry** — every successful
+validation pushes the deadline out by a full TTL so an actively-working admin is not logged
+out mid-session — and a fixed-capacity table (8 slots; oldest/expired evicted). *(This
+paragraph and `AdminAuth.hpp` both used to describe an **absolute** expiry; the code has
+implemented sliding expiry since it was written. Corrected here rather than in the code:
+sliding is the intended behaviour.)* Each session also carries the per-session CSRF token
+described in T-2. Cookie flags: `HttpOnly` (no JS access → blunts XSS exfiltration) and
+`SameSite=Strict` (browser won't attach it cross-site → blunts CSRF).
 **No `Secure` flag and no TLS**: on plain HTTP over the open AP, a network sniffer can
 capture the cookie in transit and **replay** it until expiry. This is the same root cause as
 I-1/I-2 and has the same headline fix — **WPA2 on the SoftAP encrypts the cookie in flight**.
@@ -283,6 +303,18 @@ listed as a *documented optional* future enhancement, not the headline fix.
   still vulnerable to offline handshake cracking if the passphrase is weak — so pair it with
   a non-trivial passphrase. It is nonetheless a large net improvement over an open AP.
 
+> **Status update.** WPA2 on the SoftAP is now **implemented** (`DeviceConfig::isApSecure()`,
+> NVS key `ap_secure`, dashboard toggle at `POST /api/ap-security`, and settable at install
+> time from the browser flasher via the `cfgseed` partition). It **defaults to off**: turning
+> it on forces every already-associated phone to be re-paired, so it is an explicit operator
+> action rather than something a firmware update does to a live fleet. The per-device
+> passphrase is generated from `esp_random()` on first access and shown on the LVGL screen,
+> over serial, and in the dashboard. This also retired a real bug: the captive-portal
+> onboarding AP was already WPA2 but used a hardcoded `"12345678"` identical on every unit
+> and published in a public repo, which made its encryption decorative — anyone who captured
+> the 4-way handshake could derive the PTK. Self-signed HTTPS remains **not** recommended as
+> the primary control, for the four reasons above.
+
 **Net**: HTTP + mandatory PIN (this phase) + WPA2 SoftAP (recommended P0) gives confidentiality
 *and* control protection for the whole link. Optionally layer self-signed HTTPS later for the
 dashboard if a specific deployment requires app-layer transport security on top of WPA2 — but
@@ -293,9 +325,11 @@ do it eyes-open about the warning UX and MCU cost.
 ## 7. Prioritized Hardening Roadmap
 
 ### P0 — do now / next (highest leverage, low-to-moderate effort)
-- **Enable WPA2 on the SoftAP** (`WIFI_AUTH_WPA2_PSK` instead of `WIFI_AUTH_OPEN`), with a
-  non-trivial per-device passphrase surfaced on-screen/label. *Closes the dominant boundary;
-  encrypts dashboard + SIP + RTP; the top recommendation.*
+- **WPA2 on the SoftAP — DONE this phase (opt-in).** `WIFI_AUTH_WPA2_PSK` behind the NVS flag
+  `ap_secure` (default off for fleet compatibility), with a per-device `esp_random()`
+  passphrase surfaced on-screen, over serial, in the dashboard, and settable at flash time.
+  *Closes the dominant boundary once enabled; encrypts dashboard + SIP + RTP.* **Operational
+  guidance: turn it on.** See §6 for why the previous hardcoded onboarding PSK did not count.
 - **Mandatory admin PIN — DONE this phase** (PIN + server-side session on all mutating HTTP
   endpoints; lockout; factory reset clears the credential). Make setting the PIN the first
   onboarding step in the UI/docs.
@@ -309,8 +343,9 @@ do it eyes-open about the warning UX and MCU cost.
 ### P1 — soon (meaningful, moderate effort)
 - **SIP authentication** (digest auth on REGISTER/INVITE) to stop extension spoofing and
   BYE-based teardown (S-3, D-2) even on a trusted link.
-- **Per-IP / per-association brute-force tracking** for `login` (replaces the global counter;
-  removes the admin-lockout self-DoS in D-3).
+- **Per-IP brute-force tracking for `login` — DONE this phase** (replaces the global counter,
+  removes the admin-lockout self-DoS in D-3, and stops the cooldown from resetting the
+  failure budget). See §5.2.
 - **Gate OTA behind the admin session** and restrict it to the local link until image
   signing lands.
 - **Session hardening**: optional idle timeout in addition to absolute expiry; consider
@@ -343,8 +378,32 @@ firmware-supply-chain risks are durably addressed by **Secure Boot v2 + flash en
 
 ## 9. The SIP auth surface (digest auth + Learn mode)
 
-> **Status:** forward-looking — this section analyzes the auth surface of the **SIP digest
-> auth + Learn-mode adoption** work being built now (milestone M1), not yet shipped code.
+> **Status: SHIPPED and now operator-reachable.** This section used to be marked
+> "forward-looking … not yet shipped code". That was stale: `SipDigest.{hpp,cpp}`,
+> `SipSecretStore.{hpp,cpp}`, the `Registrar::Mode` state machine and its NVS
+> persistence are all on `main`, and `Registrar::loadMode()` runs from the
+> `RequestsHandler` constructor, so a persisted mode is honoured at boot.
+>
+> **The gap that made all of it moot has been closed** *(branch)*. Until now
+> `RequestsHandler::setRegistrarMode()` was called from **tests only** — no HTTP
+> endpoint, no dashboard control, nothing in production ever wrote `reg_mode` — so a
+> device came up in the compiled-in default (`open`, `#define`d unconditionally at the
+> top of `RequestsHandler.hpp`, so a `-U` on the compiler command line could not change
+> it either) and stayed there. Every protection below was real, tested, and unreachable.
+>
+> Two operator paths now write it:
+> * **`GET`/`POST /api/registrar`** plus the *Extension Registration & Onboarding* panel
+>   in the dashboard, which also lists the adopted roster and exposes Secure / Forget per
+>   device (`POST /api/registrar/device`). Switching to `secure` while **no** extension is
+>   secured yet is refused with `409` unless `confirm=LOCKOUT` — otherwise one click
+>   rejects every phone at once and leaves the operator no working handset.
+> * **The flash-time `cfgseed` record** (`regMode`, byte 13), which is the only way to set
+>   it on a headless board before first boot.
+>
+> The S-3/D-2 registrar gap in §4 is therefore closable in the field now — but note it is
+> only *closable*, not closed: the shipped default is still `open`, so it protects
+> deployments that actually switch.
+>
 > It extends the STRIDE analysis above with the new IDs `S-4`, `D-5`, `I-6`, `T-6`, `E-3`
 > and continues the residual-risk convention. Cross-refs: [FEATURE_ROADMAP.md](FEATURE_ROADMAP.md)
 > §3.3 (SIP digest auth, WPA2), the operator runbook [LEARN_MODE.md](LEARN_MODE.md), and

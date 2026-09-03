@@ -16,7 +16,8 @@
 #
 #   * prompts (added for the media beachhead): a raw data partition carved out of
 #     the previously-unpartitioned top-of-flash. ota_1 ends at 0xC20000; the 16MB
-#     (0x1000000) device leaves 0x3E0000 (~3.87MB) free above it. Reserved now —
+#     (0x1000000) device leaves 0x3E0000 (~3.87MB) free above it, of which prompts
+#     now takes 0x3DF000 and cfgseed (below) the final 4KB sector. Reserved now —
 #     while OTA slots are still byte-identical — for FUTURE stored prompts / voicemail
 #     (recorded G.711 µ-law clips). The synthesized-tone beachhead does NOT use it.
 #     Subtype 0x40 = an undefined/raw data partition: we store fixed-layout raw µ-law
@@ -34,10 +35,33 @@
 #     cycles per sector and nothing levels that here. The synth-tone beachhead writes
 #     nothing today; this note is the contract for when prompt/voicemail code lands.
 #
+#   * cfgseed (added for flash-time configuration): one 4KB sector at the very top of
+#     flash (0xFFF000 — the last sector of the 16MB device), taken from prompts, which
+#     shrank 0x3E0000 -> 0x3DF000 to make room. Everything below it is byte-identical
+#     to the previous layout: nvs, otadata, phy_init, ota_0 and ota_1 keep their exact
+#     offsets and sizes, so this change is OTA-compatible in both directions.
+#     Subtype 0x41 = a second undefined/raw data partition (0x40 is prompts above): the
+#     browser flasher writes a single 256-byte fixed-layout record here at install time
+#     carrying the SoftAP WPA2 passphrase, wifi_mode and upstream STA credentials, so a
+#     headless esp32s3-wifi/esp32s3-eth board — which has no screen to read a generated
+#     passphrase off — can be configured before it ever boots. See DeviceConfig.hpp for
+#     the authoritative wire format (magic/version/flags/gen + CRC-32).
+#   * The FIRMWARE ONLY EVER READS THIS PARTITION. DeviceConfig::applyFlashSeed() reads
+#     the 256 bytes once at boot and writes the settings into NVS; nothing in the
+#     firmware calls esp_partition_write() or esp_partition_erase_range() on cfgseed.
+#     The erase-before-write discipline documented above for raw 0x40 therefore does not
+#     apply here — the only writer is the flasher, over USB, before first boot.
+#   * BOARDS FLASHED BEFORE cfgseed EXISTED SIMPLY WON'T HAVE IT, and that is fine: an
+#     OTA update ships a new app image but never rewrites the partition table, and the
+#     4MB sdkconfig.defaults.esp32_constrained layout has no room for it at all. A
+#     missing cfgseed partition is the NORMAL case, not an error — applyFlashSeed()
+#     returns false silently and the device keeps its NVS-stored configuration.
+#
 # Name,     Type, SubType,  Offset,    Size
 nvs,        data, nvs,      0x9000,    0x6000
 otadata,    data, ota,      0xf000,    0x2000
 phy_init,   data, phy,      0x11000,   0x1000
 ota_0,      app,  ota_0,    0x20000,   0x600000
 ota_1,      app,  ota_1,    0x620000,  0x600000
-prompts,    data, 0x40,     0xC20000,  0x3E0000
+prompts,    data, 0x40,     0xC20000,  0x3DF000
+cfgseed,    data, 0x41,     0xFFF000,  0x1000

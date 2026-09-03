@@ -152,11 +152,40 @@ jobs:
       # a partition-table or flash-settings change follows automatically.
       # Variant ids are the "<chip>-<transport>" tags used in the asset names
       # and must match the VARIANTS table in docs/flasher/index.html.
+      #
+      # It also emits "cfgseed_offset" per variant. That partition holds the
+      # flash-time settings blob the browser flasher generates client-side, so
+      # it is NOT a release asset and has no entry in "parts" — but its address
+      # is a property of this build's partition table exactly like the app and
+      # otadata offsets, and hardcoding it in the page as well as in
+      # partitions.csv would be the one offset in this file not derived from the
+      # build. It is read out of the published partition-table-<vid>.bin (the
+      # binary, not partitions.csv: it is already per-variant like
+      # flasher_args-<vid>.json, and it is authoritative even when the CSV
+      # leaves an offset blank for gen_esp32part.py to fill in). Omitted when
+      # the table has no cfgseed partition, which the flasher treats as "this
+      # release predates flash-time configuration" and warns about.
       - name: Generate flasher manifest.json
         run: |
           python3 - "${{ github.ref_name }}" <<'EOF'
-          import glob, json, os, re, sys
+          import glob, json, os, re, struct, sys
           version = sys.argv[1]
+
+          # esp_partition_info_t: 32 bytes each, magic 0xAA50, NUL-padded name.
+          def cfgseed_offset(path):
+              try:
+                  blob = open(path, "rb").read()
+              except OSError:
+                  return None
+              for i in range(0, len(blob) - 31, 32):
+                  magic, ptype, subtype, offset, size, name, flags = \
+                      struct.unpack("<HBBII16sI", blob[i:i + 32])
+                  if magic != 0xAA50:
+                      break  # end of table (the MD5 entry / 0xFF padding)
+                  if name.rstrip(b"\x00") == b"cfgseed":
+                      return offset
+              return None
+
           roles = {"bootloader": "bootloader", "partition-table": "partition-table",
                    "otadata": "ota-data", "app": "app"}
           stems = {"bootloader": "bootloader", "partition-table": "partition-table",
@@ -183,6 +212,9 @@ jobs:
                                          "mode": fs.get("flash_mode", "dio"),
                                          "freq": fs.get("flash_freq", "80m")},
                                "parts": parts}
+              seed_off = cfgseed_offset(os.path.join("release", f"partition-table-{vid}.bin"))
+              if seed_off is not None:
+                  variants[vid]["cfgseed_offset"] = seed_off
           if not variants:
               sys.exit("no flasher_args-*.json found in release/")
           with open("release/manifest.json", "w") as f:

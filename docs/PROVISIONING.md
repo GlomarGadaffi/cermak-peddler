@@ -435,6 +435,13 @@ phone, yet it is the most sensitive payload the device serves.
   link-layer + scoping (§4.4), not transport crypto. We *document* HTTPS-for-provisioning
   as a v3+ hardening item tied to enabling **WPA2 on the SoftAP** (a far higher-leverage
   change: closing the open AP removes the passive sniffer entirely). See §4.5.
+* **Update:** that link-layer mitigation now **exists**. WPA2 on the SoftAP is
+  implemented (NVS `ap_secure`, dashboard toggle, or set at flash time from the browser
+  flasher) with a per-device generated passphrase — see
+  [THREAT_MODEL.md §6](THREAT_MODEL.md) and
+  [SETUP_GUIDE.md](SETUP_GUIDE.md#turning-on-access-point-security-wpa2). It defaults to
+  **off** for fleet compatibility, so the passive-sniffer risk below is only actually
+  closed on deployments that turn it on. **Provision over a secured link.**
 
 ### 4.2 Per-MAC allowlist
 
@@ -792,10 +799,12 @@ SIP hot path.
    config body contains a live password and the SoftAP is `WIFI_AUTH_OPEN` with no TLS.
    The layered mitigations (allowlist + uniform 404 + per-MAC token + provisioning
    window) raise the bar but do **not** eliminate a local passive sniffer. The durable
-   fix is closing the open AP (WPA2) and/or flash-encrypting NVS — both outside this
-   change and tracked as SEC-03/v3. Provisioning must be shipped *with* the window
-   defaulting to a safe state and must never be described as a security feature on its
-   own.
+   fix is closing the open AP (WPA2) and/or flash-encrypting NVS. **WPA2 on the SoftAP
+   now ships** (opt-in, default off — §4.1); flash encryption is still tracked as
+   SEC-03/v3. Turning WPA2 on is the difference between "layered mitigations that raise
+   the bar" and "no passive sniffer on the link at all", so provision over a secured
+   link. Provisioning must be shipped *with* the window defaulting to a safe state and
+   must never be described as a security feature on its own.
 2. **Static client-pool ceiling vs. fleet size mismatch.** The registrar pre-allocates a
    fixed pool (32 clients today, hardcoded in the `RequestsHandler` constructor rather
    than via the `POCKETDIAL_MAX_CLIENTS` macro that `PoolConfig.hpp`/`SCALING.md`

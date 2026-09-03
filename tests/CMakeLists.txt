@@ -126,6 +126,13 @@ add_executable(sip_parser_tests
     # !ESP_PLATFORM). RequestsHandler::onDtmfInfo references AdminAuth::verifyPin for
     # the DTMF *PIN# admin menu, so it must be linked into the host binary too.
     ../src/Helpers/AdminAuth.cpp
+    # SoftAP WPA2 settings: default-off, generated passphrase, and the WPA2
+    # length/charset bounds that stop a typo from bringing the AP up open.
+    DeviceConfig_test.cpp
+    # DeviceConfig: SoftAP WPA2 settings + the flash-time cfgseed reader.
+    # Host-stubbed under !ESP_PLATFORM (no NVS, no cfgseed partition), so the
+    # dashboard AP-security endpoints stay exercisable on the desktop build.
+    ../src/Helpers/DeviceConfig.cpp
     ../src/SIP/SipMessage.cpp
     ../src/SIP/SipStatus.cpp
     # Media beachhead (RTP sender + 440 media extension). RtpSender.cpp compiles to

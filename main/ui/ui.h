@@ -11,8 +11,9 @@
 // This screen is now a passive, always-on, glanceable monitor: the physical-screen
 // counterpart of the SSH [1] System Monitor. It shows live calls, the extension
 // roster + counts, vitals (uptime / free heap), a reach line ("SSH here to
-// configure"), and the operator-log ticker. The only touch interaction left is
-// tap-anywhere to cycle the brass/phosphor theme.
+// configure"), and the operator-log ticker. The only touch interactions left are
+// tap-anywhere to cycle the brass/phosphor theme, and — on a standalone board whose
+// SoftAP came up secured — press-and-hold to re-show the AP credentials splash.
 //
 // LVGL v8.4 (NOT v9 — the installed managed component is lvgl/lvgl ^8.3.11). All
 // object/style/anim calls below target the v8 API. The UI is built once on the main
@@ -70,9 +71,36 @@ struct UiBoardSnapshot {
 void ui_init(void);
 
 // Transition between first-boot Onboarding/Splash and the live wallboard. In
-// onboarding mode a brand splash + scannable Wi-Fi join QR + "then SSH to
-// pocketdial.local" instructions cover the board (config is SSH-only afterward).
-void ui_set_onboarding_mode(bool onboarding, const char* ssid = "My-Ap", const char* pass = "12345678");
+// onboarding mode a brand splash + a scannable Wi-Fi join QR cover the board, and
+// configuration continues in the web dashboard at http://pocketdial.local/.
+// (An earlier revision of this comment said config was "SSH-only afterward"; the
+// SSH sysop terminal was deleted outright rather than hardened — see
+// docs/THREAT_MODEL.md E-3 — so HTTP is the only admin surface.)
+//
+// `ssid`/`pass` are REQUIRED when `onboarding` is true: they are rendered on the
+// glass and encoded into the join QR, so they must be the credentials the SoftAP
+// actually came up with. They previously defaulted to "My-Ap"/"12345678" — the
+// same hardcoded passphrase that made the onboarding AP's WPA2 decorative, since
+// it was identical on every unit and published in this repo. The defaults are
+// gone so that literal cannot quietly come back; pass DeviceConfig::getApPsk().
+void ui_set_onboarding_mode(bool onboarding, const char* ssid = nullptr, const char* pass = nullptr);
+
+// Show the standalone SoftAP's SSID + WPA2 passphrase (and a scannable Wi-Fi join
+// QR) as a timed splash IN FRONT OF the live wallboard. Call it only when the AP
+// actually came up secured — there is nothing to show for an open AP.
+//
+// Unlike ui_set_onboarding_mode(true) this does NOT put the UI into onboarding
+// state: standalone AP is the normal operating mode, so the wallboard keeps
+// updating underneath and the splash stands aside by itself after ~90 s, or on a
+// tap. A long press anywhere on the wallboard brings it back, which is the only
+// thing that keeps the passphrase recoverable on a board whose dashboard sits
+// behind the very AP the operator cannot yet join.
+//
+// `ssid`/`pass` are REQUIRED and have no defaults, for the same reason
+// ui_set_onboarding_mode's were removed: no plausible-looking placeholder may ever
+// stand in for a real credential. They are copied internally, so the caller's
+// buffers need not outlive the call.
+void ui_show_ap_credentials(const char* ssid, const char* pass);
 
 // Update the header (uptime clock + online lamp), the reach line (host + IP), the
 // roster counts strip (EXT n/32 · CALLS n/8) and the vitals strip (uptime / free
@@ -93,6 +121,8 @@ void ui_add_log(const char* line);
 void ui_set_battery(float volts, int percent);
 
 // Low-level capacitive-touch coordinate router (AXS15231B). Wallboard is passive:
-// the only gesture is tap-anywhere to cycle the brass/phosphor theme (and dismiss
-// onboarding fallbacks). Kept so esp_main_display.cpp keeps linking.
+// the gestures are tap-anywhere to cycle the brass/phosphor theme, press-and-hold to
+// re-show the AP credentials splash on a secured standalone board, and a tap on that
+// splash to dismiss it. All three are routed by LVGL's own hit-testing, so nothing
+// is dispatched from here; kept so esp_main_display.cpp keeps linking.
 void ui_handle_touch_press(int16_t x, int16_t y);

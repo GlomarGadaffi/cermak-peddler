@@ -26,7 +26,36 @@ The same C++17 engine compiles to a desktop binary for development and testing. 
 - **LVGL touchscreen UI** (Guition JC3248W535, optional) — glossy retro operator-board aesthetic
 - **NVS provisioning** — inject credentials and config without rebuilding firmware
 - **Dual-OTA firmware updates** — safe binary rollout with fallback
-- **Dark-by-default HTTP admin plane** — unreachable except during provisioning or after a DTMF gating sequence
+- **Flash-time configuration** — set Wi-Fi mode, AP security and the passphrase from the
+  browser flasher; the firmware applies them on first boot
+
+### Security
+The device is an appliance on a local link, so the defences are layered rather than
+perimeter-based. [THREAT_MODEL.md](docs/THREAT_MODEL.md) is candid about what each one
+does and does not buy:
+
+- **WPA2 on the SoftAP** (opt-in) — encrypts the dashboard, SIP signalling **and** RTP
+  audio in one move. Per-device passphrase, generated on the device, never baked into
+  the image. Off by default so a firmware update can't strand phones already associated
+  with a live access point.
+- **Dark-by-default HTTP admin plane** — on a provisioned device the listen socket isn't
+  even bound except inside a bounded window opened by a source-IP-verified DTMF code or
+  an authenticated operator
+- **Admin PIN + server-side session** on every mutating endpoint, with per-client
+  brute-force lockout and an aggregate backstop
+- **SIP digest auth** (RFC 2617) with a Learn mode for adopting an existing phone
+  fleet — runtime-selectable `open`/`learn`/`secure`; the registrar still **defaults
+  to open**, so this protects deployments that switch it on
+- **CSRF tokens + strict security headers** — the same-origin check deliberately admits
+  header-less clients like `curl`, so a per-session token is what actually closes the gap
+- **SDP admission gate** — every SDP body is structurally checked before any decoder
+  runs or it is relayed to a peer phone
+- **No SSH surface** — the second admin plane was deleted rather than hardened
+
+> **Not** TLS. Self-signed HTTPS on a LAN appliance trains users to click through
+> certificate warnings, costs MCU RAM and CPU on a device carrying real-time audio, and
+> protects only the dashboard — not SIP or RTP. WPA2 at the link layer covers all three
+> for less. The reasoning is written up in [THREAT_MODEL.md §6](docs/THREAT_MODEL.md).
 
 ### Hardware flexibility
 | Transport | Board | Use case |
@@ -51,7 +80,9 @@ Register two SIP softphones (Linphone, Zoiper, etc.) to `sip:127.0.0.1:5060`, di
 
 **No toolchain?** Flash a release straight from Chrome or Edge at
 **<https://glomargadaffi.github.io/pocket-dial/flasher/>** — plug the board in over USB,
-pick Ethernet / display / Wi-Fi, click Flash. Or build it yourself:
+pick Ethernet / display / Wi-Fi, click Flash. The flasher can also write the Wi-Fi mode,
+access-point security and passphrase at the same time, which is the easiest way to
+configure the headless Ethernet and Wi-Fi variants. Or build it yourself:
 
 ```bash
 # WiFi SoftAP (default for standard ESP32-S3 boards)
@@ -73,7 +104,7 @@ For detailed setup, see **[docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md)** and **[do
 
 - **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** — concurrency model, zero-heap-alloc hot path, outbox pattern for safe sockets
 - **[RTP.md](docs/RTP.md)** — media bridge, G.711 codec, how peer-to-peer streaming stays under 2 KB/s overhead
-- **[THREAT_MODEL.md](docs/THREAT_MODEL.md)** — security posture (rate limiting, digest auth, CIDR allowlist, no SSH surface)
+- **[THREAT_MODEL.md](docs/THREAT_MODEL.md)** — STRIDE analysis, trust boundaries, and the honest residual risks
 
 ## Capacity & constraints
 
@@ -125,7 +156,7 @@ If you need conference calls or external bridging, see **[docs/CONFERENCE_MIXER.
 **Deployment:**
 - [PROVISIONING.md](docs/PROVISIONING.md) — inject credentials without rebuilding
 - [OTA.md](docs/OTA.md) — dual-OTA safe firmware updates
-- [THREAT_MODEL.md](docs/THREAT_MODEL.md) — security architecture
+- [THREAT_MODEL.md](docs/THREAT_MODEL.md) — security architecture, and why not TLS
 - [SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md) — known constraints
 
 **Ops:**
