@@ -376,11 +376,21 @@ HTTP_CODE=$(echo "$RESP_DATA" | tail -n1)
 BODY_CONTENT=$(echo "$RESP_DATA" | sed '$d')
 assert_status "TC-AUTH-05: POST /api/kill (provisioned, no cookie -> 401)" "401" "$HTTP_CODE" "$BODY_CONTENT"
 
-# TC-AUTH-06: login with the correct PIN -> 200 and a pd_session cookie.
-LOGIN_HEADERS=$(curl -s -D - -o /dev/null -X POST \
+# TC-AUTH-06: login with the correct PIN -> 200, a pd_session cookie, AND the
+# per-session CSRF token in the response body. The token is captured here because
+# every mutating request below needs it: on a provisioned device the session
+# cookie alone is deliberately not sufficient (see TC-AUTH-07a).
+# -i (headers + body together on stdout) rather than -D to a temp file: nothing
+# to clean up, and it keeps working under a curl whose filesystem view differs
+# from the shell's (e.g. a Windows curl.exe invoked from WSL, which cannot write
+# to a /tmp path the shell just created).
+LOGIN_RAW=$(curl -s -i -X POST \
   -H "Host: ${HOST_HDR}" \
   -H "Origin: ${ORIGIN_HDR}" \
   -d "pin=1234" "${BASE_URL}/api/admin/login")
+# Split on the first blank line: headers before it, body after.
+LOGIN_HEADERS=$(printf '%s' "$LOGIN_RAW" | sed -n '1,/^\r*$/p')
+LOGIN_BODY=$(printf '%s' "$LOGIN_RAW" | sed '1,/^\r*$/d')
 LOGIN_CODE=$(printf '%s' "$LOGIN_HEADERS" | grep -i "^HTTP/" | tail -n1 | awk '{print $2}')
 assert_status "TC-AUTH-06: POST /api/admin/login (correct PIN -> 200)" "200" "${LOGIN_CODE:-0}" "$LOGIN_HEADERS"
 
@@ -397,7 +407,22 @@ else
     ((FAILED_TESTS++))
 fi
 
-# TC-AUTH-07: the same mutating endpoint WITH the cookie now succeeds (200).
+# Extract the CSRF token from the login response body.
+CSRF=$(printf '%s' "$LOGIN_BODY" \
+    | sed -n 's/.*"csrf":"\([0-9a-fA-F]*\)".*/\1/p' \
+    | head -n1)
+if [ -n "$CSRF" ]; then
+    echo -e "  [${GREEN}PASS${RESET}] TC-AUTH-06: login returned a CSRF token (len ${#CSRF})."
+    ((PASSED_TESTS++))
+else
+    echo -e "  [${RED}FAIL${RESET}] TC-AUTH-06: login did not return a CSRF token. Body: ${YELLOW}${LOGIN_BODY}${RESET}"
+    ((FAILED_TESTS++))
+fi
+
+# TC-AUTH-07a: the cookie ALONE is no longer enough. The same-origin check
+# deliberately admits a request with no Origin header (curl and scripts send
+# none), so the per-session CSRF token is what actually stops a same-site page
+# from riding the victim's cookie. Cookie without token must be refused.
 RESP_DATA=$(curl -s -w "\n%{http_code}" -X POST \
   -H "Host: ${HOST_HDR}" \
   -H "Origin: ${ORIGIN_HDR}" \
@@ -405,7 +430,18 @@ RESP_DATA=$(curl -s -w "\n%{http_code}" -X POST \
   -d "extension=123" "${BASE_URL}/api/kill")
 HTTP_CODE=$(echo "$RESP_DATA" | tail -n1)
 BODY_CONTENT=$(echo "$RESP_DATA" | sed '$d')
-assert_status "TC-AUTH-07: POST /api/kill (provisioned, WITH cookie -> 200)" "200" "$HTTP_CODE" "$BODY_CONTENT"
+assert_status "TC-AUTH-07a: POST /api/kill (cookie but NO CSRF token -> 403)" "403" "$HTTP_CODE" "$BODY_CONTENT"
+
+# TC-AUTH-07b: cookie + CSRF token succeeds (200).
+RESP_DATA=$(curl -s -w "\n%{http_code}" -X POST \
+  -H "Host: ${HOST_HDR}" \
+  -H "Origin: ${ORIGIN_HDR}" \
+  -H "Cookie: pd_session=${SESSION}" \
+  -H "X-CSRF: ${CSRF}" \
+  -d "extension=123" "${BASE_URL}/api/kill")
+HTTP_CODE=$(echo "$RESP_DATA" | tail -n1)
+BODY_CONTENT=$(echo "$RESP_DATA" | sed '$d')
+assert_status "TC-AUTH-07b: POST /api/kill (cookie + CSRF token -> 200)" "200" "$HTTP_CODE" "$BODY_CONTENT"
 
 # TC-AUTH-08: brute-force lockout — 5 consecutive wrong PINs trip a 429.
 #   verifyPin engages the lockout on the 5th failure, so by the 5th attempt the
