@@ -384,7 +384,7 @@ firmware-supply-chain risks are durably addressed by **Secure Boot v2 + flash en
 > persistence are all on `main`, and `Registrar::loadMode()` runs from the
 > `RequestsHandler` constructor, so a persisted mode is honoured at boot.
 >
-> **The gap that made all of it moot has been closed** *(branch)*. Until now
+> **The gap that made all of it moot has been closed.** Until now
 > `RequestsHandler::setRegistrarMode()` was called from **tests only** — no HTTP
 > endpoint, no dashboard control, nothing in production ever wrote `reg_mode` — so a
 > device came up in the compiled-in default (`open`, `#define`d unconditionally at the

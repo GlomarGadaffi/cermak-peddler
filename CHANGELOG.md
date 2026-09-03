@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (feat/ap-wpa2-and-web-hardening) - 2026-09-03
+## Unreleased (on main, in no published release) - 2026-09-03
 
 ### Security — SoftAP WPA2, CSRF tokens, and a centralised admin gate
 
