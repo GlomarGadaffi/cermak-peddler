@@ -18,10 +18,15 @@
 //      answered 200 OK with a sendrecv SDP and land on one room; a BYE from one leaves
 //      the others mixing.
 //
-// On host RtpReceiver/RtpSender::start() are no-op stubs that store the callback and
-// never invoke it, so the media callbacks are driven directly through the named
-// MediaBridge::onHandsetRtp / fillHandsetTx members they are wired to — the same code
-// the sockets run on device.
+// On host RtpReceiver::start() is a no-op stub, so RX is always driven directly through
+// MediaBridge::onHandsetRtp. RtpSender is NOT inert on a Linux host: RtpSender.cpp's
+// "Linux desktop" branch (Issue #82) spawns a real std::thread the moment startBridge()
+// succeeds, and that thread calls the same fillHandsetTx provider on its own 20 ms pacer
+// — racing any test that also calls fillHandsetTx (or reads getPlayoutBuffer()) directly
+// after startBridge(). A test that wants deterministic, synchronous control over TX must
+// stop the RtpSender it passed to init() right after startBridge() returns (the bridge
+// itself, and the bus port, stay live — only the background pacer thread is halted) before
+// driving fillHandsetTx by hand. See AnchorModeIsUnchangedByTheBusRewiring below.
 
 #include <gtest/gtest.h>
 
@@ -425,6 +430,11 @@ TEST(ConferenceRoom, AnchorModeIsUnchangedByTheBusRewiring)
 	bridge.init(&rx, &tx, &anchor);   // no bus argument at all
 	ASSERT_TRUE(bridge.startBridge("127.0.0.1", 16003, "call-x", "part-1"));
 	EXPECT_EQ(bridge.busPort(), -1);
+
+	// Halt RtpSender's own background pacer thread (Linux host only — see the file
+	// header comment) before driving the playout buffer by hand below, so its
+	// unrelated 20 ms fillHandsetTx tick can't race and drain what this test writes.
+	ASSERT_TRUE(tx.stop("call-x"));
 
 	const int16_t in[] = {111, 222, 333};
 	EXPECT_TRUE(bridge.feedRx("part-1", in, 3));
