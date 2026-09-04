@@ -15,6 +15,7 @@
 // parsing helpers (parseReferToTarget, splitMembers) are pure and free-standing so
 // the unit tests can exercise the routing logic without the full RequestsHandler.
 
+#include <chrono>
 #include <string>
 #include <vector>
 #include <utility>
@@ -26,6 +27,12 @@
 
 namespace pbx
 {
+	// How long a rung member (direct CFNA target or one hunt-group leg) is given
+	// to answer before the caller gives up on it. Shared by RequestsHandler's
+	// direct-call CFNA arm (onInvite) and CallForker::huntRingNext, which is why
+	// it lives here rather than file-local to either translation unit.
+	inline constexpr std::chrono::seconds kNoAnswerTimeout{20};
+
 	// How a ring group fans an inbound INVITE out to its members.
 	enum class GroupMode
 	{

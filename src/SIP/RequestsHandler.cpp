@@ -51,8 +51,9 @@ namespace
 	constexpr auto SWEEP_INTERVAL = std::chrono::seconds(1);
 
 	// How long an unanswered leg rings before the no-answer action fires (CFNA
-	// forward, or advancing to the next hunt-group member). Polled from tick().
-	constexpr auto NO_ANSWER_TIMEOUT = std::chrono::seconds(20);
+	// forward, or advancing to the next hunt-group member). Shared with
+	// CallForker::huntRingNext, so it now lives at pbx::kNoAnswerTimeout
+	// (PbxConfig.hpp) instead of file-local here.
 
 	// NVS namespace for the persisted PBX config, pbxcfg (loadAdminHttpTtl here;
 	// DtmfFeatureCodes::load()/saveAdminExt() too) is pbxpersist::kNvsNamespace
@@ -782,7 +783,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 			return;
 		}
 
-		startBroadcastFork(data, caller.value(), std::move(targets), /*intercom=*/true);
+		_forker.startBroadcastFork(data, caller.value(), std::move(targets), /*intercom=*/true);
 		return;
 	}
 
@@ -793,7 +794,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	{
 		if (const pbx::PageZone* zone = _cfg.findPageZone(destNumber))
 		{
-			routePageZone(data, caller.value(), *zone);
+			_forker.routePageZone(data, caller.value(), *zone);
 			return;
 		}
 	}
@@ -850,7 +851,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// real endpoint and so never carries its own DND/forward config.
 	if (const pbx::RingGroup* group = _cfg.findRingGroup(destNumber))
 	{
-		routeRingGroup(data, caller.value(), destNumber, *group);
+		_forker.routeRingGroup(data, caller.value(), destNumber, *group);
 		return;
 	}
 
@@ -864,7 +865,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// a park retrieval or a configured group extension — so even a catch-all "*"
 	// pattern leaves the built-ins working. Nothing matched ⇒ routeDialPlan()
 	// returns false and everything below runs exactly as it did before #69.
-	if (routeDialPlan(data, caller.value(), destNumber))
+	if (_forker.routeDialPlan(data, caller.value(), destNumber))
 	{
 		return;
 	}
@@ -876,7 +877,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 		if (!cfu.empty() && cfu != destNumber)
 		{
 			queueLog("CFU: forwarding " + destNumber + " -> " + cfu);
-			if (redirectInvite(data, caller.value(), cfu))
+			if (_forker.redirectInvite(data, caller.value(), cfu))
 			{
 				return;
 			}
@@ -956,7 +957,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	if (!cfna.empty() && cfna != destNumber)
 	{
 		newSession->setNoAnswerTarget(cfna);
-		newSession->armRingTimer(std::chrono::steady_clock::now() + NO_ANSWER_TIMEOUT);
+		newSession->armRingTimer(std::chrono::steady_clock::now() + pbx::kNoAnswerTimeout);
 	}
 
 	auto response = getMessageFromPool(*data);
@@ -1301,7 +1302,7 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 		// disarmed inside huntRingNext). If the list is exhausted, fail to caller.
 		if (session.value()->isHunt())
 		{
-			if (session.value()->getState() == Session::State::Invited && !huntRingNext(session.value()))
+			if (session.value()->getState() == Session::State::Invited && !_forker.huntRingNext(session.value()))
 			{
 				endHandle(session.value()->getSrc()->getNumber(), data);
 				endCall(data->getCallID(), session.value()->getSrc()->getNumber(),
@@ -1336,7 +1337,7 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 				// Tear down the busy leg's session, then start a fresh leg to the
 				// forward target reusing the retained original INVITE.
 				endCall(callID, src->getNumber(), busyExt, "forwarded on busy");
-				if (redirectInvite(inviteMsg, src, cfb))
+				if (_forker.redirectInvite(inviteMsg, src, cfb))
 				{
 					return;
 				}
@@ -1356,7 +1357,7 @@ void RequestsHandler::onUnavailable(std::shared_ptr<SipMessage> data)
 		// Hunt group: treat unavailable like busy — advance to the next member.
 		if (session.value()->isHunt())
 		{
-			if (session.value()->getState() == Session::State::Invited && !huntRingNext(session.value()))
+			if (session.value()->getState() == Session::State::Invited && !_forker.huntRingNext(session.value()))
 			{
 				endHandle(session.value()->getSrc()->getNumber(), data);
 				endCall(data->getCallID(), session.value()->getSrc()->getNumber(),
@@ -1898,7 +1899,7 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 
 	endCall(callID, transferor->getNumber(), std::string(data->getToNumber()), "blind transfer");
 
-	bool ok = targetClient.has_value() && redirectInvite(data, transferor, target);
+	bool ok = targetClient.has_value() && _forker.redirectInvite(data, transferor, target);
 
 	// NOTIFY the transferor with the transfer result (message/sipfrag body).
 	std::string frag = ok ? "SIP/2.0 200 OK" : "SIP/2.0 404 Not Found";
@@ -1931,180 +1932,6 @@ void RequestsHandler::onMessage(std::shared_ptr<SipMessage> data)
 	response->setVia(std::string(data->getVia()) + ";received=" + activeIp);
 	response->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
 	_outbox.emplace_back(data->getSource(), std::move(response));
-}
-
-bool RequestsHandler::buildInviteFork(const std::shared_ptr<SipMessage>& invite,
-	const std::shared_ptr<SipClient>& caller,
-	const std::shared_ptr<SipClient>& target,
-	bool intercom)
-{
-	auto inviteFork = getMessageFromPool(*invite);
-	// Returns bool because callers report success on this function's behalf —
-	// huntRingNext arms a 20 s no-answer timer, redirectInvite NOTIFYs the
-	// transferor. A silent void return had them announcing an INVITE that was
-	// never sent (#101A).
-	if (!inviteFork) return false;
-	inviteFork->setContact(buildContact(caller->getNumber()));
-
-	std::string activeIp = _localIp;
-	std::string targetIpPort = sipwire::addrToIpPort(target->getAddress());
-	std::string serverIpPort = activeIp + ":" + std::to_string(_serverPort);
-
-	inviteFork->setHeader("INVITE sip:" + target->getNumber() + "@" + targetIpPort + " SIP/2.0");
-	inviteFork->setTo("To: <sip:" + target->getNumber() + "@" + serverIpPort + ">");
-
-	if (intercom)
-	{
-		// Auto-answer / intercom headers — used by 999 all-page only. A ring group
-		// omits these so members ring normally (the caller can be picked up by hand).
-		inviteFork->addHeader("Call-Info", "<sip:any>;answer-after=0");
-		inviteFork->addHeader("Alert-Info", "info=alert-autoanswer");
-		inviteFork->addHeader("Alert-Info", "answer-after=0");
-		inviteFork->addHeader("Alert-Info", "intercom=true");
-		inviteFork->addHeader("P-Auto-Answer", "normal");
-	}
-	// Caller's offer relayed peer-to-peer: preserve its preference order, drop
-	// only unsupported payloads (onInvite already 488'd offers with nothing left).
-	(void)inviteFork->filterAudioCodecs(/*allowWideband=*/true);
-	_outbox.emplace_back(target->getAddress(), std::move(inviteFork));
-	return true;
-}
-
-void RequestsHandler::startBroadcastFork(std::shared_ptr<SipMessage> invite,
-	std::shared_ptr<SipClient> caller,
-	const std::vector<std::shared_ptr<SipClient>>& targets,
-	bool intercom)
-{
-	// Shared fan-out core: build the broadcast Session, send 180 Ringing to the
-	// caller, then one forked INVITE per target. First answer wins; onOk() cancels
-	// the losers (it walks getPendingTargets()). Used by 999 (intercom=true) and
-	// ring-all groups (intercom=false).
-	auto newSession = allocateSession(std::string(invite->getCallID()), caller);
-	if (!newSession)
-	{
-		std::shared_ptr<SipMessage> responseObj = getMessageFromPool(*invite);
-		if (!responseObj) return;   // pool exhausted: drop, peer retransmits (#101A)
-		responseObj->setHeader("SIP/2.0 503 Service Unavailable");
-		responseObj->clearBody();
-		responseObj->setContact(buildContact(caller->getNumber()));
-		_outbox.emplace_back(invite->getSource(), std::move(responseObj));
-		return;
-	}
-	std::string contactExt = intercom ? std::string("999") : std::string(invite->getToNumber());
-
-	// Drawn BEFORE the session is published. Refusing after _sessions.emplace()
-	// would register a session under this Call-ID with no target ever invited and
-	// — unlike the hunt path — no ring timer for tick() to sweep, so it would sit
-	// there permanently; the INVITE retransmit's duplicate emplace() is a silent
-	// no-op, so it would not replace the zombie either (#101A).
-	auto ringing = getMessageFromPool(*invite);
-	if (!ringing) return;   // pool exhausted: drop, peer retransmits (#101A)
-
-	newSession->setBroadcast(true);
-	newSession->setPendingTargets(targets);
-	newSession->setInviteMessage(invite);
-	_sessions.emplace(invite->getCallID(), newSession);
-
-	ringing->setHeader("SIP/2.0 180 Ringing");
-	ringing->clearBody();
-	std::string activeIp = _localIp;
-	ringing->setVia(std::string(invite->getVia()) + ";received=" + activeIp);
-	ringing->setTo(std::string(invite->getTo()) + ";tag=" + IDGen::GenerateID(9));
-	ringing->setContact(buildContact(contactExt));
-	_outbox.emplace_back(invite->getSource(), std::move(ringing));
-
-	for (auto& target : targets)
-	{
-		buildInviteFork(invite, caller, target, intercom);
-	}
-}
-
-bool RequestsHandler::huntRingNext(const std::shared_ptr<Session>& session)
-{
-	// Ring the next not-yet-tried hunt member. Returns false when the list is
-	// exhausted (caller fails the call). The single ringing member is kept in
-	// getPendingTargets() so onOk()/onCancel() can address it like a broadcast.
-	auto& members = session->getHuntMembers();
-	auto invite = session->getInviteMessage();
-	auto caller = session->getSrc();
-	if (!invite || !caller)
-	{
-		return false;
-	}
-
-	while (session->getHuntIndex() < members.size())
-	{
-		std::string ext = members[session->getHuntIndex()];
-		session->setHuntIndex(session->getHuntIndex() + 1);
-
-		auto mc = findClient(ext);
-		if (!mc.has_value())
-		{
-			continue;   // member went offline since the call started; skip it
-		}
-
-		session->setPendingTargets({ mc.value() });
-		if (!buildInviteFork(invite, caller, mc.value(), /*intercom=*/false))
-		{
-			// Nothing was rung, so do NOT arm the no-answer timer — that would burn
-			// the full NO_ANSWER_TIMEOUT waiting on a member that never got an
-			// INVITE. Try the next member instead (#101A).
-			continue;
-		}
-		session->armRingTimer(std::chrono::steady_clock::now() + NO_ANSWER_TIMEOUT);
-		return true;
-	}
-
-	session->clearRingTimer();
-	return false;
-}
-
-bool RequestsHandler::redirectInvite(const std::shared_ptr<SipMessage>& invite,
-	const std::shared_ptr<SipClient>& caller,
-	const std::string& target)
-{
-	// Re-point an INVITE at `target` and send it as a fresh leg. Powers blind
-	// transfer and the call-forward redirect paths. A new Session is allocated under
-	// the SAME Call-ID so subsequent responses (180/200/BYE) route normally.
-	auto targetClient = findClient(target);
-	if (!targetClient.has_value())
-	{
-		return false;
-	}
-
-	// Don't double-allocate if a session for this Call-ID already exists (e.g. CFU
-	// from onInvite, which hasn't created one yet) — reuse or create as needed.
-	std::shared_ptr<Session> session;
-	auto existing = getSession(invite->getCallID());
-	if (existing.has_value())
-	{
-		session = existing.value();
-		session->setDest(targetClient.value());
-	}
-	else
-	{
-		session = allocateSession(std::string(invite->getCallID()), caller);
-		if (!session)
-		{
-			std::shared_ptr<SipMessage> responseObj = getMessageFromPool(*invite);
-			// true, not false, even though nothing was sent. false here means
-			// "target not registered — fall through", which on the CFU path would
-			// ring the extension the subscriber explicitly forwarded away from, and
-			// on the REFER path would report "target not registered" for a target
-			// that is. The target WAS resolved; we just could not serve it. Same
-			// answer as the 503 branch below (#101A).
-			if (!responseObj) return true;
-			responseObj->setHeader("SIP/2.0 503 Service Unavailable");
-			responseObj->clearBody();
-			responseObj->setContact(buildContact(caller->getNumber()));
-			_outbox.emplace_back(invite->getSource(), std::move(responseObj));
-			return true;   // we DID handle it (with a 503); target lookup succeeded
-		}
-		_sessions.emplace(invite->getCallID(), session);
-	}
-
-	buildInviteFork(invite, caller, targetClient.value(), /*intercom=*/false);
-	return true;
 }
 
 std::shared_ptr<SipMessage> RequestsHandler::buildReferNotify(const std::shared_ptr<SipMessage>& refer,
@@ -2143,34 +1970,6 @@ std::shared_ptr<SipMessage> RequestsHandler::buildReferNotify(const std::shared_
 	   << body;
 
 	return getMessageFromPool(ss.str(), transferor->getAddress());
-}
-
-std::shared_ptr<SipMessage> RequestsHandler::buildCancel(const std::shared_ptr<SipMessage>& invite,
-	const std::shared_ptr<SipClient>& target)
-{
-	// Build a CANCEL for an outstanding forked INVITE leg toward `target`, derived
-	// from the original INVITE (same Call-ID / branch). Mirrors the inline CANCEL
-	// construction used by onCancel()/onOk() for the 999 path.
-	std::string activeIp = _localIp;
-	std::string serverIpPort = activeIp + ":" + std::to_string(_serverPort);
-
-	auto cancelMsg = getMessageFromPool(*invite);
-	if (!cancelMsg) return nullptr;   // pool exhausted: propagate, caller drops (#101A)
-
-	std::string targetIpPort = sipwire::addrToIpPort(target->getAddress());
-
-	cancelMsg->setHeader("CANCEL sip:" + target->getNumber() + "@" + targetIpPort + " SIP/2.0");
-	cancelMsg->setTo("To: <sip:" + target->getNumber() + "@" + serverIpPort + ">");
-
-	std::string cseq(invite->getCSeq());
-	size_t invitePos = cseq.find("INVITE");
-	if (invitePos != std::string::npos)
-	{
-		cseq.replace(invitePos, 6, "CANCEL");
-		cancelMsg->setCSeq(cseq);
-	}
-	cancelMsg->clearBody();
-	return cancelMsg;
 }
 
 bool RequestsHandler::setCallState(std::string_view callID, Session::State state)
@@ -2706,190 +2505,6 @@ void RequestsHandler::refreshPbxConfigSnapshot(PbxFeatureConfig::Table t)
 	}
 }
 
-// ── Action dispatch shared by the built-in codes and the dial plan (#69) ─────
-
-void RequestsHandler::routePageZone(const std::shared_ptr<SipMessage>& data,
-	const std::shared_ptr<SipClient>& caller,
-	const pbx::PageZone& zone)
-{
-	// A zone page is a scoped 999: fork an intercom (auto-answer) INVITE to every
-	// registered member of the zone. Lifted verbatim out of onInvite()'s 98x
-	// branch so the dial plan reaches the same code. Unlike routeRingGroup this
-	// needs no zone-extension parameter: startBroadcastFork stamps the intercom
-	// Contact as 999 for every page, built-in or dial-rule-aliased alike, so the
-	// zone's own extension never appears on the wire.
-	std::vector<std::shared_ptr<SipClient>> targets;
-	for (const auto& m : zone.members)
-	{
-		if (m == caller->getNumber()) continue;
-		auto mc = findClient(m);
-		if (mc.has_value())
-			targets.push_back(mc.value());
-	}
-
-	if (targets.empty())
-	{
-		std::shared_ptr<SipMessage> responseObj = getMessageFromPool(*data);
-		if (!responseObj) return;   // pool exhausted: drop, peer retransmits (#101A)
-		responseObj->setHeader(SipMessageTypes::UNAVAILABLE);
-		responseObj->clearBody();
-		responseObj->setContact(buildContact(caller->getNumber()));
-		_outbox.emplace_back(data->getSource(), std::move(responseObj));
-		return;
-	}
-
-	startBroadcastFork(data, caller, std::move(targets), /*intercom=*/true);
-}
-
-void RequestsHandler::routeRingGroup(const std::shared_ptr<SipMessage>& data,
-	const std::shared_ptr<SipClient>& caller,
-	const std::string& groupExt, const pbx::RingGroup& group)
-{
-	// Ring-all reuses the broadcast fork (without the intercom auto-answer headers,
-	// so members ring normally); hunt rings members one at a time, driven from
-	// tick(). Lifted verbatim out of onInvite()'s ring-group branch. `groupExt` is
-	// the REAL group extension — under a dial rule it differs from the dialed
-	// number, and Session::setGroupExt feeds the hunt-exhausted CDR and the
-	// no-answer Contact, both of which want the group's identity, not the alias.
-
-	// Collect the registered members (skip the caller and any offline member).
-	std::vector<std::shared_ptr<SipClient>> members;
-	std::vector<std::string> huntOrder;
-	for (const auto& m : group.members)
-	{
-		if (m == caller->getNumber()) continue;
-		auto mc = findClient(m);
-		if (mc.has_value())
-		{
-			members.push_back(mc.value());
-			huntOrder.push_back(m);
-		}
-	}
-
-	if (members.empty())
-	{
-		std::shared_ptr<SipMessage> responseObj = getMessageFromPool(*data);
-		if (!responseObj) return;   // pool exhausted: drop, peer retransmits (#101A)
-		responseObj->setHeader(SipMessageTypes::UNAVAILABLE);
-		responseObj->clearBody();
-		responseObj->setContact(buildContact(caller->getNumber()));
-		endHandle(data->getFromNumber(), responseObj);
-		return;
-	}
-
-	if (group.mode == pbx::GroupMode::RingAll)
-	{
-		startBroadcastFork(data, caller, std::move(members), /*intercom=*/false);
-		return;
-	}
-
-	// Hunt (sequential): build a broadcast-style session but ring one at a time.
-	auto newSession = allocateSession(std::string(data->getCallID()), caller);
-	if (!newSession)
-	{
-		std::shared_ptr<SipMessage> responseObj = getMessageFromPool(*data);
-		if (!responseObj) return;   // pool exhausted: drop, peer retransmits (#101A)
-		responseObj->setHeader("SIP/2.0 503 Service Unavailable");
-		responseObj->clearBody();
-		responseObj->setContact(buildContact(caller->getNumber()));
-		_outbox.emplace_back(data->getSource(), std::move(responseObj));
-		return;
-	}
-	newSession->setBroadcast(true);
-	newSession->setHunt(true);
-	newSession->setGroupExt(groupExt);
-	newSession->setInviteMessage(data);
-	newSession->setHuntMembers(std::move(huntOrder));
-	newSession->setHuntIndex(0);
-	_sessions.emplace(data->getCallID(), newSession);
-
-	// 180 Ringing back to the caller while we walk the list.
-	auto ringing = getMessageFromPool(*data);
-	if (!ringing) return;   // pool exhausted: drop, peer retransmits (#101A)
-	ringing->setHeader("SIP/2.0 180 Ringing");
-	ringing->clearBody();
-	std::string activeIp = _localIp;
-	ringing->setVia(std::string(data->getVia()) + ";received=" + activeIp);
-	ringing->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
-	ringing->setContact(buildContact(groupExt));
-	_outbox.emplace_back(data->getSource(), std::move(ringing));
-
-	huntRingNext(newSession);   // ring the first member, arm its timeout
-}
-
-// ── Dial plan (Issue #69) ────────────────────────────────────────────────────
-
-bool RequestsHandler::routeDialPlan(const std::shared_ptr<SipMessage>& data,
-	const std::shared_ptr<SipClient>& caller,
-	const std::string& destNumber)
-{
-	// Fast path: the table is empty on a default install, so the overwhelmingly
-	// common case costs one size check and nothing else.
-	if (_cfg.dialPlan().empty())
-	{
-		return false;
-	}
-
-	const pbx::DialRule* rule = _cfg.dialPlan().match(destNumber);
-	if (!rule)
-	{
-		return false;   // fallthrough — routing continues exactly as it did pre-#69
-	}
-
-	queueLog("Dial plan: " + destNumber + " matched \"" + rule->pattern + "\" -> " +
-		pbx::dialActionName(rule->action) + " " + rule->target);
-
-	switch (rule->action)
-	{
-	case pbx::DialActionType::RingGroup:
-		if (const pbx::RingGroup* group = _cfg.findRingGroup(rule->target))
-		{
-			routeRingGroup(data, caller, rule->target, *group);
-			return true;
-		}
-		break;
-
-	case pbx::DialActionType::PageZone:
-		if (const pbx::PageZone* zone = _cfg.findPageZone(rule->target))
-		{
-			routePageZone(data, caller, *zone);
-			return true;
-		}
-		break;
-
-	case pbx::DialActionType::ParkOrbit:
-	{
-		// Park/retrieve is stateless config-wise — the orbit always exists, so the
-		// only way this fails is a target outside this build's orbit range, which
-		// setDialRule() already refuses. Re-checked here anyway: POCKETDIAL_PARK_SLOTS
-		// can shrink under a rebuilt firmware that reloads an older NVS blob.
-		const int orbitIdx = _park.orbitIndex(rule->target);
-		if (orbitIdx >= 0)
-		{
-			_park.onInvite(data, caller, orbitIdx);
-			return true;
-		}
-		break;
-	}
-	}
-
-	// The rule matched but its target no longer resolves — a group or zone deleted
-	// after the rule was written, or an orbit outside this build's range. Answer
-	// 404 rather than falling through: falling through would silently ring a real
-	// extension that happens to share the dialed digits, which is a mis-routed
-	// call, whereas a stale rule failing loudly is diagnosable from one 404.
-	queueLog("Dial plan: rule \"" + rule->pattern + "\" -> " +
-		pbx::dialActionName(rule->action) + " " + rule->target +
-		" has no such target; answering 404", true);
-	auto responseObj = getMessageFromPool(*data);
-	if (!responseObj) return true;   // pool exhausted: drop, peer retransmits (#101A)
-	responseObj->setHeader(SipMessageTypes::NOT_FOUND);
-	responseObj->clearBody();
-	responseObj->setContact(buildContact(caller->getNumber()));
-	_outbox.emplace_back(data->getSource(), std::move(responseObj));
-	return true;
-}
-
 void RequestsHandler::setDialRule(const std::string& pattern, const std::string& action,
 	const std::string& target)
 {
@@ -3153,11 +2768,11 @@ void RequestsHandler::tick()
 					auto invite = session->getInviteMessage();
 					if (invite)
 					{
-						auto cancel = buildCancel(invite, t);
+						auto cancel = _forker.buildCancel(invite, t);
 						if (cancel) _outbox.emplace_back(t->getAddress(), std::move(cancel));
 					}
 				}
-				if (!huntRingNext(session))
+				if (!_forker.huntRingNext(session))
 				{
 					// List exhausted: 480 to the caller and tear down.
 					auto invite = session->getInviteMessage();
@@ -3184,12 +2799,12 @@ void RequestsHandler::tick()
 				{
 					if (dest)
 					{
-						auto cancel = buildCancel(invite, dest);
+						auto cancel = _forker.buildCancel(invite, dest);
 						if (cancel) _outbox.emplace_back(dest->getAddress(), std::move(cancel));
 					}
 					queueLog("CFNA: no answer, forwarding -> " + cfna);
 					endCall(callID, src->getNumber(), std::string(invite->getToNumber()), "no answer (CFNA)");
-					redirectInvite(invite, src, cfna);
+					_forker.redirectInvite(invite, src, cfna);
 				}
 			}
 		}
@@ -3900,14 +3515,14 @@ void RequestsHandler::onPickup(const std::shared_ptr<SipMessage>& data, const st
 	{
 		for (const auto& t : ringing->getPendingTargets())
 		{
-			auto cancel = buildCancel(invite, t);
+			auto cancel = _forker.buildCancel(invite, t);
 			if (cancel) _outbox.emplace_back(t->getAddress(), std::move(cancel));
 		}
 		ringing->setPendingTargets({});
 	}
 	else if (auto target = findClient(ringingExt); target.has_value())
 	{
-		auto cancel = buildCancel(invite, target.value());
+		auto cancel = _forker.buildCancel(invite, target.value());
 		if (cancel) _outbox.emplace_back(target.value()->getAddress(), std::move(cancel));
 	}
 	ringing->clearRingTimer();

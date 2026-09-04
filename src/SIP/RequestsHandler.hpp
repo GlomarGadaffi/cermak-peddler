@@ -46,6 +46,7 @@
 #include "PbxFeatureConfig.hpp"
 #include "CdrRing.hpp"
 #include "DtmfFeatureCodes.hpp"
+#include "CallForker.hpp"
 #include "RtpSender.hpp"
 #include "PbxEnv.hpp"
 #include "TransactionLayer.hpp"
@@ -454,28 +455,11 @@ private:
 	// tick()) and DtmfFeatureCodes::onInfo() (see _dtmf below) reach them as
 	// _cfg.xxx(...), all while already holding _mutex, exactly as before.
 
-	// ── Dial-plan dispatch (Issue #69) ────────────────────────────────────────
-	// The two "route this INVITE to an already-shipped action" bodies, lifted
-	// verbatim out of onInvite()'s built-in 98x / ring-group branches so the dial
-	// plan can reach the same code instead of duplicating it. Both take the action
-	// target EXPLICITLY rather than reading it back off the INVITE's To-number,
-	// because under a dial rule the dialed number and the group/zone extension are
-	// no longer the same string. Both always answer the caller (fork, 480, or
-	// 503) and so are terminal for the INVITE. Caller holds _mutex.
-	void routePageZone(const std::shared_ptr<SipMessage>& data,
-		const std::shared_ptr<SipClient>& caller,
-		const pbx::PageZone& zone);
-	void routeRingGroup(const std::shared_ptr<SipMessage>& data,
-		const std::shared_ptr<SipClient>& caller,
-		const std::string& groupExt, const pbx::RingGroup& group);
-
-	// Evaluate the dial plan against the dialed number. Returns true if a rule
-	// matched and the INVITE was fully handled (onInvite must return); false means
-	// no rule matched and routing falls through to the unchanged extension-lookup
-	// path. Caller holds _mutex.
-	bool routeDialPlan(const std::shared_ptr<SipMessage>& data,
-		const std::shared_ptr<SipClient>& caller,
-		const std::string& destNumber);
+	// ── Dial-plan dispatch (Issue #69) + fork/group routing ──────────────────────
+	// routePageZone/routeRingGroup/routeDialPlan, plus the shared fork/hunt/
+	// redirect/cancel core they and onInvite()/onBusy()/onUnavailable()/onRefer()/
+	// tick() all call, now live on _forker (CallForker.hpp) — reached as
+	// _forker.xxx(...), all while already holding _mutex, exactly as before.
 
 	// ── Directed / group call pickup (Issue #68) ──────────────────────────────
 	// See PbxConfig.hpp's isGroupPickupCode/directedPickupTarget doc comment for
@@ -511,37 +495,6 @@ private:
 	// original call is left untouched either way).
 	void onPickup(const std::shared_ptr<SipMessage>& data, const std::shared_ptr<SipClient>& picker,
 		const std::vector<std::string>& candidates);
-
-	// Fan an INVITE out to a set of targets (the reusable core extracted from the
-	// 999 all-page path). `targets` are pre-selected registered clients; `intercom`
-	// adds the 999 auto-answer headers (true for 999, false for a ring group so it
-	// rings normally). Builds the broadcast Session, the 180 Ringing to the caller,
-	// and one forked INVITE per target. Caller holds _mutex.
-	void startBroadcastFork(std::shared_ptr<SipMessage> invite,
-		std::shared_ptr<SipClient> caller,
-		const std::vector<std::shared_ptr<SipClient>>& targets,
-		bool intercom);
-
-	// Build and queue a single INVITE fork toward one target, re-pointing the
-	// request line / To at that target. `intercom` toggles the auto-answer headers.
-	// Caller holds _mutex.
-	// false when the message pool refused: no INVITE was sent, so the caller must
-	// not report success on its behalf (#101A).
-	bool buildInviteFork(const std::shared_ptr<SipMessage>& invite,
-		const std::shared_ptr<SipClient>& caller,
-		const std::shared_ptr<SipClient>& target,
-		bool intercom);
-
-	// Drive the next leg of a sequential hunt group (ring one member, arm timeout).
-	// Returns false when the member list is exhausted. Caller holds _mutex.
-	bool huntRingNext(const std::shared_ptr<Session>& session);
-
-	// Re-target an INVITE at `target` and (re)send it as a fresh call leg — the
-	// engine behind blind-transfer and call-forward "redirect" paths. Caller holds
-	// _mutex. Returns false if the target is not registered.
-	bool redirectInvite(const std::shared_ptr<SipMessage>& invite,
-		const std::shared_ptr<SipClient>& caller,
-		const std::string& target);
 
 	// Build a NOTIFY (Event: refer) carrying a message/sipfrag body reporting the
 	// transfer result back to the transferor. Caller holds _mutex.
@@ -592,11 +545,15 @@ private:
 	// _mutex. Safe to call off the SIP thread (the TUI/admin path).
 	bool sendMessageTo(const std::string& ext, const std::string& text);
 
-	// Broadcast / all-page extension (Issue #37). All assume the caller holds _mutex.
+	// Broadcast / all-page extension (Issue #37). startPaging/handlePagingAnswer/
+	// buildPagingBye below are declared but were already never defined or called
+	// anywhere in the codebase before this step (paging routes through
+	// startBroadcastFork instead, now on _forker) — left as-is; removing unused
+	// declarations is a separate cleanup, not this step's job. buildCancel moved
+	// to _forker.buildCancel(...) (CallForker.hpp) — it IS called, from tick()
+	// and onPickup().
 	void startPaging(std::shared_ptr<SipMessage> invite, std::shared_ptr<SipClient> caller);
 	void handlePagingAnswer(const std::shared_ptr<Session>& session, std::shared_ptr<SipMessage> data);
-	std::shared_ptr<SipMessage> buildCancel(const std::shared_ptr<SipMessage>& invite,
-		const std::shared_ptr<SipClient>& target);
 	std::shared_ptr<SipMessage> buildPagingBye(const std::shared_ptr<SipMessage>& ok,
 		const std::shared_ptr<SipClient>& answerer);
 
@@ -786,6 +743,15 @@ private:
 	// contract the original onDtmfInfo() documented.
 	DtmfFeatureCodes _dtmf{*this, _cfg, _cdr,
 		[this]() { return grantAdminHttpGraceWindow(); }};
+
+	// The fork/group/dial-plan routing engine (buildInviteFork, startBroadcastFork,
+	// huntRingNext, redirectInvite, buildCancel, routePageZone, routeRingGroup,
+	// routeDialPlan) now lives on CallForker. It takes _cfg (dial-plan/ring-group/
+	// page-zone lookups) and _park (the ParkOrbit dial-plan action reaches
+	// _park.orbitIndex()/_park.onInvite() directly, a sibling reference like _cfg,
+	// not a new PbxEnv virtual) by reference. Declared after both. Guarded by this
+	// engine's _mutex, same convention as every other extracted machine.
+	CallForker _forker{*this, _cfg, _park};
 };
 
 #endif
