@@ -139,6 +139,45 @@ TEST(ParkOrbit, ParkChangedFlagTracksSlotStateNotTraffic)
 	EXPECT_TRUE(park.snapshotRows(std::chrono::steady_clock::now(), /*onlyParked=*/false).empty());
 }
 
+// Issue #127: a BYE from either leg of a retrieved park must relay to the
+// other (RequestsHandler::onBye's peerCallID branch), but that relay only
+// fires when both legs' own dialog headers were captured via
+// setDialogHeaders() — the same convention CallPickup::complete() uses.
+// ParkOrbit is the producer of that state; this pins it directly rather than
+// relying on the harder-to-wire end-to-end office_smoke.py scenario that
+// originally caught the regression.
+TEST(ParkOrbit, RetrieveCapturesDialogHeadersOnBothLegsForByeRelay)
+{
+	FakePbxEnv env;
+	ParkOrbit park(env);
+
+	const sockaddr_in parkedAddr    = FakePbxEnv::addr("192.168.1.50", 5060);
+	const sockaddr_in retrieverAddr = FakePbxEnv::addr("192.168.1.51", 5060);
+
+	park.onInvite(inviteTo("700", "101", "parked-call-5@192.168.1.50", parkedAddr, "192.168.1.50"),
+		std::make_shared<SipClient>("101", parkedAddr), 0);
+	park.onInvite(inviteTo("700", "102", "retrieve-call-5@192.168.1.51", retrieverAddr, "192.168.1.51"),
+		std::make_shared<SipClient>("102", retrieverAddr), 0);
+
+	// findSession/insertSession key on the FULL "Call-ID: x@host" line (see
+	// ParkOrbit::sendReinvite's comment on getCallID()), not the bare value.
+	auto parked = env.findSession("Call-ID: parked-call-5@192.168.1.50");
+	ASSERT_TRUE(parked);
+	EXPECT_FALSE(parked->getDialogFrom().empty());
+	EXPECT_FALSE(parked->getDialogTo().empty());
+	EXPECT_NE(parked->getDialogFrom().find("101@"), std::string::npos) << parked->getDialogFrom();
+	EXPECT_NE(parked->getDialogTo().find(";tag="), std::string::npos) << parked->getDialogTo();
+	EXPECT_EQ(parked->getPeerCallID(), "Call-ID: retrieve-call-5@192.168.1.51");
+
+	auto retriever = env.findSession("Call-ID: retrieve-call-5@192.168.1.51");
+	ASSERT_TRUE(retriever);
+	EXPECT_FALSE(retriever->getDialogFrom().empty());
+	EXPECT_FALSE(retriever->getDialogTo().empty());
+	EXPECT_NE(retriever->getDialogFrom().find("102@"), std::string::npos) << retriever->getDialogFrom();
+	EXPECT_NE(retriever->getDialogTo().find(";tag="), std::string::npos) << retriever->getDialogTo();
+	EXPECT_EQ(retriever->getPeerCallID(), "Call-ID: parked-call-5@192.168.1.50");
+}
+
 // A retrieve that cannot get a session must 503 the retriever and leave the
 // orbit occupied rather than half-tearing-down the parked leg (#71).
 TEST(ParkOrbit, RetrieveWithExhaustedSessionPoolLeavesSlotParked)

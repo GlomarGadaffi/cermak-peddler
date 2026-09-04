@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased (fix/issue-127-park-retrieve-bye-relay) - 2026-09-04
+
+### Fixed — Park retrieve: BYE from either leg was never relayed to the other (#127)
+
+- `ParkOrbit::onInvite` created both the parked leg's session (at park time) and
+  the retriever's session (at retrieve time) without ever calling
+  `Session::setDialogHeaders()` — so `RequestsHandler::onBye`'s peerCallID
+  cross-dialog relay branch (the same one Issue #68 call pickup uses) always
+  found an empty `getDialogFrom()`/`getDialogTo()` and silently skipped
+  building the peer-addressed BYE. `peerCallID` itself was set correctly on
+  both legs; only the dialog-header half of the contract was missing, which is
+  why the retriever's own BYE was still answered 200 OK (its own dialog ended
+  fine) while the formerly-parked party's phone was left hanging on a dead
+  call.
+
+  Fixed by capturing each leg's own dialog `From`/`To` (with the server's own
+  to-tag) at the point each session is created, mirroring the convention
+  `CallPickup::complete()` already established. The ring-back-timeout leg
+  (`Session::isParkUac()`) has the same gap but is a server-UAC-role dialog
+  needing swapped header capture — out of scope here; the `onBye` comment
+  where the relay lives now says so explicitly.
+
+  New coverage in `tests/ParkOrbit_test.cpp` pins that both legs' dialog
+  headers and `peerCallID` are set after a retrieve — the host-testable
+  regression, since `.smoke/office_smoke.py`'s "Call park + retrieve" scenario
+  (which originally caught this) isn't wired into CI.
+
 ## Unreleased (on main, in no published release) - 2026-09-03
 
 ### Security — SoftAP WPA2, CSRF tokens, and a centralised admin gate
