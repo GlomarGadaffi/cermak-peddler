@@ -1908,6 +1908,27 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	std::string callID(data->getCallID());
 	auto targetClient = findClient(target);
 
+	// Issue #128: endCall() below is pure local bookkeeping (session/pool/CDR) — it
+	// never puts a packet on the wire, so the OTHER party on this dialog (the one
+	// NOT the transferor, dropped by the transfer) was never told the call ended and
+	// sat on a dead call forever. REFER is itself an in-dialog request on the SAME
+	// A-B dialog it's transferring out of, so data->getFrom()/getTo() already carry
+	// exactly this dialog's tags (transferor's own + the other party's) — no need to
+	// read session->getDialogFrom()/getDialogTo(), which armSessionTimer() only
+	// populates when RFC 4028 Session-Expires was negotiated.
+	if (auto original = getSession(callID); original.has_value())
+	{
+		auto src = original.value()->getSrc();
+		auto dest = original.value()->getDest();
+		auto other = (dest && dest->getNumber() != transferor->getNumber()) ? dest : src;
+		if (other && other->getNumber() != transferor->getNumber())
+		{
+			auto bye = buildServerBye(other->getNumber(), other->getAddress(), callID,
+				std::string(data->getFrom()), std::string(data->getTo()));
+			if (bye) _outbox.emplace_back(other->getAddress(), std::move(bye));
+		}
+	}
+
 	endCall(callID, transferor->getNumber(), std::string(data->getToNumber()), "blind transfer");
 
 	bool ok = targetClient.has_value() && _forker.redirectInvite(data, transferor, target);
