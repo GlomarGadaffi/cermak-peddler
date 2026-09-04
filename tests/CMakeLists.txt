@@ -167,6 +167,9 @@ add_executable(sip_parser_tests
     # Issue #53/#101(A)/#101(E): the static SipMessage pool, extracted out of
     # RequestsHandler into its own translation unit.
     ../src/SIP/SipMessagePool.cpp
+    # The five DND/forward/ring-group/page-zone/dial-plan PBX feature tables,
+    # extracted out of RequestsHandler into their own translation unit.
+    ../src/SIP/PbxFeatureConfig.cpp
     ../src/SIP/RequestsHandler.cpp
     ../src/SIP/TransactionLayer.cpp
     ../src/SIP/Registrar.cpp
