@@ -55,6 +55,46 @@ namespace siphdr
 		while (e > v && (h[e - 1] == '\r' || h[e - 1] == '\n')) --e;
 		return std::string(h.substr(v, e - v));
 	}
+
+	// Percent-decode a URI parameter value (RFC 3986 %XX escapes only — unlike
+	// HTTP form encoding, a SIP URI parameter does NOT treat '+' as space, so an
+	// intentional '+' in a Call-ID or tag survives unchanged). Used to decode the
+	// ?Replaces=callid;from-tag=X;to-tag=Y URI parameter on an attended-transfer
+	// Refer-To (RFC 3891) before the embedded ';' separators are parsed.
+	inline std::string urlDecode(std::string_view src)
+	{
+		// Hand-rolled instead of sscanf("%x", ...): sscanf greedily matches a
+		// variable-length run of hex digits, so a malformed escape like "%4Z"
+		// (second char not hex) would parse just "4", report success, and the
+		// caller's fixed pos += 2 would still skip both chars -- silently
+		// dropping the literal 'Z' instead of emitting it. Require BOTH chars
+		// to be hex before consuming either.
+		auto hexVal = [](char c) -> int
+		{
+			if (c >= '0' && c <= '9') return c - '0';
+			if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+			if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+			return -1;
+		};
+		std::string ret;
+		ret.reserve(src.size());
+		for (size_t pos = 0; pos < src.size(); ++pos)
+		{
+			if (src[pos] == '%' && pos + 2 < src.size())
+			{
+				int hi = hexVal(src[pos + 1]);
+				int lo = hexVal(src[pos + 2]);
+				if (hi >= 0 && lo >= 0)
+				{
+					ret += static_cast<char>((hi << 4) | lo);
+					pos += 2;
+					continue;
+				}
+			}
+			ret += src[pos];
+		}
+		return ret;
+	}
 }
 
 #endif

@@ -505,6 +505,16 @@ private:
 		const std::string& sipfrag,
 		bool terminated);
 
+	// Attended transfer (RFC 3891 Replaces), issue #131: onRefer() splices two live
+	// P2P sessions (A-B and A-C) into one B-C call via cross re-INVITEs carrying
+	// swapped SDP, then drops A. handleTransferOk() (called from onOk() before the
+	// normal session lookup, same pattern as _beeper.handleOk()/_park.handleOk())
+	// intercepts the 200 OK to each splice re-INVITE (CSeq 100, tracked by Call-ID
+	// in _transferPendingAcks) and ACKs it directly — it must never reach the
+	// generic relay below, which would forward it toward A, who is already gone.
+	// Caller holds _mutex.
+	bool handleTransferOk(const std::shared_ptr<SipMessage>& data);
+
 	// ── Media beachhead: virtual extension 440 (server-sourced RTP tone) ─────────
 	// onInvite() routes a dial of 440 here. The server answers 200 OK advertising its
 	// OWN media (server IP:port, m=audio <svrport> RTP/AVP 0, PCMU) and starts the
@@ -598,6 +608,13 @@ private:
 	// RequestsHandler.hpp: Issues #24 and #28 resolved.
 	std::unordered_map<std::string, std::function<void(std::shared_ptr<SipMessage> request)>> _handlers;
 	std::unordered_map<std::string, std::shared_ptr<Session>>   _sessions;
+
+	// Call-IDs of attended-transfer splice re-INVITEs (issue #131) pending their
+	// 200 OK -> ACK, so handleTransferOk() can find them (same bounded-vector
+	// pattern as ParkOrbit's own _pendingAcks). At most two entries live per
+	// transfer (the B leg and the C leg); endCall() erases any entry for the
+	// Call-ID it tears down, so a leg that dies mid-splice can't leak one forever.
+	std::vector<std::string> _transferPendingAcks;
 
 	std::mutex _mutex;
 	OnHandledEvent _onHandled;

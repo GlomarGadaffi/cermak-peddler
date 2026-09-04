@@ -128,6 +128,16 @@ public:
 	bool isTransferBridge() const { return _isTransferBridge; }
 	void setTransferBridge(bool v) { _isTransferBridge = v; }
 
+	// Whether the transferor (A) was THIS dialog's caller (src) or callee
+	// (dest) at splice time. The splice deliberately leaves src/dest
+	// unchanged (swapping them would corrupt CDR caller/callee and
+	// getRemoteSdp()'s "callee's SDP" meaning), so the surviving non-A party
+	// can be getSrc() OR getDest() depending on which side A originally was
+	// -- meaningful only when isTransferBridge() is true. Same
+	// role-inversion reasoning as isParkUac() above.
+	bool wasTransferorSrc() const { return _wasTransferorSrc; }
+	void setWasTransferorSrc(bool v) { _wasTransferorSrc = v; }
+
 	void release();
 
 private:
@@ -170,6 +180,7 @@ private:
 
 	std::string _remoteSdp;        // callee's most recent SDP (for transfer SDP swap)
 	bool _isTransferBridge = false; // true for attended-transfer bridge halves
+	bool _wasTransferorSrc = true; // meaningful only when _isTransferBridge
 };
 
 #endif

@@ -1483,6 +1483,52 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	// Attended-transfer bridge teardown (issue #131). MUST run before the generic
+	// peerCallID branch below: after onRefer()'s splice, both the B and C sessions
+	// still have src/dest exactly as they were in their ORIGINAL (pre-splice)
+	// dialog with A — the generic branch below BYEs peer->getSrc(), which is
+	// only ever right by coincidence here (A could be either side), so this gets
+	// its own branch rather than a special case bolted onto the generic one.
+	if (session.has_value() && session.value()->isTransferBridge() &&
+		!session.value()->getPeerCallID().empty())
+	{
+		auto response = getMessageFromPool(*data);
+		if (response)
+		{
+			response->setHeader(SipMessageTypes::OK);
+			response->setVia(std::string(data->getVia()) + ";received=" + _localIp);
+			response->clearBody();
+			_outbox.emplace_back(data->getSource(), std::move(response));
+		}
+
+		const std::string peerId = session.value()->getPeerCallID();
+		if (auto peer = getSession(peerId); peer.has_value())
+		{
+			auto peerSess = peer.value();
+			// wasTransferorSrc() records which side A was in the PEER's original
+			// dialog (captured at splice time, since A's identity is otherwise
+			// gone from both sessions by now) -- the surviving party is whichever
+			// side A wasn't.
+			bool peerAIsSrc = peerSess->wasTransferorSrc();
+			auto survivor = peerAIsSrc ? peerSess->getDest() : peerSess->getSrc();
+			// Same #72 malformed-BYE guard as the generic branch below.
+			if (survivor && !peerSess->getDialogFrom().empty() && !peerSess->getDialogTo().empty())
+			{
+				// Impersonate the dropped transferor (A) in the peer dialog — A's
+				// own From/To tags are exactly what that phone's dialog expects.
+				const std::string& peerAHdr     = peerAIsSrc ? peerSess->getDialogFrom() : peerSess->getDialogTo();
+				const std::string& peerOtherHdr = peerAIsSrc ? peerSess->getDialogTo()   : peerSess->getDialogFrom();
+				auto bye = buildServerBye(survivor->getNumber(), survivor->getAddress(),
+					peerId, peerAHdr, peerOtherHdr);
+				if (bye) _outbox.emplace_back(survivor->getAddress(), std::move(bye));
+			}
+			endCall(peerId, survivor ? survivor->getNumber() : std::string(),
+				std::string(data->getFromNumber()), "transfer bridge peer BYE");
+		}
+		endCall(data->getCallID(), data->getFromNumber(), destNumber, "transfer bridge BYE");
+		return;
+	}
+
 	// Cross-dialog bridge teardown (Issue #68 call pickup and, since #127,
 	// ParkOrbit's park+retrieve legs — both set peerCallID AND capture dialog
 	// headers). A BYE here ends ONE of two independently-dialogued legs that
@@ -1552,6 +1598,14 @@ void RequestsHandler::onOk(std::shared_ptr<SipMessage> data)
 	// snapshot mirror is driven by _park.consumeParkChanged() in handle(), so a
 	// state-neutral ACK confirmation no longer pays a rebuild.
 	if (_park.handleOk(data))
+	{
+		return;
+	}
+
+	// Attended-transfer splice re-INVITE ACKs (issue #131), same intercept-before-
+	// session-lookup pattern -- must never reach the generic relay below, which
+	// would forward this 200 OK toward A, the transferor the splice already drops.
+	if (handleTransferOk(data))
 	{
 		return;
 	}
@@ -1822,12 +1876,14 @@ void RequestsHandler::onAck(std::shared_ptr<SipMessage> data)
 
 void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 {
-	// Blind (unattended) transfer, RFC 3515. The transferor (the party that holds
-	// the call and pressed "transfer") sends REFER with a Refer-To header naming the
-	// new target. We ack 202 Accepted, then drive a fresh INVITE from the transferor
-	// to the target, and report progress with a NOTIFY (Event: refer + sipfrag body).
-	// Attended transfer (Refer-To carrying a Replaces= dialog) is OUT OF SCOPE — see
-	// the summary; such a REFER is treated as a blind transfer to the named target.
+	// RFC 3515 REFER handler -- blind transfer and attended transfer (RFC 3891
+	// Replaces). The transferor sends REFER with a Refer-To header naming the
+	// target. When the Refer-To carries a ?Replaces=callid URI parameter, the
+	// REFER is attended: two existing sessions (A-B and A-C, where A is this
+	// transferor) are spliced via cross re-INVITEs so B and C talk directly once A
+	// drops out (see the attended-transfer block below, issue #131). Otherwise the
+	// REFER is a blind transfer: 202 Accepted, then a fresh INVITE from the
+	// transferor to the target, reported back via NOTIFY (Event: refer + sipfrag).
 	auto transferorOpt = findClient(data->getFromNumber());
 	if (!transferorOpt.has_value())
 	{
@@ -1843,8 +1899,16 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	}
 	auto transferor = transferorOpt.value();
 
-	// Pull the Refer-To header value out of the raw message and extract the target.
+	// Pull the Refer-To header value out of the raw message, extract the target,
+	// and (issue #131) any ?Replaces= URI parameter naming the consult dialog.
 	std::string target;
+	std::string replacesCallIdBare; // bare call-id from ?Replaces=, URL-decoded
+	// True when a Replaces= param was present but decoded to something
+	// containing a control character (e.g. a %0D%0A-smuggled CRLF that would
+	// otherwise be embedded verbatim into an outgoing Call-ID header below).
+	// A malformed Replaces is NOT the same as an absent one -- it forces a
+	// 603 Decline rather than silently downgrading to a blind transfer.
+	bool replacesMalformed = false;
 	{
 		const std::string& raw = data->toString();
 		// Case-insensitive scan for a "Refer-To:" header line (no compact form in 3515).
@@ -1863,6 +1927,36 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 					size_t valEnd = (lineEnd == std::string::npos) ? raw.size() : lineEnd;
 					std::string value = raw.substr(pos + 9, valEnd - (pos + 9));
 					target = pbx::parseReferToTarget(value);
+
+					// parseReferToTarget() stops at '?', so the URI params (including
+					// Replaces=) are still intact in `value`.
+					if (size_t qmark = value.find('?'); qmark != std::string::npos)
+					{
+						std::string uriParams = value.substr(qmark + 1);
+						if (size_t rp = uriParams.find("Replaces="); rp != std::string::npos)
+						{
+							std::string repVal = uriParams.substr(rp + 9);
+							size_t semi = repVal.find_first_of(";&>\r");
+							replacesCallIdBare = siphdr::urlDecode(
+								(semi == std::string::npos) ? repVal : repVal.substr(0, semi));
+							// URL-decode FIRST, then strip: a %3B-encoded ;from-tag=/
+							// ;to-tag= param must not bleed into the bare call-id used
+							// for the session lookup below.
+							if (size_t semiDecoded = replacesCallIdBare.find(';');
+								semiDecoded != std::string::npos)
+							{
+								replacesCallIdBare.resize(semiDecoded);
+							}
+							for (unsigned char c : replacesCallIdBare)
+							{
+								if (c < 0x20 || c == 0x7F)
+								{
+									replacesMalformed = true;
+									break;
+								}
+							}
+						}
+					}
 					break;
 				}
 			}
@@ -1886,6 +1980,214 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
+	std::string callID(data->getCallID());
+
+	// ── Attended transfer (RFC 3891 Replaces), issue #131 ─────────────────────────
+	// A (transferor) has two active calls: A-B (this REFER's own dialog, callID)
+	// and A-C (the consult session, replacesCallIdBare). Splice B<->C via cross
+	// re-INVITEs carrying swapped SDP, then drop A from both dialogs. Falls through
+	// to the blind-transfer path below when Replaces is absent (or unusable).
+	if (!replacesCallIdBare.empty() || replacesMalformed)
+	{
+		const std::string replacesCallIdKey = "Call-ID: " + replacesCallIdBare;
+		bool canSplice = false;
+		std::shared_ptr<Session> ab, ac;
+		std::shared_ptr<SipClient> bClient, cClient;
+		std::string bSdp, cSdp, dFromAB, dToAB, dFromAC, dToAC;
+		bool aIsSrcAB = false, aIsSrcAC = false;
+
+		if (replacesMalformed)
+		{
+			// A control character survived decode (e.g. a %0D%0A-smuggled CRLF) --
+			// refuse outright rather than looking anything up with it. Decline,
+			// don't silently fall through to blind transfer: the caller asked for
+			// an attended transfer and it should fail as one, not quietly change
+			// what it did.
+			queueLog("REFER: attended transfer Replaces contains a control character after decode, declining", true);
+		}
+		else
+		{
+			auto sessionAB = getSession(callID);
+			auto sessionAC = getSession(replacesCallIdKey);
+			canSplice = sessionAB.has_value() && sessionAC.has_value();
+			if (canSplice)
+			{
+				ab = sessionAB.value();
+				ac = sessionAC.value();
+				const std::string aNum = transferor->getNumber();
+				aIsSrcAB = ab->getSrc() && ab->getSrc()->getNumber() == aNum;
+				bool aIsDestAB = ab->getDest() && ab->getDest()->getNumber() == aNum;
+				aIsSrcAC = ac->getSrc() && ac->getSrc()->getNumber() == aNum;
+				bool aIsDestAC = ac->getDest() && ac->getDest()->getNumber() == aNum;
+				// Narrower than #133's general onRefer auth gap: A must be common to
+				// BOTH dialogs, or there is nothing coherent to splice. Stays regardless
+				// of how #133 is eventually resolved.
+				if (!(aIsSrcAB || aIsDestAB) || !(aIsSrcAC || aIsDestAC))
+				{
+					queueLog("REFER: attended transfer invariant violated (A not common to both dialogs)", true);
+					canSplice = false;
+				}
+			}
+			if (canSplice)
+			{
+				// pocket-dial has no SIP-trunk/anchor concept on Session (unlike
+				// drawbridge's isAnchor()/isAnchorInbound() guard) -- every session here
+				// is already a P2P leg, so that check has no equivalent to port.
+				//
+				// A can be EITHER side of either dialog (the receptionist case: B
+				// calls A, A consults C, A transfers -- A is AB's callee, not its
+				// caller), so "the other party" and their SDP must be derived from
+				// which side A actually is, never assumed. getRemoteSdp() is always
+				// "the callee's SDP" -- when A is the callee, that SDP is A's OWN
+				// answer, not B's/C's, so the caller's original offer is read back
+				// from the stored INVITE message body instead (kept for the call's
+				// life -- see getInviteMessage()'s other callers). Same hold-SDP
+				// staleness caveat as the getRemoteSdp() path: this can't detect a
+				// later re-INVITE either, for the same reason noted below.
+				bClient = aIsSrcAB ? ab->getDest() : ab->getSrc();
+				cClient = aIsSrcAC ? ac->getDest() : ac->getSrc();
+				bSdp = aIsSrcAB ? ab->getRemoteSdp()
+					: (ab->getInviteMessage() ? std::string(ab->getInviteMessage()->getBody()) : std::string());
+				cSdp = aIsSrcAC ? ac->getRemoteSdp()
+					: (ac->getInviteMessage() ? std::string(ac->getInviteMessage()->getBody()) : std::string());
+				dFromAB = ab->getDialogFrom(); // AB dialog's caller (src) tag -- not necessarily A's
+				dToAB   = ab->getDialogTo();   // AB dialog's callee (dest) tag -- not necessarily B's
+				dFromAC = ac->getDialogFrom(); // AC dialog's caller (src) tag -- not necessarily A's
+				dToAC   = ac->getDialogTo();   // AC dialog's callee (dest) tag -- not necessarily C's
+				if (!bClient || !cClient || bSdp.empty() || cSdp.empty() ||
+					dFromAB.empty() || dToAB.empty() || dFromAC.empty() || dToAC.empty())
+				{
+					// SDP or dialog headers missing (call too new, or a leg never
+					// reached Connected) -- nothing coherent to splice. NOTE: a phone
+					// that put B on hold before consulting C has bSdp/cSdp holding B's
+					// HOLD answer (a=recvonly/inactive), not a resumed one -- this
+					// check doesn't (and can't, from here) catch that; it only catches
+					// SDP/headers never having been captured at all.
+					canSplice = false;
+				}
+			}
+		}
+
+		if (!canSplice)
+		{
+			auto declined = getMessageFromPool(*data);
+			if (!declined) return;   // pool exhausted: drop, peer retransmits (#101A)
+			declined->setHeader("SIP/2.0 603 Decline");
+			declined->clearBody();
+			declined->setVia(std::string(data->getVia()) + ";received=" + _localIp);
+			_outbox.emplace_back(data->getSource(), std::move(declined));
+			return;
+		}
+
+		// ── Draw every wire-critical message BEFORE mutating any session state or
+		// sending anything (#101A, same acquire-everything-then-mutate discipline as
+		// CallPickup::complete()). A splice touches two sessions' worth of wire state
+		// (two BYEs, two re-INVITEs, one 202); a refusal partway through would leave
+		// A half-dropped with B/C never re-INVITEd — worse than declining outright,
+		// so on ANY refusal below nothing is sent and nothing mutates.
+		const std::string srcIpPort = _localIp + ":" + std::to_string(_serverPort);
+
+		// A's own tag/header in each dialog, and the other party's -- these flip
+		// with orientation. A message the server sends impersonating A carries
+		// A's own tag as From and the peer's as To; a message impersonating the
+		// OTHER party (toward A, e.g. the BYE below) is the reverse. Same
+		// role-inversion reasoning as setParkUac()'s own comment.
+		const std::string& aHdrAB     = aIsSrcAB ? dFromAB : dToAB;
+		const std::string& otherHdrAB = aIsSrcAB ? dToAB   : dFromAB;
+		const std::string& aHdrAC     = aIsSrcAC ? dFromAC : dToAC;
+		const std::string& otherHdrAC = aIsSrcAC ? dToAC   : dFromAC;
+
+		auto byeAfromAB = buildServerBye(transferor->getNumber(), transferor->getAddress(),
+			callID, otherHdrAB, aHdrAB);
+		auto byeAfromAC = buildServerBye(transferor->getNumber(), transferor->getAddress(),
+			replacesCallIdKey, otherHdrAC, aHdrAC);
+
+		std::shared_ptr<SipMessage> invToB;
+		{
+			std::ostringstream ss;
+			ss << "INVITE sip:" << bClient->getNumber() << "@" << sipwire::addrToIpPort(bClient->getAddress()) << " SIP/2.0\r\n"
+			   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=z9hG4bK" << IDGen::GenerateID(12) << "\r\n"
+			   << "From: " << stripHeaderName(aHdrAB) << "\r\n"
+			   << "To: " << stripHeaderName(otherHdrAB) << "\r\n"
+			   << "Call-ID: " << stripHeaderName(callID) << "\r\n"
+			   << "CSeq: 100 INVITE\r\n"
+			   << "Max-Forwards: 70\r\n"
+			   << "Contact: <sip:" << bClient->getNumber() << "@" << srcIpPort << ">\r\n"
+			   << "User-Agent: pocket-dial\r\n"
+			   << "Content-Type: application/sdp\r\n"
+			   << "Content-Length: " << cSdp.size() << "\r\n\r\n"
+			   << cSdp;
+			invToB = getMessageFromPool(ss.str(), bClient->getAddress());
+		}
+		std::shared_ptr<SipMessage> invToC;
+		{
+			std::ostringstream ss;
+			ss << "INVITE sip:" << cClient->getNumber() << "@" << sipwire::addrToIpPort(cClient->getAddress()) << " SIP/2.0\r\n"
+			   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=z9hG4bK" << IDGen::GenerateID(12) << "\r\n"
+			   << "From: " << stripHeaderName(aHdrAC) << "\r\n"
+			   << "To: " << stripHeaderName(otherHdrAC) << "\r\n"
+			   << "Call-ID: " << replacesCallIdBare << "\r\n"
+			   << "CSeq: 100 INVITE\r\n"
+			   << "Max-Forwards: 70\r\n"
+			   << "Contact: <sip:" << cClient->getNumber() << "@" << srcIpPort << ">\r\n"
+			   << "User-Agent: pocket-dial\r\n"
+			   << "Content-Type: application/sdp\r\n"
+			   << "Content-Length: " << bSdp.size() << "\r\n\r\n"
+			   << bSdp;
+			invToC = getMessageFromPool(ss.str(), cClient->getAddress());
+		}
+		auto accepted = getMessageFromPool(*data);
+
+		if (!byeAfromAB || !byeAfromAC || !invToB || !invToC || !accepted)
+		{
+			// Pool exhausted partway through the draw: nothing has been sent or
+			// mutated yet (#101A) — drop, the transferor's phone retransmits the
+			// REFER and the whole splice is retried cleanly from scratch.
+			return;
+		}
+
+		(void)invToB->filterAudioCodecs(/*allowWideband=*/true);   // phone SDP relayed P2P
+		invToB->syncContentLength();
+		(void)invToC->filterAudioCodecs(/*allowWideband=*/true);   // phone SDP relayed P2P
+		invToC->syncContentLength();
+
+		accepted->setHeader(SipMessageTypes::ACCEPTED);
+		accepted->clearBody();
+		accepted->setVia(std::string(data->getVia()) + ";received=" + _localIp);
+		accepted->setTo(std::string(data->getTo()) + ";tag=" + IDGen::GenerateID(9));
+		_outbox.emplace_back(data->getSource(), std::move(accepted));
+
+		_outbox.emplace_back(transferor->getAddress(), std::move(byeAfromAB));
+		_outbox.emplace_back(transferor->getAddress(), std::move(byeAfromAC));
+		_outbox.emplace_back(bClient->getAddress(), std::move(invToB));
+		_outbox.emplace_back(cClient->getAddress(), std::move(invToC));
+		_transferPendingAcks.push_back(callID);
+		_transferPendingAcks.push_back(replacesCallIdKey);
+
+		// Link the two sessions as a transfer bridge: a BYE from either B or C
+		// (onBye's isTransferBridge() branch) relays to the other, using
+		// wasTransferorSrc() to find the surviving party -- A can be either
+		// src or dest of either original dialog, so unlike the generic
+		// peerCallID branch below it, this can't hardcode getDest().
+		ab->setPeerCallID(replacesCallIdKey);
+		ab->setTransferBridge(true);
+		ab->setWasTransferorSrc(aIsSrcAB);
+		ac->setPeerCallID(callID);
+		ac->setTransferBridge(true);
+		ac->setWasTransferorSrc(aIsSrcAC);
+
+		// NOTIFY A with the success sipfrag — best-effort: the splice itself is
+		// already fully committed and on the wire by this point, so a pool refusal
+		// here just means A's phone doesn't get the courtesy status update.
+		auto notify = buildReferNotify(data, transferor, "SIP/2.0 200 OK", /*terminated=*/true);
+		if (notify) _outbox.emplace_back(transferor->getAddress(), std::move(notify));
+
+		queueLog("REFER: attended transfer " + transferor->getNumber() + " -> " +
+			bClient->getNumber() + " <-> " + cClient->getNumber());
+		return;
+	}
+
+	// ── Blind transfer ─────────────────────────────────────────────────────────────
 	// 202 Accepted to the transferor (RFC 3515 §2.4.4).
 	{
 		auto accepted = getMessageFromPool(*data);
@@ -1905,7 +2207,6 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 	// matched no session and the transfer silently never completed. onBusy()/tick()
 	// (CFB/CFNA) end-then-redirect for exactly this reason. CDR is recorded as the
 	// original leg tears down; redirectInvite() then allocates a clean session.
-	std::string callID(data->getCallID());
 	auto targetClient = findClient(target);
 
 	// Issue #128: endCall() below is pure local bookkeeping (session/pool/CDR) — it
@@ -2004,6 +2305,38 @@ std::shared_ptr<SipMessage> RequestsHandler::buildReferNotify(const std::shared_
 	return getMessageFromPool(ss.str(), transferor->getAddress());
 }
 
+bool RequestsHandler::handleTransferOk(const std::shared_ptr<SipMessage>& data)
+{
+	// Only the splice re-INVITEs use CSeq 100 (chosen high enough to never collide
+	// with the dialog's own in-flight CSeq at splice time) — same recognise-by-
+	// Call-ID-in-a-tracking-vector pattern as ParkOrbit::handleOk's pendingAcks scan.
+	if (data->getCSeq().find(SipMessageTypes::INVITE) == std::string::npos) return false;
+	const std::string callID(data->getCallID());
+	auto it = std::find(_transferPendingAcks.begin(), _transferPendingAcks.end(), callID);
+	if (it == _transferPendingAcks.end()) return false;
+
+	std::string activeIp = _localIp;
+	std::string srcIpPort = activeIp + ":" + std::to_string(_serverPort);
+	std::string destIpPort = sipwire::addrToIpPort(data->getSource());
+
+	std::ostringstream ss;
+	ss << "ACK sip:" << data->getToNumber() << "@" << destIpPort << " SIP/2.0\r\n"
+	   << "Via: SIP/2.0/UDP " << srcIpPort << ";branch=z9hG4bK" << IDGen::GenerateID(12) << "\r\n"
+	   << "From: " << stripHeaderName(data->getFrom()) << "\r\n"
+	   << "To: " << stripHeaderName(data->getTo()) << "\r\n"
+	   << "Call-ID: " << stripHeaderName(callID) << "\r\n"
+	   << "CSeq: 100 ACK\r\n"
+	   << "Max-Forwards: 70\r\n"
+	   << "Content-Length: 0\r\n\r\n";
+	auto ack = getMessageFromPool(ss.str(), data->getSource());
+	if (!ack) return true;   // pool exhausted: drop, peer retransmits the 200 OK (#101A) —
+	                          // entry stays so the retransmit still lands here, not the
+	                          // generic relay below (which would forward it toward A).
+	_outbox.emplace_back(data->getSource(), std::move(ack));
+	_transferPendingAcks.erase(it);
+	return true;
+}
+
 bool RequestsHandler::setCallState(std::string_view callID, Session::State state)
 {
 	auto session = getSession(callID);
@@ -2026,6 +2359,12 @@ void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumbe
 	_txLayer.freeForCallId(callID);
 	// Free any park orbit slot holding this call's parked leg.
 	_park.freeForCallId(callID);
+	// Issue #131: a leg that dies mid-splice (before its 200 OK arrives) must not
+	// leak its entry in _transferPendingAcks forever -- same bounded-state
+	// reasoning as the park orbit line above.
+	_transferPendingAcks.erase(
+		std::remove(_transferPendingAcks.begin(), _transferPendingAcks.end(), std::string(callID)),
+		_transferPendingAcks.end());
 	// Drop this call's conference leg, if it had one. Idempotent for every other
 	// call, so this is the ONE place a 888 leg is released — BYE, CANCEL, a session
 	// timer expiring and the orphan sweep all funnel through endCall(), and none of

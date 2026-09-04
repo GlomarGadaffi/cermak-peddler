@@ -1,5 +1,83 @@
 # Changelog
 
+## Unreleased (feat/issue-131-attended-transfer) - 2026-09-04
+
+### Added — Attended transfer via REFER + Replaces (#131)
+
+- Ported drawbridge's `e594914` ("Phase C-2 — attended transfer via REFER +
+  Replaces") to pocket-dial. A transferor (A) with two active P2P calls — A-B
+  and a consult call A-C — sends REFER on the A-B dialog with a `Replaces`
+  URI parameter naming the A-C dialog (RFC 3891). `RequestsHandler::onRefer`
+  now recognizes this and splices B and C together directly: cross
+  re-INVITEs carry each leg's SDP to the other, A is BYE'd out of both
+  dialogs, and the two sessions are linked as a transfer bridge
+  (`Session::isTransferBridge`/`getPeerCallID`) so a later BYE from either B
+  or C relays to the other instead of reaching the now-departed A
+  (`RequestsHandler::onBye`'s new transfer-bridge branch, which must run
+  before the pre-existing Issue #68/#127 generic peerCallID branch). The
+  splice's own re-INVITE 200 OKs are intercepted and ACKed directly
+  (`RequestsHandler::handleTransferOk`, called from `onOk` before the
+  generic session lookup) so they never reach the generic relay, which would
+  otherwise forward them toward A.
+
+  Most of the supporting `Session` scaffolding this needed
+  (`_remoteSdp`/`getRemoteSdp`/`setRemoteSdp`, `_isTransferBridge`) was
+  already present as unused fields from an earlier partial port — this PR
+  wires it up rather than adding it from scratch. `onOk`'s SDP/dialog-header
+  capture for it turned out to already be in place too.
+
+  A can be either side (caller or callee) of either dialog — the
+  "receptionist" case (B calls A, A consults C) is just as valid as A
+  originating both calls. The splice derives which side A is on
+  independently per dialog and picks the other party's client, SDP (via
+  `getInviteMessage()->getBody()` when A is the callee, since
+  `getRemoteSdp()` is always "the callee's SDP" and would otherwise return
+  A's own answer), and dialog-header From/To orientation accordingly, rather
+  than assuming A is always the caller. `Session` gained
+  `wasTransferorSrc()`/`setWasTransferorSrc()` (mirroring the existing
+  `isParkUac()` pattern) so `onBye`'s transfer-bridge relay can find the
+  correct surviving peer and header orientation for a session whose original
+  A-orientation is otherwise unrecoverable by the time a later BYE arrives.
+
+  `siphdr::urlDecode` (new, `SipHeaderUtil.hpp`) percent-decodes the
+  `Replaces=` URI parameter before parsing its `;`-separated pieces, so a
+  `%3B`-encoded separator inside the SIP-URI-embedded value doesn't get cut
+  at the wrong point. A `Replaces` value that decodes to something
+  containing a control character (e.g. a `%0D%0A`-smuggled CRLF) is treated
+  as malformed and declined (603) rather than silently falling through to a
+  blind transfer.
+
+  New coverage in `tests/AttendedTransfer_test.cpp`: the splice's accepted
+  response and crossed re-INVITEs, the re-INVITE-OK-intercepted-not-relayed
+  behavior, post-splice BYE relay, an unresolvable `Replaces` declining
+  cleanly, and two orientation regressions found by adversarial review
+  before this PR — B-calls-A-then-A-consults-C, and both legs A-as-callee —
+  which the initial port got backwards (it unconditionally assumed A was the
+  caller of both dialogs). `.smoke/office_smoke.py`'s "Attended transfer"
+  scenario (A-as-caller only) also passes, 11/11 overall.
+
+  Known gaps, not fixed here: #133 (`onRefer` has no source-authorization
+  check, same as blind transfer); the splice's SDP/dialog-header presence
+  check can't detect a leg that's on HOLD at consult time (documented
+  in-code, not exercised by any test); RFC 3891 §3's `from-tag`/`to-tag`
+  MUST-match against the `Replaces` target dialog is not enforced (the bare
+  Call-ID is matched, tags are parsed by office_smoke's own construction but
+  not validated) — neither drawbridge's source nor this port do this
+  matching; worth its own follow-up if it matters in practice.
+
+### Fixed — ConferenceRoom test: RtpSender's real Linux pacer thread raced synchronous playout-buffer assertions (#135)
+
+- Found while adding the above: `ConferenceRoom.AnchorModeIsUnchangedByTheBusRewiring`
+  intermittently failed depending on the test binary's link layout, unrelated to
+  its own test bodies ever running. Root cause: `RtpSender.cpp`'s Linux-desktop
+  branch (`#elif defined(__linux__)`, Issue #82) is not the inert host stub the
+  test file's own header comment claimed — on this build (WSL defines
+  `__linux__`) it spawns a real `std::thread` the instant `startBridge()`
+  succeeds, racing the test's own direct calls into the same buffer. Fixed by
+  stopping that thread right after `startBridge()` succeeds, before driving the
+  buffer by hand. See `tests/ConferenceRoom_test.cpp` and issue #135 for the full
+  mechanism.
+
 ## Unreleased (fix/issue-128-blind-transfer-teardown) - 2026-09-04
 
 ### Fixed — Blind transfer: the dropped party never received a BYE (#128)
