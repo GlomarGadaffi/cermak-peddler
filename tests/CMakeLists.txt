@@ -64,6 +64,13 @@ add_executable(sip_parser_tests
     # 200 OK was silently dropped instead of reaching the held leg. Drives a full
     # 999 broadcast call through connect -> hold -> resume via handle().
     BroadcastHoldResume_test.cpp
+    # Issue #128: blind transfer's onRefer() tore down the transferor's ORIGINAL
+    # session (endCall(), pure local bookkeeping) without ever sending the
+    # dropped party a BYE on the wire. Drives a direct call through connect,
+    # then a blind transfer, and asserts the dropped party's phone actually
+    # gets a BYE for the dialog it was on (not just that the target gets an
+    # INVITE).
+    BlindTransfer_test.cpp
     # Issue #69: the bounded pattern -> action dial plan that generalizes the
     # ring-group mechanism. Pure grammar/precedence/cap coverage against
     # DialPlan.hpp, end-to-end routing (dispatch + fallthrough) driven through

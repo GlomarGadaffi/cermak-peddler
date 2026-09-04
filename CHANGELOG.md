@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased (fix/issue-128-blind-transfer-teardown) - 2026-09-04
+
+### Fixed — Blind transfer: the dropped party never received a BYE (#128)
+
+- `RequestsHandler::onRefer`'s blind-transfer path already tore down the
+  transferor's original session via `endCall()` before driving the fresh
+  INVITE to the transfer target (drawbridge's earlier fix for the reverse
+  ordering bug, already present here) — but `endCall()` is pure local
+  bookkeeping (session/pool/CDR release); it never puts a packet on the wire.
+  The OTHER party on that dialog (the one the transfer drops, not the
+  transferor) was never told the call ended, so its phone sat on a call the
+  server itself already considered over.
+
+  Fixed by sending that party an explicit BYE before `endCall()` erases the
+  session. REFER is itself an in-dialog request on the SAME dialog it's
+  transferring out of, so `data->getFrom()`/`getTo()` already carry that
+  dialog's tags exactly — no dependency on `Session::getDialogFrom()`/
+  `getDialogTo()`, which `armSessionTimer()` only populates when RFC 4028
+  Session-Expires was negotiated. Works regardless of which side of the
+  original call sent the REFER (the transferor can be either the original
+  caller or callee) by comparing both `Session::getSrc()`/`getDest()` against
+  the transferor's own number and BYE-ing whichever one isn't it.
+
+  New coverage in `tests/BlindTransfer_test.cpp` drives a full call through
+  connect and blind transfer, and asserts the dropped party receives a BYE
+  for the correct Call-ID (not just that the transfer target gets an
+  INVITE) — the host-testable regression, since
+  `.smoke/office_smoke.py`'s "Blind transfer" scenario (which originally
+  caught this) isn't wired into CI.
+
 ## Unreleased (fix/issue-127-park-retrieve-bye-relay) - 2026-09-04
 
 ### Fixed — Park retrieve: BYE from either leg was never relayed to the other (#127)
