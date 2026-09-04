@@ -173,6 +173,9 @@ add_executable(sip_parser_tests
     # The CDR ring buffer, extracted out of RequestsHandler into its own
     # translation unit.
     ../src/SIP/CdrRing.cpp
+    # The DTMF digit-collection state machine + CLASS/admin codes, extracted
+    # out of RequestsHandler into its own translation unit.
+    ../src/SIP/DtmfFeatureCodes.cpp
     ../src/SIP/RequestsHandler.cpp
     ../src/SIP/TransactionLayer.cpp
     ../src/SIP/Registrar.cpp
