@@ -83,8 +83,8 @@ public:
 	// ── Dial plan (Issue #69) ─────────────────────────────────────────────────
 	void setDialRule(const std::string& pattern, const std::string& action, const std::string& target);
 	std::vector<std::tuple<std::string, std::string, std::string>> dialRulesSnapshot() const;
-	// Read-only access for routeDialPlan() (still in RequestsHandler.cpp until
-	// the fork/group engine extraction) to call .empty()/.match() on directly.
+	// Read-only access for CallForker::routeDialPlan() (CallForker.hpp) to call
+	// .empty()/.match() on directly.
 	const pbx::DialPlan& dialPlan() const { return _dialPlan; }
 
 	// ── Directed / group call pickup (Issue #68) ──────────────────────────────

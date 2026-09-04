@@ -45,6 +45,9 @@
 #include "DialPlan.hpp"
 #include "PbxFeatureConfig.hpp"
 #include "CdrRing.hpp"
+#include "DtmfFeatureCodes.hpp"
+#include "CallForker.hpp"
+#include "CallPickup.hpp"
 #include "RtpSender.hpp"
 #include "PbxEnv.hpp"
 #include "TransactionLayer.hpp"
@@ -199,25 +202,28 @@ public:
 	std::vector<std::tuple<std::string, std::string, std::string>> getDialRules();
 
 	// ── Admin extension (Task 2B) ─────────────────────────────────────────────────
-	// NVS-persisted extension identity for the administrative endpoint.
-	// Default "1001". Loaded from NVS namespace "pbxcfg", key "admin_ext" at boot.
+	// NVS-persisted extension identity for the administrative endpoint
+	// (default "1001", NVS namespace "pbxcfg", key "admin_ext") now lives on
+	// DtmfFeatureCodes (see _dtmf below); this forwards to _dtmf.adminExt().
 	// cppcheck suggests returning `const std::string&` here (returnByReference).
-	// Deliberately not applied: _adminExt is mutated by saveAdminExt()/
-	// loadAdminExt() from other call paths with no lock of its own (callers of
-	// this getter are not required to hold _mutex — dashboard/HTTP reads go
-	// through here off the SIP thread). Returning by value at least keeps the
-	// caller's copy independent once this call returns; a reference would
-	// additionally dangle/tear if a concurrent save reallocates the string
-	// while the caller still holds it.
+	// Deliberately not applied: DtmfFeatureCodes's _adminExt is mutated by its
+	// saveAdminExt()/load() from other call paths with no lock of its own
+	// (callers of this getter are not required to hold _mutex — dashboard/HTTP
+	// reads go through here off the SIP thread). Returning by value at least
+	// keeps the caller's copy independent once this call returns; a reference
+	// would additionally dangle/tear if a concurrent save reallocates the
+	// string while the caller still holds it.
 	// cppcheck-suppress returnByReference
 	std::string getAdminExt() const;
 
 	// ── Admin HTTP-open deadline (PLAN_ADMIN_HTTP_ONLY.md Phase 2) ────────────────
 	// Epoch-ms deadline until which HttpServer's accept-loop should accept
 	// connections on a provisioned device; 0 means no open window. Written only by
-	// onDtmfInfo's DTMF trigger branch (Phase 3), which already holds _mutex; read
-	// lock-free here so HttpServer's own accept-loop thread never takes _mutex
-	// (invariant I2 — it is the only thread that touches the listen socket).
+	// grantAdminHttpGraceWindow() below — reached from DtmfFeatureCodes's *4887
+	// branch (Phase 3), which already holds _mutex, via the _grantAdminWindow
+	// callback; read lock-free here so HttpServer's own accept-loop thread never
+	// takes _mutex (invariant I2 — it is the only thread that touches the
+	// listen socket).
 	uint64_t getAdminHttpOpenUntilMs() const
 	{
 		return _adminHttpOpenUntilMs.load(std::memory_order_acquire);
@@ -230,12 +236,19 @@ public:
 	// extensions, ...) — since setting the PIN is exactly what flips
 	// AdminAuth::isProvisioned() to true and the dark-by-default gate on.
 	// Grants the same TTL window a DTMF trigger would; lock-free (atomic store
-	// only), safe to call from the HTTP worker thread.
-	void grantAdminHttpGraceWindow()
+	// only), safe to call from the HTTP worker thread. Returns the TTL (seconds)
+	// it applied so callers that need it for logging don't have to read
+	// _adminHttpTtlSec themselves — DtmfFeatureCodes's *4887 handler reaches
+	// this through the _grantAdminWindow callback passed to its constructor
+	// (see RequestsHandler's _dtmf member) rather than duplicating this
+	// arithmetic; HttpServer's existing caller (the set-PIN handler) ignores
+	// the return value.
+	uint16_t grantAdminHttpGraceWindow()
 	{
-		uint64_t untilMs = nowEpochMs() +
-			static_cast<uint64_t>(_adminHttpTtlSec.load()) * 1000ULL;
+		uint16_t ttlSec = _adminHttpTtlSec.load();
+		uint64_t untilMs = nowEpochMs() + static_cast<uint64_t>(ttlSec) * 1000ULL;
 		_adminHttpOpenUntilMs.store(untilMs, std::memory_order_release);
+		return ttlSec;
 	}
 
 	// Called by HttpServer's authenticated /api/admin/keepalive endpoint. A
@@ -318,12 +331,10 @@ private:
 	// BLF presence (RFC 6665 / RFC 4235) watcher-dialog FSM. Guarded by _mutex.
 	BlfSubscriptions _blf{*this};
 
-	// ── DTMF SIP INFO handler (Task 2C) ──────────────────────────────────────────
-	// Invoked from handle() when a SIP INFO arrives carrying
-	// Content-Type: application/dtmf-relay. Parses the Signal= digit, updates the
-	// per-Call-ID accumulator, and dispatches CLASS feature code actions.
-	// Called from the single-threaded SIP handler path — no additional mutex needed.
-	void onDtmfInfo(std::shared_ptr<SipMessage> data);
+	// The DTMF SIP INFO handler (Task 2C) — Signal= digit parsing, the
+	// per-Call-ID accumulator, and CLASS/admin-menu dispatch — now lives on
+	// DtmfFeatureCodes (see _dtmf below); handle() calls _dtmf.onInfo(request)
+	// directly, same single-threaded-SIP-path contract as before.
 
 	// Register beep (signaling-only intercom tone): the outbound UAC dialog FSM
 	// lives in RegisterBeeper (see RegisterBeeper.hpp). Guarded by _mutex.
@@ -441,32 +452,15 @@ private:
 
 	// DND/forward/ring-group/page-zone/dial-plan lookups and the Locked mutation
 	// cores that used to live here directly now live on the _cfg member (see
-	// PbxFeatureConfig.hpp) — callers throughout this file (onInvite(),
-	// onBusy(), tick(), onDtmfInfo()) reach them as _cfg.xxx(...), all while
-	// already holding _mutex, exactly as before.
+	// PbxFeatureConfig.hpp) — callers throughout this file (onInvite(), onBusy(),
+	// tick()) and DtmfFeatureCodes::onInfo() (see _dtmf below) reach them as
+	// _cfg.xxx(...), all while already holding _mutex, exactly as before.
 
-	// ── Dial-plan dispatch (Issue #69) ────────────────────────────────────────
-	// The two "route this INVITE to an already-shipped action" bodies, lifted
-	// verbatim out of onInvite()'s built-in 98x / ring-group branches so the dial
-	// plan can reach the same code instead of duplicating it. Both take the action
-	// target EXPLICITLY rather than reading it back off the INVITE's To-number,
-	// because under a dial rule the dialed number and the group/zone extension are
-	// no longer the same string. Both always answer the caller (fork, 480, or
-	// 503) and so are terminal for the INVITE. Caller holds _mutex.
-	void routePageZone(const std::shared_ptr<SipMessage>& data,
-		const std::shared_ptr<SipClient>& caller,
-		const pbx::PageZone& zone);
-	void routeRingGroup(const std::shared_ptr<SipMessage>& data,
-		const std::shared_ptr<SipClient>& caller,
-		const std::string& groupExt, const pbx::RingGroup& group);
-
-	// Evaluate the dial plan against the dialed number. Returns true if a rule
-	// matched and the INVITE was fully handled (onInvite must return); false means
-	// no rule matched and routing falls through to the unchanged extension-lookup
-	// path. Caller holds _mutex.
-	bool routeDialPlan(const std::shared_ptr<SipMessage>& data,
-		const std::shared_ptr<SipClient>& caller,
-		const std::string& destNumber);
+	// ── Dial-plan dispatch (Issue #69) + fork/group routing ──────────────────────
+	// routePageZone/routeRingGroup/routeDialPlan, plus the shared fork/hunt/
+	// redirect/cancel core they and onInvite()/onBusy()/onUnavailable()/onRefer()/
+	// tick() all call, now live on _forker (CallForker.hpp) — reached as
+	// _forker.xxx(...), all while already holding _mutex, exactly as before.
 
 	// ── Directed / group call pickup (Issue #68) ──────────────────────────────
 	// See PbxConfig.hpp's isGroupPickupCode/directedPickupTarget doc comment for
@@ -492,47 +486,17 @@ private:
 	std::shared_ptr<Session> findRingingSessionAmong(const std::vector<std::string>& candidates,
 		std::string& outCallId, std::string& outExt) const;
 
-	// Shared core for *8 and **<ext>: picks up the oldest Invited session
-	// ringing any of `candidates` (empty means "not eligible" — the caller
-	// already resolved eligibility/self-pickup before calling this), answers
-	// `picker`'s INVITE with the ringing call's SDP (and vice versa), cancels
-	// every other still-ringing fork of that call, and bridges the two
-	// resulting dialogs via Session::peerCallID (see onBye's peerCallID
-	// branch for teardown). 486 Busy Here on no match / pool exhaustion (the
-	// original call is left untouched either way).
-	void onPickup(const std::shared_ptr<SipMessage>& data, const std::shared_ptr<SipClient>& picker,
-		const std::vector<std::string>& candidates);
-
-	// Fan an INVITE out to a set of targets (the reusable core extracted from the
-	// 999 all-page path). `targets` are pre-selected registered clients; `intercom`
-	// adds the 999 auto-answer headers (true for 999, false for a ring group so it
-	// rings normally). Builds the broadcast Session, the 180 Ringing to the caller,
-	// and one forked INVITE per target. Caller holds _mutex.
-	void startBroadcastFork(std::shared_ptr<SipMessage> invite,
-		std::shared_ptr<SipClient> caller,
-		const std::vector<std::shared_ptr<SipClient>>& targets,
-		bool intercom);
-
-	// Build and queue a single INVITE fork toward one target, re-pointing the
-	// request line / To at that target. `intercom` toggles the auto-answer headers.
-	// Caller holds _mutex.
-	// false when the message pool refused: no INVITE was sent, so the caller must
-	// not report success on its behalf (#101A).
-	bool buildInviteFork(const std::shared_ptr<SipMessage>& invite,
-		const std::shared_ptr<SipClient>& caller,
-		const std::shared_ptr<SipClient>& target,
-		bool intercom);
-
-	// Drive the next leg of a sequential hunt group (ring one member, arm timeout).
-	// Returns false when the member list is exhausted. Caller holds _mutex.
-	bool huntRingNext(const std::shared_ptr<Session>& session);
-
-	// Re-target an INVITE at `target` and (re)send it as a fresh call leg — the
-	// engine behind blind-transfer and call-forward "redirect" paths. Caller holds
-	// _mutex. Returns false if the target is not registered.
-	bool redirectInvite(const std::shared_ptr<SipMessage>& invite,
-		const std::shared_ptr<SipClient>& caller,
-		const std::string& target);
+	// Everything AFTER finding the ringing session — the 486 rejection, the two
+	// 200 OKs that bridge the caller's and picker's independent dialogs via
+	// Session::peerCallID (see onBye's peerCallID branch for teardown), and
+	// cancelling every other still-ringing fork — now lives on _pickup
+	// (CallPickup.hpp) as complete(data, picker, ringing, ringingCallId,
+	// ringingExt). findRingingSessionAmong's raw _sessions scan above STAYS
+	// here (highest session coupling — same reasoning as keeping the 999
+	// target-selection loop in onInvite rather than growing PbxEnv with a
+	// mutable all-sessions visitor); onInvite's two pickup branches call
+	// findRingingSessionAmong themselves, then _pickup.complete(...) with the
+	// result.
 
 	// Build a NOTIFY (Event: refer) carrying a message/sipfrag body reporting the
 	// transfer result back to the transferor. Caller holds _mutex.
@@ -583,11 +547,15 @@ private:
 	// _mutex. Safe to call off the SIP thread (the TUI/admin path).
 	bool sendMessageTo(const std::string& ext, const std::string& text);
 
-	// Broadcast / all-page extension (Issue #37). All assume the caller holds _mutex.
+	// Broadcast / all-page extension (Issue #37). startPaging/handlePagingAnswer/
+	// buildPagingBye below are declared but were already never defined or called
+	// anywhere in the codebase before this step (paging routes through
+	// startBroadcastFork instead, now on _forker) — left as-is; removing unused
+	// declarations is a separate cleanup, not this step's job. buildCancel moved
+	// to _forker.buildCancel(...) (CallForker.hpp) — it IS called, from tick()
+	// and CallPickup::complete().
 	void startPaging(std::shared_ptr<SipMessage> invite, std::shared_ptr<SipClient> caller);
 	void handlePagingAnswer(const std::shared_ptr<Session>& session, std::shared_ptr<SipMessage> data);
-	std::shared_ptr<SipMessage> buildCancel(const std::shared_ptr<SipMessage>& invite,
-		const std::shared_ptr<SipClient>& target);
 	std::shared_ptr<SipMessage> buildPagingBye(const std::shared_ptr<SipMessage>& ok,
 		const std::shared_ptr<SipClient>& answerer);
 
@@ -696,9 +664,10 @@ private:
 	// Mirrors one of _cfg's five tables into the dashboard snapshot immediately
 	// after a mutation (Issue #77) — the callback _cfg invokes on every DND/
 	// forward/ring-group/page-zone/dial-rule change, whether it came from the
-	// public HTTP-facing setters or from onDtmfInfo()'s CLASS codes (already
-	// inside _mutex via handle()). Caller holds _mutex; takes _snapshotMutex
-	// internally, same nesting as every other snapshot refresh in this class.
+	// public HTTP-facing setters or from DtmfFeatureCodes::onInfo()'s CLASS
+	// codes (already inside _mutex via handle()). Caller holds _mutex; takes
+	// _snapshotMutex internally, same nesting as every other snapshot refresh
+	// in this class.
 	void refreshPbxConfigSnapshot(PbxFeatureConfig::Table t);
 
 	// How long to wait between OPTIONS keepalive cycles, in minutes. Atomic so the
@@ -765,35 +734,32 @@ private:
 
 	std::vector<std::pair<bool, std::string>> _logQueue;
 
-	// ── Admin extension (Task 2B) ─────────────────────────────────────────────────
-	// NVS-persisted extension identity for the administrative endpoint.
-	// Default "1001". Loaded from NVS namespace "pbxcfg", key "admin_ext" at boot.
-	std::string _adminExt{"1001"};
-	void loadAdminExt();
-	void saveAdminExt(const std::string& ext);
+	// The admin extension identity (Task 2B: _adminExt, loadAdminExt/
+	// saveAdminExt) and the DTMF digit-collection state machine + CLASS/admin
+	// dispatch (Task 2C: DtmfAccum, _dtmfState, onDtmfInfo) now live on
+	// DtmfFeatureCodes. It takes _cfg (the *60/*80/*73/*72 CLASS codes) and
+	// _cdr (the *69 last-caller lookup) by reference, and reaches
+	// grantAdminHttpGraceWindow() through a callback rather than duplicating
+	// its epoch-ms-plus-TTL arithmetic (see that method's comment above).
+	// Guarded by this engine's _mutex, same "single-threaded SIP handler path"
+	// contract the original onDtmfInfo() documented.
+	DtmfFeatureCodes _dtmf{*this, _cfg, _cdr,
+		[this]() { return grantAdminHttpGraceWindow(); }};
 
-	// ── DTMF digit-collection state machine (Task 2C) ────────────────────────────
-	// Per-Call-ID accumulator. Accessed only from the single-threaded UDP receiver
-	// task (the same path that calls handle()), so no additional mutex is needed.
-	struct DtmfAccum
-	{
-		std::string digits;          // accumulated digit string
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-		TickType_t  lastTick{0};     // xTaskGetTickCount() of last digit
-		TickType_t  starCodeFiredAtTick{0};
-#else
-		uint32_t    lastTick{0};     // monotonic ms counter on host
-		uint32_t    starCodeFiredAtTick{0};
-#endif
-		// Set when the *4887 HTTP-open star-code just matched for this dialog
-		// (0 = not pending). The star-code clears `digits` the instant the
-		// sequence equals "*4887", which can land before the admin finishes
-		// dialing *PIN#code if their PIN happens to begin with those four
-		// digits — see the Issue #93 detection in onDtmfInfo(). Cleared on the
-		// next digit (one warning per incident) or on the normal DTMF timeout.
-		static constexpr uint32_t TIMEOUT_MS = 5000;
-	};
-	std::unordered_map<std::string, DtmfAccum> _dtmfState;
+	// The fork/group/dial-plan routing engine (buildInviteFork, startBroadcastFork,
+	// huntRingNext, redirectInvite, buildCancel, routePageZone, routeRingGroup,
+	// routeDialPlan) now lives on CallForker. It takes _cfg (dial-plan/ring-group/
+	// page-zone lookups) and _park (the ParkOrbit dial-plan action reaches
+	// _park.orbitIndex()/_park.onInvite() directly, a sibling reference like _cfg,
+	// not a new PbxEnv virtual) by reference. Declared after both. Guarded by this
+	// engine's _mutex, same convention as every other extracted machine.
+	CallForker _forker{*this, _cfg, _park};
+
+	// Directed/group call pickup completion (Issue #68) — see the comment above
+	// findRingingSessionAmong for why the session-table scan stays here while
+	// only the completion logic moves to _pickup. Declared after _forker (it
+	// holds a CallForker& for buildCancel). Guarded by this engine's _mutex.
+	CallPickup _pickup{*this, _forker};
 };
 
 #endif
