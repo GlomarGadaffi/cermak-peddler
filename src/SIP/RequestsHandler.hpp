@@ -47,6 +47,7 @@
 #include "CdrRing.hpp"
 #include "DtmfFeatureCodes.hpp"
 #include "CallForker.hpp"
+#include "CallPickup.hpp"
 #include "RtpSender.hpp"
 #include "PbxEnv.hpp"
 #include "TransactionLayer.hpp"
@@ -485,16 +486,17 @@ private:
 	std::shared_ptr<Session> findRingingSessionAmong(const std::vector<std::string>& candidates,
 		std::string& outCallId, std::string& outExt) const;
 
-	// Shared core for *8 and **<ext>: picks up the oldest Invited session
-	// ringing any of `candidates` (empty means "not eligible" — the caller
-	// already resolved eligibility/self-pickup before calling this), answers
-	// `picker`'s INVITE with the ringing call's SDP (and vice versa), cancels
-	// every other still-ringing fork of that call, and bridges the two
-	// resulting dialogs via Session::peerCallID (see onBye's peerCallID
-	// branch for teardown). 486 Busy Here on no match / pool exhaustion (the
-	// original call is left untouched either way).
-	void onPickup(const std::shared_ptr<SipMessage>& data, const std::shared_ptr<SipClient>& picker,
-		const std::vector<std::string>& candidates);
+	// Everything AFTER finding the ringing session — the 486 rejection, the two
+	// 200 OKs that bridge the caller's and picker's independent dialogs via
+	// Session::peerCallID (see onBye's peerCallID branch for teardown), and
+	// cancelling every other still-ringing fork — now lives on _pickup
+	// (CallPickup.hpp) as complete(data, picker, ringing, ringingCallId,
+	// ringingExt). findRingingSessionAmong's raw _sessions scan above STAYS
+	// here (highest session coupling — same reasoning as keeping the 999
+	// target-selection loop in onInvite rather than growing PbxEnv with a
+	// mutable all-sessions visitor); onInvite's two pickup branches call
+	// findRingingSessionAmong themselves, then _pickup.complete(...) with the
+	// result.
 
 	// Build a NOTIFY (Event: refer) carrying a message/sipfrag body reporting the
 	// transfer result back to the transferor. Caller holds _mutex.
@@ -551,7 +553,7 @@ private:
 	// startBroadcastFork instead, now on _forker) — left as-is; removing unused
 	// declarations is a separate cleanup, not this step's job. buildCancel moved
 	// to _forker.buildCancel(...) (CallForker.hpp) — it IS called, from tick()
-	// and onPickup().
+	// and CallPickup::complete().
 	void startPaging(std::shared_ptr<SipMessage> invite, std::shared_ptr<SipClient> caller);
 	void handlePagingAnswer(const std::shared_ptr<Session>& session, std::shared_ptr<SipMessage> data);
 	std::shared_ptr<SipMessage> buildPagingBye(const std::shared_ptr<SipMessage>& ok,
@@ -752,6 +754,12 @@ private:
 	// not a new PbxEnv virtual) by reference. Declared after both. Guarded by this
 	// engine's _mutex, same convention as every other extracted machine.
 	CallForker _forker{*this, _cfg, _park};
+
+	// Directed/group call pickup completion (Issue #68) — see the comment above
+	// findRingingSessionAmong for why the session-table scan stays here while
+	// only the completion logic moves to _pickup. Declared after _forker (it
+	// holds a CallForker& for buildCancel). Guarded by this engine's _mutex.
+	CallPickup _pickup{*this, _forker};
 };
 
 #endif

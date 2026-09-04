@@ -179,6 +179,9 @@ add_executable(sip_parser_tests
     # The fork/group/dial-plan routing engine, extracted out of RequestsHandler
     # into its own translation unit.
     ../src/SIP/CallForker.cpp
+    # Directed/group call pickup completion, extracted out of RequestsHandler
+    # into its own translation unit.
+    ../src/SIP/CallPickup.cpp
     ../src/SIP/RequestsHandler.cpp
     ../src/SIP/TransactionLayer.cpp
     ../src/SIP/Registrar.cpp

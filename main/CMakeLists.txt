@@ -95,6 +95,7 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/SIP/CdrRing.cpp"
                             "../src/SIP/DtmfFeatureCodes.cpp"
                             "../src/SIP/CallForker.cpp"
+                            "../src/SIP/CallPickup.cpp"
                             "../src/SIP/RequestsHandler.cpp"
                             "../src/SIP/TransactionLayer.cpp"
                             "../src/SIP/Registrar.cpp"
