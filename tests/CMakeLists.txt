@@ -170,6 +170,9 @@ add_executable(sip_parser_tests
     # The five DND/forward/ring-group/page-zone/dial-plan PBX feature tables,
     # extracted out of RequestsHandler into their own translation unit.
     ../src/SIP/PbxFeatureConfig.cpp
+    # The CDR ring buffer, extracted out of RequestsHandler into its own
+    # translation unit.
+    ../src/SIP/CdrRing.cpp
     ../src/SIP/RequestsHandler.cpp
     ../src/SIP/TransactionLayer.cpp
     ../src/SIP/Registrar.cpp

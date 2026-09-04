@@ -44,6 +44,7 @@
 #include "PbxConfig.hpp"
 #include "DialPlan.hpp"
 #include "PbxFeatureConfig.hpp"
+#include "CdrRing.hpp"
 #include "RtpSender.hpp"
 #include "PbxEnv.hpp"
 #include "TransactionLayer.hpp"
@@ -434,12 +435,8 @@ private:
 	bool setCallState(std::string_view callID, Session::State state);
 	void endCall(std::string_view callID, std::string_view srcNumber, std::string_view destNumber, std::string_view reason = "");
 
-	// CDR: write one record into the ring as a call ends. Caller must hold _mutex.
-	// `session` (may be null) supplies the start time / final state used to derive
-	// duration and result; src/dest provide the parties when the session lookup
-	// can't (e.g. the virtual 777/999 extensions reuse a shared dummy client).
-	void recordCdr(const std::shared_ptr<Session>& session,
-		std::string_view srcNumber, std::string_view destNumber);
+	// CDR ring buffer moved to CdrRing.hpp (see _cdr below); endCall() now calls
+	// _cdr.record(...) directly, same "caller holds _mutex" contract as before.
 	uint64_t nowEpochMs() const;
 
 	// DND/forward/ring-group/page-zone/dial-plan lookups and the Locked mutation
@@ -678,12 +675,12 @@ private:
 	RegistrarSnapshot _snapshot;
 	std::mutex _snapshotMutex;
 
-	// CDR ring buffer (Phase 2). Fixed capacity, no heap growth: writes wrap and
-	// overwrite the oldest slot. All access is under _mutex. _cdrHead is the index
-	// of the NEXT slot to write; _cdrCount caps at POCKETDIAL_CDR_RECORDS.
-	std::array<CallDetailRecord, POCKETDIAL_CDR_RECORDS> _cdrRing;
-	size_t _cdrHead = 0;
-	size_t _cdrCount = 0;
+	// CDR ring buffer (Phase 2) now lives on CdrRing.hpp — data, NVS persistence,
+	// snapshot copy, and the *69 last-caller lookup, all still guarded by this
+	// engine's _mutex. See CdrRing.hpp's class comment for why it takes no
+	// PbxEnv reference (unlike _cfg above, nothing about a CDR write needs to
+	// refresh the dashboard snapshot immediately).
+	CdrRing _cdr;
 
 	// Issue #33: /api/pcap ring. Populated from handle() (inbound) and
 	// drainOutbox() (outbound), both already under _mutex.
@@ -729,11 +726,9 @@ private:
 	// now live on PbxFeatureConfig; NVS persistence for _forwards / _ringGroups /
 	// _pageZones / _dialPlan is unchanged, just relocated.
 
-	// Persistent CDR (Class A sweep). The CDR ring is flushed to the "cdrlog" NVS
-	// namespace on teardown (write-through) and reloaded on boot, so records survive
-	// reboot. No-ops on host. Caller holds _mutex.
-	void loadCdrRing();                   // boot-time reload of the ring
-	void persistCdrRing();                // flush the whole ring (bounded, fixed size)
+	// _cdr.load() (boot-time reload) and _cdr.record()'s write-through persist
+	// now live on CdrRing; the "cdrlog" NVS namespace and record shape are
+	// unchanged, just relocated.
 
 	// Pre-allocated static memory pools (Issue #53). The SipMessage pool itself
 	// now lives in SipMessagePool.hpp/.cpp (static there, not a member here).

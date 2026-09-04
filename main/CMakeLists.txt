@@ -92,6 +92,7 @@ idf_component_register(SRCS ${MAIN_SRC}
                             "../src/Helpers/OtaUpdater.cpp"
                             "../src/SIP/SipMessagePool.cpp"
                             "../src/SIP/PbxFeatureConfig.cpp"
+                            "../src/SIP/CdrRing.cpp"
                             "../src/SIP/RequestsHandler.cpp"
                             "../src/SIP/TransactionLayer.cpp"
                             "../src/SIP/Registrar.cpp"

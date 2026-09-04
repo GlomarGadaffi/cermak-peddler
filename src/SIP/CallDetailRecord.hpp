@@ -3,8 +3,8 @@
 
 // CallDetailRecord.hpp — fixed-footprint Call Detail Record (CDR) types.
 //
-// A CDR is written exactly once, as a call tears down (see RequestsHandler::
-// recordCdr, invoked from endCall()). Records are kept in a fixed-capacity ring
+// A CDR is written exactly once, as a call tears down (see CdrRing::record,
+// invoked from RequestsHandler::endCall()). Records are kept in a fixed-capacity ring
 // buffer (POCKETDIAL_CDR_RECORDS) so the memory cost is paid statically at boot
 // and never grows on the heap — consistent with the SIP object pools (see
 // PoolConfig.hpp). The newest record overwrites the oldest once the ring is full.
