@@ -71,6 +71,14 @@ add_executable(sip_parser_tests
     # gets a BYE for the dialog it was on (not just that the target gets an
     # INVITE).
     BlindTransfer_test.cpp
+    # Issue #131: attended transfer (REFER + Replaces, RFC 3891), ported from
+    # drawbridge. Splices two live P2P sessions via cross re-INVITEs carrying
+    # swapped SDP, then drops the transferor. Drives two direct calls through
+    # connect, then the splice, and asserts the crossed SDP, the splice
+    # re-INVITE's OK never reaching the dropped transferor, the post-splice
+    # BYE relay between the two remaining legs, and the 603-decline path for
+    # an unresolvable Replaces target.
+    AttendedTransfer_test.cpp
     # Issue #69: the bounded pattern -> action dial plan that generalizes the
     # ring-group mechanism. Pure grammar/precedence/cap coverage against
     # DialPlan.hpp, end-to-end routing (dispatch + fallthrough) driven through
