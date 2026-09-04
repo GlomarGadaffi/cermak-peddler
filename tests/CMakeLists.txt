@@ -164,6 +164,15 @@ add_executable(sip_parser_tests
     # driver. Host-compilable — the driver is a std::thread off-device and the
     # tests step the clock with tickOnce() instead of starting it.
     ../src/SIP/ConferenceRoom.cpp
+    # Issue #53/#101(A)/#101(E): the static SipMessage pool, extracted out of
+    # RequestsHandler into its own translation unit.
+    ../src/SIP/SipMessagePool.cpp
+    # The five DND/forward/ring-group/page-zone/dial-plan PBX feature tables,
+    # extracted out of RequestsHandler into their own translation unit.
+    ../src/SIP/PbxFeatureConfig.cpp
+    # The CDR ring buffer, extracted out of RequestsHandler into its own
+    # translation unit.
+    ../src/SIP/CdrRing.cpp
     ../src/SIP/RequestsHandler.cpp
     ../src/SIP/TransactionLayer.cpp
     ../src/SIP/Registrar.cpp

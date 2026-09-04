@@ -43,6 +43,8 @@
 #include "PcapCapture.hpp"
 #include "PbxConfig.hpp"
 #include "DialPlan.hpp"
+#include "PbxFeatureConfig.hpp"
+#include "CdrRing.hpp"
 #include "RtpSender.hpp"
 #include "PbxEnv.hpp"
 #include "TransactionLayer.hpp"
@@ -61,35 +63,16 @@ public:
 	RequestsHandler(std::string serverIp, int serverPort,
 		OnHandledEvent onHandledEvent);
 
-	// RETURNS NULL under sustained pressure — check it. The pool is bounded and
-	// its heap fallback is now bounded too (Issue #101(A)); once both are spent
-	// this refuses rather than allocating without limit. The contract for a
-	// caller that gets nullptr is to DROP: it cannot answer 503, because building
-	// the 503 would need a message out of the same empty pool. SIP over UDP
-	// retransmits, so a dropped packet costs latency, not the call.
-	// Issue #81: `message` is a view, never copied here — SipMessage::reset()
-	// below reads through it once, synchronously, to parse the pooled slot.
-	// Issue #105: taking it by view (not by value) also means a caller holding
-	// the original wire-received bytes (SipMessageFactory::createMessage, on
-	// behalf of SipServer::onNewMessage) keeps them intact after this returns.
+	// Forwarders onto the static pool in SipMessagePool.hpp/.cpp (Issue #53 /
+	// #101(A) / #101(E)) — kept as public statics here because SipMessageFactory,
+	// the handler table, and the test suite all call them as
+	// RequestsHandler::getMessageFromPool(...). See sipmsgpool::getMessageFromPool
+	// for the full contract (returns NULL under sustained pressure — check it;
+	// the caller's job on refusal is to drop, never to synthesize a response out
+	// of the same empty pool).
 	static std::shared_ptr<SipMessage> getMessageFromPool(std::string_view message, sockaddr_in src);
-	// Clones an already-parsed message into a free pool slot via a direct field
-	// copy (SipMessage's copy assignment is a plain owned-string/vector copy —
-	// no shared buffer to fix up). Used by every response-building call site that
-	// used to go through getMessageFromPool(source->toString(), source->getSource()),
-	// which paid a full serialize + reparse just to duplicate a message we had
-	// already parsed once (issue #76).
 	static std::shared_ptr<SipMessage> getMessageFromPool(const SipMessage& source);
 
-private:
-	// Hands out an uninitialized message the caller exclusively owns: a free
-	// (use_count()==1) pool slot, else a bounded heap fallback, else nullptr once
-	// POCKETDIAL_MSG_HEAP_FALLBACK_MAX are already alive (Issue #101(A)).
-	// Internally synchronized on a leaf mutex — the pool is reachable from the
-	// UDP receive task and the tick task at once. See the definition.
-	static std::shared_ptr<SipMessage> acquirePooledMessage();
-
-public:
 	// ── Media beachhead static helpers (pure; host-unit-tested) ──────────────────
 	// Build the server's own SDP body for the 440 answer (server media: PCMU on the
 	// server's RTP port). Pure formatter — exposed so tests can assert its body and
@@ -452,38 +435,15 @@ private:
 	bool setCallState(std::string_view callID, Session::State state);
 	void endCall(std::string_view callID, std::string_view srcNumber, std::string_view destNumber, std::string_view reason = "");
 
-	// CDR: write one record into the ring as a call ends. Caller must hold _mutex.
-	// `session` (may be null) supplies the start time / final state used to derive
-	// duration and result; src/dest provide the parties when the session lookup
-	// can't (e.g. the virtual 777/999 extensions reuse a shared dummy client).
-	void recordCdr(const std::shared_ptr<Session>& session,
-		std::string_view srcNumber, std::string_view destNumber);
+	// CDR ring buffer moved to CdrRing.hpp (see _cdr below); endCall() now calls
+	// _cdr.record(...) directly, same "caller holds _mutex" contract as before.
 	uint64_t nowEpochMs() const;
 
-	// Internal DND lookup used by onInvite(). Caller MUST already hold _mutex
-	// (std::mutex is non-recursive); does a bounded map lookup, no locking.
-	bool isDndEnabled(const std::string& extension);
-
-	// Lock-already-held mutation cores for setDnd()/setForward() (Issue #77).
-	// _mutex is non-recursive, and onDtmfInfo() runs inside handle()'s _mutex
-	// lock, so it cannot call the public setDnd()/setForward() without
-	// deadlocking. These do the actual map mutation + dashboard-snapshot
-	// refresh (queueLog only — no _mutex/_logQueue handling of their own) so
-	// both the public setters (after taking _mutex) and onDtmfInfo's CLASS
-	// code handling (already inside it) share one code path and one snapshot
-	// refresh, instead of onDtmfInfo writing _dnd/_forwards directly and
-	// leaving the dashboard snapshot stale until an unrelated HTTP-side call
-	// happens to touch the same extension.
-	void setDndLocked(const std::string& extension, bool on);
-	void setForwardLocked(const std::string& extension, const std::string& trigger, const std::string& target);
-
-	// Internal forward/group/zone lookups used by onInvite()/onBusy()/tick(). Caller
-	// MUST already hold _mutex (non-recursive) — bounded map lookups, no locking.
-	// getForwardTarget returns "" when no forward of that trigger is configured.
-	std::string getForwardTarget(const std::string& extension, const std::string& trigger) const;
-	const pbx::RingGroup* findRingGroup(const std::string& extension) const;
-	const pbx::PageZone* findPageZone(const std::string& extension) const;
-	bool isPageZoneDialog(const std::string& extension) const;
+	// DND/forward/ring-group/page-zone/dial-plan lookups and the Locked mutation
+	// cores that used to live here directly now live on the _cfg member (see
+	// PbxFeatureConfig.hpp) — callers throughout this file (onInvite(),
+	// onBusy(), tick(), onDtmfInfo()) reach them as _cfg.xxx(...), all while
+	// already holding _mutex, exactly as before.
 
 	// ── Dial-plan dispatch (Issue #69) ────────────────────────────────────────
 	// The two "route this INVITE to an already-shipped action" bodies, lifted
@@ -514,9 +474,10 @@ private:
 	// config table. All four assume the caller holds _mutex (called from
 	// onInvite()/onOk()/onBye(), which already do).
 
-	// Every OTHER extension co-membered with `ext` in any configured ring
-	// group, deduped and order-preserving. Empty if `ext` is in no group.
-	std::vector<std::string> pickupPeersOf(const std::string& ext) const;
+	// pickupPeersOf(ext) — every OTHER extension co-membered with `ext` in any
+	// configured ring group — now lives on _cfg (PbxFeatureConfig), a pure
+	// membership query over ring-group config; called here as
+	// _cfg.pickupPeersOf(...).
 
 	// True iff `session` is currently ringing `ext` (state == Invited AND
 	// either it's `ext`'s stored direct-call invite, or `ext` is one of its
@@ -702,8 +663,8 @@ private:
 		std::vector<std::pair<std::string, std::string>> pageZones;
 		// Dial-plan rules (Issue #69): {pattern, "group"|"page"|"park", target},
 		// in table order — the order they are evaluated in. Unlike pageZones this
-		// is rebuilt from _dialPlan every tick() alongside ringGroups, so it needs
-		// no out-of-band carry-over across the snapshot swap.
+		// is rebuilt from _cfg's dial plan every tick() alongside ringGroups, so
+		// it needs no out-of-band carry-over across the snapshot swap.
 		std::vector<std::tuple<std::string, std::string, std::string>> dialRules;
 		// Adopted devices (STAGE 2): {mac, ext, state, online}. Mirrored from the
 		// Registrar's registry under _mutex; copied out under _snapshotMutex.
@@ -714,47 +675,31 @@ private:
 	RegistrarSnapshot _snapshot;
 	std::mutex _snapshotMutex;
 
-	// CDR ring buffer (Phase 2). Fixed capacity, no heap growth: writes wrap and
-	// overwrite the oldest slot. All access is under _mutex. _cdrHead is the index
-	// of the NEXT slot to write; _cdrCount caps at POCKETDIAL_CDR_RECORDS.
-	std::array<CallDetailRecord, POCKETDIAL_CDR_RECORDS> _cdrRing;
-	size_t _cdrHead = 0;
-	size_t _cdrCount = 0;
+	// CDR ring buffer (Phase 2) now lives on CdrRing.hpp — data, NVS persistence,
+	// snapshot copy, and the *69 last-caller lookup, all still guarded by this
+	// engine's _mutex. See CdrRing.hpp's class comment for why it takes no
+	// PbxEnv reference (unlike _cfg above, nothing about a CDR write needs to
+	// refresh the dashboard snapshot immediately).
+	CdrRing _cdr;
 
 	// Issue #33: /api/pcap ring. Populated from handle() (inbound) and
 	// drainOutbox() (outbound), both already under _mutex.
 	PcapCapture _pcapCapture;
 
-	// DND state, keyed by extension. Bounded by the client-pool depth: an entry is
-	// only created when DND is turned ON, and turning it OFF erases the entry, so
-	// the map can never hold more than POCKETDIAL_MAX_CLIENTS live extensions.
-	// Guarded by _mutex. (A std::shared_ptr<SipClient> flag would be lost across
-	// re-REGISTER / pool eviction; keying by extension keeps DND sticky.)
-	std::unordered_map<std::string, bool> _dnd;
-
-	// Call-forwarding config, keyed by extension (Class A sweep). Same bounding /
-	// stickiness rationale as _dnd: an entry exists only while at least one trigger
-	// is set, and is bounded by POCKETDIAL_MAX_CLIENTS. Guarded by _mutex; mirrored
-	// into the dashboard snapshot and persisted to NVS.
-	std::unordered_map<std::string, pbx::ForwardConfig> _forwards;
-
-	// Ring/hunt groups, keyed by the group extension (e.g. 6xx). Bounded by
-	// POCKETDIAL_MAX_CLIENTS groups; each member list is bounded by splitMembers().
-	// Guarded by _mutex; mirrored into the snapshot and persisted to NVS.
-	std::unordered_map<std::string, pbx::RingGroup> _ringGroups;
-
-	// Paging zones, keyed by the zone extension (980–989). Bounded by
-	// POCKETDIAL_MAX_PAGE_ZONES; member lists bounded by splitZoneMembers().
-	// Guarded by _mutex; mirrored into the snapshot and persisted to NVS.
-	std::unordered_map<std::string, pbx::PageZone> _pageZones;
-
-	// Dial-plan rule table (Issue #69). An ORDERED vector, not a map: first match
-	// wins, so evaluation order is the semantics. Hard-capped at
-	// POCKETDIAL_MAX_DIAL_RULES by DialPlan::upsert(). Guarded by _mutex; mirrored
-	// into the snapshot and persisted to NVS. Empty by default, and an empty table
-	// is a no-op on routing — every dialed number falls straight through to the
-	// pre-#69 extension-lookup path.
-	pbx::DialPlan _dialPlan;
+	// The five DND/forward/ring-group/page-zone/dial-plan tables live on _cfg now
+	// (PbxFeatureConfig.hpp) — data + validation + NVS persistence, all still
+	// guarded by this engine's _mutex (see PbxFeatureConfig's class comment for
+	// why it takes a callback instead of touching _snapshot/_snapshotMutex
+	// directly).
+	PbxFeatureConfig _cfg{*this,
+		[this](PbxFeatureConfig::Table t) { refreshPbxConfigSnapshot(t); }};
+	// Mirrors one of _cfg's five tables into the dashboard snapshot immediately
+	// after a mutation (Issue #77) — the callback _cfg invokes on every DND/
+	// forward/ring-group/page-zone/dial-rule change, whether it came from the
+	// public HTTP-facing setters or from onDtmfInfo()'s CLASS codes (already
+	// inside _mutex via handle()). Caller holds _mutex; takes _snapshotMutex
+	// internally, same nesting as every other snapshot refresh in this class.
+	void refreshPbxConfigSnapshot(PbxFeatureConfig::Table t);
 
 	// How long to wait between OPTIONS keepalive cycles, in minutes. Atomic so the
 	// TUI can read without taking _mutex. Persisted to NVS ("pbxcfg"/"rewarm_min").
@@ -777,26 +722,18 @@ private:
 	// cheap in-place path for an online-flag-only change. Caller holds _mutex.
 	void applyDeviceChange(Registrar::Change change);
 
-	// NVS persistence for _forwards / _ringGroups / _pageZones. No-ops on host (the
-	// maps are the store); on ESP they read/write the "pbxcfg" NVS namespace.
-	// Caller holds _mutex.
-	void loadPbxConfig();                 // boot-time reload into the maps
-	void persistForwards();               // write-through after a setForward mutation
-	void persistRingGroups();             // write-through after a setRingGroup mutation
-	void persistPageZones();              // write-through after a setPageZone mutation
-	void persistDialPlan();               // write-through after a setDialRule mutation
-	bool _pbxConfigLoaded = false;
+	// _cfg.loadPbxConfig() (boot-time reload) and the four persist* write-throughs
+	// now live on PbxFeatureConfig; NVS persistence for _forwards / _ringGroups /
+	// _pageZones / _dialPlan is unchanged, just relocated.
 
-	// Persistent CDR (Class A sweep). The CDR ring is flushed to the "cdrlog" NVS
-	// namespace on teardown (write-through) and reloaded on boot, so records survive
-	// reboot. No-ops on host. Caller holds _mutex.
-	void loadCdrRing();                   // boot-time reload of the ring
-	void persistCdrRing();                // flush the whole ring (bounded, fixed size)
+	// _cdr.load() (boot-time reload) and _cdr.record()'s write-through persist
+	// now live on CdrRing; the "cdrlog" NVS namespace and record shape are
+	// unchanged, just relocated.
 
-	// Pre-allocated static memory pools (Issue #53)
+	// Pre-allocated static memory pools (Issue #53). The SipMessage pool itself
+	// now lives in SipMessagePool.hpp/.cpp (static there, not a member here).
 	std::vector<std::shared_ptr<SipClient>> _clientPool;
 	std::vector<std::shared_ptr<Session>> _sessionPool;
-	static std::vector<std::shared_ptr<SipMessage>> _messagePool;
 	// Virtual-peer pool: transient SipClient slots for 777/440/park legs (Issue #70).
 	std::vector<std::shared_ptr<SipClient>> _virtualPeerPool;
 

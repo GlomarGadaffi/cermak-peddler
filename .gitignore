@@ -64,6 +64,10 @@ Thumbs.db
 # Build output, managed deps, and scratch (added 2026-06-03)
 # build_*/ catches any alternate/side-by-side build dir (build_desktop, build_v5_eth, ...)
 build_*/
+# build-wsl/: the WSL host-test build dir (hyphen, not underscore — build_*/ above
+# does not match it). Without this, `git stash -u` sweeps its generated CMake/gtest
+# content into the stash as "untracked".
+build-wsl/
 managed_components/
 dependencies.lock
 scratch/

@@ -1,5 +1,6 @@
 // RequestsHandler.cpp: Issues #24 and #28 resolved.
 #include "RequestsHandler.hpp"
+#include "SipMessagePool.hpp"
 #include <atomic>
 #include <sstream>
 #include <cctype>
@@ -34,8 +35,6 @@
 	#include "esp_idf_version.h"
 #endif
 
-std::vector<std::shared_ptr<SipMessage>> RequestsHandler::_messagePool;
-
 // File-scope static helpers defined later in this translation unit.
 static bool sameAddress(const sockaddr_in&, const sockaddr_in&);
 static std::string stripHeaderName(std::string_view fullLine);
@@ -55,11 +54,10 @@ namespace
 	// forward, or advancing to the next hunt-group member). Polled from tick().
 	constexpr auto NO_ANSWER_TIMEOUT = std::chrono::seconds(20);
 
-	// NVS namespaces / keys for the persisted PBX config and CDR ring. Kept short
-	// (NVS keys are capped at 15 chars). Forward/group entries are stored one blob
-	// per extension so a single mutation rewrites only its own key (low flash wear).
-	constexpr auto NVS_PBX_NS  = "pbxcfg";
-	constexpr auto NVS_CDR_NS  = "cdrlog";
+	// NVS namespace for the persisted PBX config, pbxcfg (loadAdminHttpTtl /
+	// loadAdminExt / saveAdminExt) is pbxpersist::kNvsNamespace (PbxPersist.hpp)
+	// so there is exactly one definition of "pbxcfg" in the codebase. The CDR
+	// ring's own namespace ("cdrlog") now lives on CdrRing.cpp.
 }
 
 RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
@@ -82,14 +80,7 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	{
 		_sessionPool.push_back(std::make_shared<Session>());
 	}
-	if (_messagePool.empty())
-	{
-		_messagePool.reserve(POCKETDIAL_MSG_POOL);
-		for (int i = 0; i < POCKETDIAL_MSG_POOL; ++i)
-		{
-			_messagePool.push_back(std::make_shared<SipSdpMessage>("", sockaddr_in{}));
-		}
-	}
+	sipmsgpool::ensureInitialized();
 	_virtualPeerPool.reserve(POCKETDIAL_VIRTUAL_PEERS);
 	for (int i = 0; i < POCKETDIAL_VIRTUAL_PEERS; ++i)
 	{
@@ -99,8 +90,8 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	// Reload persisted PBX config (call-forward / ring groups) and the CDR ring from
 	// NVS so they survive reboot. No-ops on host. Construction is single-threaded
 	// (no handler is dispatching yet), so these run without holding _mutex.
-	loadPbxConfig();
-	loadCdrRing();
+	_cfg.loadPbxConfig();
+	_cdr.load();
 	// Task 2B: load the admin extension from NVS (defaults to "1001" if absent).
 	loadAdminExt();
 	// STAGE 2: load the registrar mode (defaults to the POCKETDIAL_OPEN_REGISTRAR
@@ -116,61 +107,16 @@ RequestsHandler::RequestsHandler(std::string serverIp, int serverPort,
 	refreshDeviceSnapshot();
 }
 
-// ── Message pool synchronization (Issue #101(A) / #101(E)) ──────────────────
-//
-// Leaf lock guarding the static _messagePool. LEAF means exactly that: nothing
-// inside its critical section may acquire another lock, ever. That is what makes
-// it safe to take whether or not the caller already holds _mutex, with no lock
-// ordering to reason about.
-//
-// It is needed because handing a slot out is a check-then-take (scan for
-// use_count()==1, then copy the shared_ptr) over a pool reachable from two
-// tasks at once:
-//
-//   * the UDP receive task (UdpServer.cpp:134) -> SipServer::onNewMessage ->
-//     SipMessageFactory::createMessage -> getMessageFromPool, holding NO lock —
-//     handle() only takes _mutex afterwards, on the already-allocated message;
-//   * the tick task (esp_main.cpp:192, or SipServer::tickLoop on desktop) ->
-//     tick() -> TransactionLayer::sweep -> messageFromPool, under _mutex.
-//
-// Unsynchronized, both could observe use_count()==1 on the same slot and both
-// take it, then reset() it concurrently — two owners writing the same
-// SipMessage, reallocating its strings under each other. _mutex on one side does
-// not help: a lock only excludes other holders of that same lock. Found by the
-// #101(E) audit, fixed here because it lives in the function #101(A) rewrites.
-static std::mutex s_msgPoolMutex;
-
-// Heap-fallback messages currently alive. Atomic because the decrement happens
-// in the deleter, which runs wherever the last reference happens to drop —
-// commonly on the socket-send path after the outbox is drained, outside every
-// lock we hold here.
-static std::atomic<std::size_t> s_msgHeapFallbacksInFlight{0};
-
-namespace
-{
-	// Releases a bounded heap-fallback message and gives its budget back.
-	//
-	// MUST NOT take s_msgPoolMutex (or any lock): the last reference can drop
-	// while that mutex is held — dropping a superseded message inside the pool
-	// critical section would self-deadlock on a non-recursive mutex. An atomic
-	// decrement is all this is allowed to do.
-	struct HeapFallbackDeleter
-	{
-		void operator()(SipMessage* p) const noexcept
-		{
-			delete p;
-			s_msgHeapFallbacksInFlight.fetch_sub(1, std::memory_order_relaxed);
-		}
-	};
-}
-
-// Same bounded-fallback bookkeeping for the virtual-peer pool. Separate budget:
-// a virtual peer is a long-lived per-park-slot stand-in, not a per-packet object.
+// Same bounded-fallback bookkeeping for the virtual-peer pool as the message
+// pool uses (SipMessagePool.cpp). Separate budget: a virtual peer is a
+// long-lived per-park-slot stand-in, not a per-packet object.
 static std::atomic<std::size_t> s_vpeerHeapFallbacksInFlight{0};
 
 namespace
 {
-	// Same no-locking rule as HeapFallbackDeleter above.
+	// Same no-locking rule as SipMessagePool's HeapFallbackDeleter: the last
+	// reference can drop while a pool-critical-section lock is held elsewhere,
+	// so the deleter must not itself take any lock.
 	struct VpeerFallbackDeleter
 	{
 		void operator()(SipClient* p) const noexcept
@@ -181,107 +127,17 @@ namespace
 	};
 }
 
-// Two distinct signals, deliberately. `Fallback` fires the moment the fixed pool
-// runs dry and the heap fallback takes over — pressure building, nothing lost yet.
-// `Refused` fires once the fallback budget is spent too and packets are actually
-// being dropped. Collapsing them (as an earlier cut of #101(A) did) removes the
-// only early warning an operator gets and reports trouble solely after the damage.
-enum class PoolPressure { Fallback, Refused };
-
-static void logPoolExhausted(const char* poolName, PoolPressure level,
-	std::atomic<std::size_t>& warnCount)
-{
-	// Rate-limited 1-in-100: a flood that drains the pool would otherwise also
-	// flood the log pipe. The running total is kept in the message so the sampling
-	// does not hide the true magnitude.
-	const std::size_t n = warnCount.fetch_add(1, std::memory_order_relaxed) + 1;
-	if ((n - 1) % 100 == 0)
-	{
-		std::cerr << "[WARNING] " << poolName << " pool exhausted ("
-			<< n << " total)! "
-			<< (level == PoolPressure::Fallback
-				? "Falling back to bounded heap allocation.\n"
-				: "Fallback budget spent — DROPPING packets.\n");
-	}
-}
-
-std::shared_ptr<SipMessage> RequestsHandler::acquirePooledMessage()
-{
-	std::lock_guard<std::mutex> poolLock(s_msgPoolMutex);
-
-	for (auto& msg : _messagePool)
-	{
-		if (msg.use_count() == 1)
-		{
-			// The mutex serializes TAKERS, but the previous owner released this
-			// slot outside it — typically on the send path once the drained outbox
-			// goes out of scope. use_count() is only an atomic load, so on its own
-			// it establishes no happens-before with that releasing thread, and the
-			// reset() we are about to authorize reads the message's existing string
-			// and vector internals before overwriting them. This fence pairs with
-			// the release the refcount decrement performs, so those writes are
-			// visible before we hand the slot on.
-			std::atomic_thread_fence(std::memory_order_acquire);
-			// Copy INSIDE the lock: the copy is what publishes use_count()==2 and
-			// so what makes this slot invisible to the other task's scan. Callers
-			// initialize it (reset() / operator=) after we return, by which point
-			// they own it exclusively — keeping the critical section to a scan.
-			return msg;
-		}
-	}
-
-	// Pool drawn down: fall back to the heap, but only up to a fixed number alive
-	// at once (Issue #101(A)). Past that, refuse and let the caller drop. Both
-	// transitions are logged, from here rather than the callers, so the two
-	// getMessageFromPool overloads share one rate-limit counter per pool instead
-	// of each sampling 1-in-100 independently under the same label.
-	static std::atomic<std::size_t> msgWarnCount{0};
-	if (s_msgHeapFallbacksInFlight.load(std::memory_order_relaxed) >= POCKETDIAL_MSG_HEAP_FALLBACK_MAX)
-	{
-		logPoolExhausted("SIP Message", PoolPressure::Refused, msgWarnCount);
-		return nullptr;
-	}
-	logPoolExhausted("SIP Message", PoolPressure::Fallback, msgWarnCount);
-
-	SipMessage* raw = nullptr;
-	try
-	{
-		raw = new SipSdpMessage("", sockaddr_in{});
-	}
-	catch (const std::bad_alloc&)
-	{
-		return nullptr;   // budget untouched — nothing was handed out
-	}
-
-	s_msgHeapFallbacksInFlight.fetch_add(1, std::memory_order_relaxed);
-	try
-	{
-		return std::shared_ptr<SipMessage>(raw, HeapFallbackDeleter{});
-	}
-	catch (const std::bad_alloc&)
-	{
-		// The shared_ptr constructor takes ownership of `raw` before it can throw,
-		// and the standard requires it to run the deleter if it does. So `raw` is
-		// already deleted and the counter already decremented — undoing either
-		// here would be a double free / double decrement.
-		return nullptr;
-	}
-}
-
+// Forwarders onto the static pool in SipMessagePool.cpp (Issue #53 / #101(A) /
+// #101(E)). Kept as public statics on RequestsHandler because SipMessageFactory,
+// the handler table, and the test suite all call them by this name.
 std::shared_ptr<SipMessage> RequestsHandler::getMessageFromPool(std::string_view message, sockaddr_in src)
 {
-	std::shared_ptr<SipMessage> msg = acquirePooledMessage();
-	if (!msg) return nullptr;   // acquirePooledMessage() already logged the pressure
-	msg->reset(message, src);
-	return msg;
+	return sipmsgpool::getMessageFromPool(message, src);
 }
 
 std::shared_ptr<SipMessage> RequestsHandler::getMessageFromPool(const SipMessage& source)
 {
-	std::shared_ptr<SipMessage> msg = acquirePooledMessage();
-	if (!msg) return nullptr;   // acquirePooledMessage() already logged the pressure
-	*msg = source;
-	return msg;
+	return sipmsgpool::getMessageFromPool(source);
 }
 
 void RequestsHandler::initHandlers()
@@ -704,7 +560,7 @@ void RequestsHandler::onCancel(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	if (destNumber == "999" || isPageZoneDialog(destNumber))
+	if (destNumber == "999" || _cfg.isPageZoneDialog(destNumber))
 	{
 		auto session = getSession(data->getCallID());
 		if (session.has_value())
@@ -935,7 +791,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// normal routing (and 404s, since 98x is not a real extension/group target).
 	if (pbx::isPageZoneExt(destNumber))
 	{
-		if (const pbx::PageZone* zone = findPageZone(destNumber))
+		if (const pbx::PageZone* zone = _cfg.findPageZone(destNumber))
 		{
 			routePageZone(data, caller.value(), *zone);
 			return;
@@ -975,12 +831,12 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// PbxConfig.hpp's doc comment for why directed pickup isn't exempted.
 	if (pbx::isGroupPickupCode(destNumber))
 	{
-		onPickup(data, caller.value(), pickupPeersOf(caller.value()->getNumber()));
+		onPickup(data, caller.value(), _cfg.pickupPeersOf(caller.value()->getNumber()));
 		return;
 	}
 	if (std::string target = pbx::directedPickupTarget(destNumber); !target.empty())
 	{
-		auto peers = pickupPeersOf(caller.value()->getNumber());
+		auto peers = _cfg.pickupPeersOf(caller.value()->getNumber());
 		bool eligible = target != caller.value()->getNumber() &&
 			std::find(peers.begin(), peers.end(), target) != peers.end();
 		onPickup(data, caller.value(), eligible ? std::vector<std::string>{ target } : std::vector<std::string>{});
@@ -992,7 +848,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// intercom auto-answer headers, so members ring normally); hunt rings members one
 	// at a time, driven from tick(). Resolved before DND because a group ext is not a
 	// real endpoint and so never carries its own DND/forward config.
-	if (const pbx::RingGroup* group = findRingGroup(destNumber))
+	if (const pbx::RingGroup* group = _cfg.findRingGroup(destNumber))
 	{
 		routeRingGroup(data, caller.value(), destNumber, *group);
 		return;
@@ -1016,7 +872,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// Call Forward Unconditional (CFU): if the destination has an "always" forward
 	// target, redirect the call to that target before ringing the original callee.
 	{
-		std::string cfu = getForwardTarget(destNumber, "always");
+		std::string cfu = _cfg.getForwardTarget(destNumber, "always");
 		if (!cfu.empty() && cfu != destNumber)
 		{
 			queueLog("CFU: forwarding " + destNumber + " -> " + cfu);
@@ -1032,7 +888,7 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// with 480 Temporarily Unavailable instead of ringing it. This branch is reached
 	// only for ordinary extensions — the virtual 777 (echo) and 999 (broadcast)
 	// extensions are handled above and so are never affected by DND.
-	if (isDndEnabled(destNumber))
+	if (_cfg.isDndEnabled(destNumber))
 	{
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
@@ -1095,8 +951,8 @@ void RequestsHandler::onInvite(std::shared_ptr<SipMessage> data)
 	// isSessionRingingExt() finds "who's ringing" for call pickup (Issue #68)
 	// without needing to pre-populate Session::dest before an answer exists.
 	newSession->setInviteMessage(data);
-	std::string cfb  = getForwardTarget(destNumber, "busy");
-	std::string cfna = getForwardTarget(destNumber, "noanswer");
+	std::string cfb  = _cfg.getForwardTarget(destNumber, "busy");
+	std::string cfna = _cfg.getForwardTarget(destNumber, "noanswer");
 	if (!cfna.empty() && cfna != destNumber)
 	{
 		newSession->setNoAnswerTarget(cfna);
@@ -1468,7 +1324,7 @@ void RequestsHandler::onBusy(std::shared_ptr<SipMessage> data)
 	if (session.has_value())
 	{
 		std::string busyExt(data->getFromNumber());
-		std::string cfb = getForwardTarget(busyExt, "busy");
+		std::string cfb = _cfg.getForwardTarget(busyExt, "busy");
 		if (!cfb.empty() && cfb != busyExt)
 		{
 			auto inviteMsg = session.value()->getInviteMessage();
@@ -1578,7 +1434,7 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	if (destNumber == "999" || isPageZoneDialog(destNumber))
+	if (destNumber == "999" || _cfg.isPageZoneDialog(destNumber))
 	{
 		auto response = getMessageFromPool(*data);
 		if (!response) return;   // pool exhausted: drop, peer retransmits (#101A)
@@ -2359,7 +2215,7 @@ void RequestsHandler::endCall(std::string_view callID, std::string_view srcNumbe
 	if (_sessions.erase(std::string(callID)) > 0)
 	{
 		// Record exactly once per torn-down dialog (Phase 2 CDR).
-		recordCdr(ending, srcNumber, destNumber);
+		_cdr.record(ending, srcNumber, destNumber);
 
 		std::ostringstream message;
 		message << "Session has been disconnected between " << srcNumber << " and " << destNumber;
@@ -2392,68 +2248,6 @@ uint64_t RequestsHandler::nowEpochMs() const
 	return static_cast<uint64_t>(
 		std::chrono::duration_cast<std::chrono::milliseconds>(
 			std::chrono::steady_clock::now().time_since_epoch()).count());
-}
-
-void RequestsHandler::recordCdr(const std::shared_ptr<Session>& session,
-	std::string_view srcNumber, std::string_view destNumber)
-{
-	CallDetailRecord rec;
-	rec.caller = std::string(srcNumber);
-	rec.callee = std::string(destNumber);
-
-	uint64_t startMs = nowEpochMs();
-	uint32_t durationSec = 0;
-	CdrResult result = CdrResult::Failed;
-
-	if (session)
-	{
-		auto now = std::chrono::steady_clock::now();
-		startMs = static_cast<uint64_t>(
-			std::chrono::duration_cast<std::chrono::milliseconds>(
-				session->getStartTime().time_since_epoch()).count());
-
-		switch (session->getState())
-		{
-			// Both Connected and Bye are "answered": a normal call ends via BYE, which
-			// sets the state to Bye (NOT Connected) just before endCall() runs, while
-			// the echo (777) path tears down straight from Connected. Session::setState
-			// resets _startTime to the connect instant on the Connected transition and
-			// the later Bye transition does NOT touch it, so getStartTime() still marks
-			// the answer instant in both cases — talk time is now - startTime.
-			case Session::State::Connected:
-			case Session::State::Held:   // call torn down mid-hold → still Answered (#73)
-			case Session::State::Bye:
-				result = CdrResult::Answered;
-				{
-					int64_t secs = static_cast<int64_t>(
-						std::chrono::duration_cast<std::chrono::seconds>(
-							now - session->getStartTime()).count());
-					if (secs < 0) secs = 0;
-					durationSec = static_cast<uint32_t>(secs);
-				}
-				break;
-			case Session::State::Busy:        result = CdrResult::Busy;        break;
-			case Session::State::Cancel:      result = CdrResult::Cancelled;   break;
-			case Session::State::Unavailable: result = CdrResult::Unavailable; break;
-			default:                          result = CdrResult::Failed;      break;
-		}
-	}
-
-	rec.startMs = startMs;
-	rec.durationSec = durationSec;
-	rec.result = result;
-
-	// Fixed ring write: overwrite the oldest slot once full (no heap growth).
-	_cdrRing[_cdrHead] = std::move(rec);
-	_cdrHead = (_cdrHead + 1) % POCKETDIAL_CDR_RECORDS;
-	if (_cdrCount < POCKETDIAL_CDR_RECORDS)
-	{
-		++_cdrCount;
-	}
-
-	// Persist the ring so records survive reboot (write-through on teardown; no-op
-	// on host). Caller (endCall) holds _mutex. See persistCdrRing() for the wear note.
-	persistCdrRing();
 }
 
 void RequestsHandler::unregisterClient(std::string_view number)
@@ -2811,51 +2605,12 @@ std::optional<RequestsHandler::ProvisioningInfo> RequestsHandler::findProvisioni
 	return std::nullopt;
 }
 
-void RequestsHandler::setDndLocked(const std::string& extension, bool on)
-{
-	if (on)
-	{
-		// Bound the map so a flood of distinct extensions can't grow the heap
-		// without limit. Mirror the client-pool cap; reject new keys past it.
-		if (_dnd.find(extension) == _dnd.end() &&
-			_dnd.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS))
-		{
-			queueLog("DND set ignored (table full) for extension " + extension, true);
-		}
-		else
-		{
-			_dnd[extension] = true;
-		}
-	}
-	else
-	{
-		// Turning DND off frees the slot, so the map only ever holds the
-		// extensions that are actively in DND (bounded by registrations).
-		_dnd.erase(extension);
-	}
-	queueLog("DND " + std::string(on ? "enabled" : "disabled") + " for extension " + extension);
-
-	// Refresh the DND view in the dashboard snapshot immediately so the UI
-	// reflects the change without waiting for the next tick(). Same refresh
-	// regardless of whether the mutation came from the HTTP setter or a DTMF
-	// CLASS code (Issue #77) — both funnel through here.
-	{
-		std::lock_guard<std::mutex> snapLock(_snapshotMutex);
-		_snapshot.dnd.clear();
-		_snapshot.dnd.reserve(_dnd.size());
-		for (const auto& [ext, enabled] : _dnd)
-		{
-			if (enabled) _snapshot.dnd.push_back(ext);
-		}
-	}
-}
-
 void RequestsHandler::setDnd(const std::string& extension, bool on)
 {
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-		setDndLocked(extension, on);
+		_cfg.setDndLocked(extension, on);
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
@@ -2867,14 +2622,6 @@ void RequestsHandler::setDnd(const std::string& extension, bool on)
 	}
 }
 
-bool RequestsHandler::isDndEnabled(const std::string& extension)
-{
-	// Internal lookup: invoked from onInvite() which already holds _mutex, so this
-	// must NOT take _mutex (std::mutex is non-recursive). Bounded map lookup.
-	auto it = _dnd.find(extension);
-	return it != _dnd.end() && it->second;
-}
-
 std::vector<std::string> RequestsHandler::getDndExtensions()
 {
 	std::lock_guard<std::mutex> lock(_snapshotMutex);
@@ -2883,81 +2630,12 @@ std::vector<std::string> RequestsHandler::getDndExtensions()
 
 // ── Call forwarding (CFU/CFB/CFNA) ───────────────────────────────────────────
 
-std::string RequestsHandler::getForwardTarget(const std::string& extension, const std::string& trigger) const
-{
-	// Internal lookup invoked from onInvite()/onBusy()/tick(), all of which already
-	// hold _mutex — must NOT lock (non-recursive). Bounded map lookup.
-	auto it = _forwards.find(extension);
-	if (it == _forwards.end())
-	{
-		return {};
-	}
-	if (trigger == "always")   return it->second.always;
-	if (trigger == "busy")     return it->second.busy;
-	if (trigger == "noanswer") return it->second.noAnswer;
-	return {};
-}
-
-void RequestsHandler::setForwardLocked(const std::string& extension, const std::string& trigger, const std::string& target)
-{
-	// Reject the virtual extensions outright; they are not real endpoints.
-	// Previously only the HTTP-facing setForward() applied this guard — the
-	// DTMF *73/*72NNNN inline path skipped it entirely (Issue #77), so a
-	// crafted mid-dialog INFO with From: 777/999 could set up a "forward" on
-	// a virtual extension. Routing both callers through here closes that gap.
-	if (extension == "777" || extension == "999" || extension == ConferenceRoom::EXT)
-	{
-		queueLog("Forward set ignored for virtual extension " + extension, true);
-	}
-	else
-	{
-		auto it = _forwards.find(extension);
-		bool isNew = (it == _forwards.end());
-
-		// Bound the table like _dnd: refuse a brand-new extension past the cap.
-		if (isNew && _forwards.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS))
-		{
-			queueLog("Forward set ignored (table full) for extension " + extension, true);
-		}
-		else
-		{
-			pbx::ForwardConfig& cfg = _forwards[extension];
-			if (trigger == "always")        cfg.always   = target;
-			else if (trigger == "busy")     cfg.busy     = target;
-			else if (trigger == "noanswer") cfg.noAnswer = target;
-
-			// Drop the entry entirely once no trigger remains set, so the map only
-			// holds actively-forwarded extensions (bounded by registrations).
-			if (cfg.empty())
-			{
-				_forwards.erase(extension);
-			}
-			queueLog("Forward " + trigger + " for " + extension +
-				(target.empty() ? " cleared" : (" -> " + target)));
-			persistForwards();
-		}
-	}
-
-	// Refresh the dashboard snapshot immediately (mirror setDnd). Same refresh
-	// regardless of whether the mutation came from the HTTP setter or a DTMF
-	// CLASS code (Issue #77) — both funnel through here.
-	{
-		std::lock_guard<std::mutex> snapLock(_snapshotMutex);
-		_snapshot.forwards.clear();
-		_snapshot.forwards.reserve(_forwards.size());
-		for (const auto& [ext, cfg] : _forwards)
-		{
-			_snapshot.forwards.emplace_back(ext, cfg.always, cfg.busy, cfg.noAnswer);
-		}
-	}
-}
-
 void RequestsHandler::setForward(const std::string& extension, const std::string& trigger, const std::string& target)
 {
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-		setForwardLocked(extension, trigger, target);
+		_cfg.setForwardLocked(extension, trigger, target);
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
@@ -2977,66 +2655,12 @@ std::vector<std::tuple<std::string, std::string, std::string, std::string>> Requ
 
 // ── Ring / hunt groups ───────────────────────────────────────────────────────
 
-const pbx::RingGroup* RequestsHandler::findRingGroup(const std::string& extension) const
-{
-	// Internal lookup from onInvite() (already holds _mutex). Bounded map lookup.
-	auto it = _ringGroups.find(extension);
-	return (it == _ringGroups.end()) ? nullptr : &it->second;
-}
-
 void RequestsHandler::setRingGroup(const std::string& groupExt, const std::string& members, const std::string& mode)
 {
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-
-		if (groupExt == "777" || groupExt == "999" || groupExt == ConferenceRoom::EXT)
-		{
-			queueLog("Ring group ignored for reserved extension " + groupExt, true);
-		}
-		else
-		{
-			std::vector<std::string> list = pbx::splitMembers(members);
-			if (list.empty())
-			{
-				// Empty membership deletes the group.
-				_ringGroups.erase(groupExt);
-				queueLog("Ring group " + groupExt + " deleted");
-				persistRingGroups();
-			}
-			else
-			{
-				bool isNew = (_ringGroups.find(groupExt) == _ringGroups.end());
-				if (isNew && _ringGroups.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS))
-				{
-					queueLog("Ring group ignored (table full) for " + groupExt, true);
-				}
-				else
-				{
-					pbx::RingGroup& g = _ringGroups[groupExt];
-					g.members = std::move(list);
-					g.mode = (mode == "hunt") ? pbx::GroupMode::Hunt : pbx::GroupMode::RingAll;
-					queueLog("Ring group " + groupExt + " (" +
-						(g.mode == pbx::GroupMode::Hunt ? "hunt" : "ringall") + ") = " +
-						pbx::joinMembers(g.members));
-					persistRingGroups();
-				}
-			}
-		}
-
-		// Refresh dashboard snapshot immediately.
-		{
-			std::lock_guard<std::mutex> snapLock(_snapshotMutex);
-			_snapshot.ringGroups.clear();
-			_snapshot.ringGroups.reserve(_ringGroups.size());
-			for (const auto& [ext, g] : _ringGroups)
-			{
-				_snapshot.ringGroups.emplace_back(ext,
-					g.mode == pbx::GroupMode::Hunt ? "hunt" : "ringall",
-					pbx::joinMembers(g.members));
-			}
-		}
-
+		_cfg.setRingGroup(groupExt, members, mode);
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
@@ -3052,6 +2676,33 @@ std::vector<std::tuple<std::string, std::string, std::string>> RequestsHandler::
 {
 	std::lock_guard<std::mutex> lock(_snapshotMutex);
 	return _snapshot.ringGroups;
+}
+
+// Mirrors one of _cfg's five tables into the dashboard snapshot (Issue #77);
+// see PbxFeatureConfig's class comment and RequestsHandler.hpp's _cfg member
+// comment for why this indirection exists. Caller holds _mutex (this is
+// invoked synchronously from inside _cfg's Locked mutation cores).
+void RequestsHandler::refreshPbxConfigSnapshot(PbxFeatureConfig::Table t)
+{
+	std::lock_guard<std::mutex> snapLock(_snapshotMutex);
+	switch (t)
+	{
+	case PbxFeatureConfig::Table::Dnd:
+		_snapshot.dnd = _cfg.dndSnapshot();
+		break;
+	case PbxFeatureConfig::Table::Forwards:
+		_snapshot.forwards = _cfg.forwardsSnapshot();
+		break;
+	case PbxFeatureConfig::Table::RingGroups:
+		_snapshot.ringGroups = _cfg.ringGroupsSnapshot();
+		break;
+	case PbxFeatureConfig::Table::PageZones:
+		_snapshot.pageZones = _cfg.pageZonesSnapshot();
+		break;
+	case PbxFeatureConfig::Table::DialRules:
+		_snapshot.dialRules = _cfg.dialRulesSnapshot();
+		break;
+	}
 }
 
 // ── Action dispatch shared by the built-in codes and the dial plan (#69) ─────
@@ -3173,12 +2824,12 @@ bool RequestsHandler::routeDialPlan(const std::shared_ptr<SipMessage>& data,
 {
 	// Fast path: the table is empty on a default install, so the overwhelmingly
 	// common case costs one size check and nothing else.
-	if (_dialPlan.empty())
+	if (_cfg.dialPlan().empty())
 	{
 		return false;
 	}
 
-	const pbx::DialRule* rule = _dialPlan.match(destNumber);
+	const pbx::DialRule* rule = _cfg.dialPlan().match(destNumber);
 	if (!rule)
 	{
 		return false;   // fallthrough — routing continues exactly as it did pre-#69
@@ -3190,7 +2841,7 @@ bool RequestsHandler::routeDialPlan(const std::shared_ptr<SipMessage>& data,
 	switch (rule->action)
 	{
 	case pbx::DialActionType::RingGroup:
-		if (const pbx::RingGroup* group = findRingGroup(rule->target))
+		if (const pbx::RingGroup* group = _cfg.findRingGroup(rule->target))
 		{
 			routeRingGroup(data, caller, rule->target, *group);
 			return true;
@@ -3198,7 +2849,7 @@ bool RequestsHandler::routeDialPlan(const std::shared_ptr<SipMessage>& data,
 		break;
 
 	case pbx::DialActionType::PageZone:
-		if (const pbx::PageZone* zone = findPageZone(rule->target))
+		if (const pbx::PageZone* zone = _cfg.findPageZone(rule->target))
 		{
 			routePageZone(data, caller, *zone);
 			return true;
@@ -3244,82 +2895,7 @@ void RequestsHandler::setDialRule(const std::string& pattern, const std::string&
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-
-		// Validate once, here, so a bad rule can never reach the SIP thread — and
-		// so the NVS blob (tab/newline delimited) can never be corrupted by a
-		// smuggled separator. Same "log and drop" contract as setRingGroup.
-		if (!pbx::isDialTokenSafe(pattern))
-		{
-			queueLog("Dial rule ignored: invalid pattern \"" + pattern + "\"", true);
-		}
-		else if (pattern == "777" || pattern == "999" || pattern == "440")
-		{
-			// These are handled above the dial plan in onInvite(), so a rule here
-			// would never fire. Refuse it instead of accepting a dead rule.
-			queueLog("Dial rule ignored: " + pattern +
-				" is a reserved extension and is routed before the dial plan", true);
-		}
-		else if (target.empty())
-		{
-			// Empty target deletes the rule (mirrors setRingGroup's empty member list).
-			if (_dialPlan.erase(pattern))
-			{
-				queueLog("Dial rule " + pattern + " deleted");
-				persistDialPlan();
-			}
-		}
-		else if (!pbx::isDialTokenSafe(target))
-		{
-			queueLog("Dial rule ignored: invalid target \"" + target + "\"", true);
-		}
-		else
-		{
-			pbx::DialActionType parsed;
-			if (!pbx::parseDialAction(action, parsed))
-			{
-				queueLog("Dial rule ignored: unknown action \"" + action +
-					"\" (want group|page|park)", true);
-			}
-			else if (parsed == pbx::DialActionType::PageZone && !pbx::isPageZoneExt(target))
-			{
-				queueLog("Dial rule ignored: page target " + target +
-					" is not a paging zone (zones are 980-989)", true);
-			}
-			else if (parsed == pbx::DialActionType::ParkOrbit && !pbx::isParkOrbitExt(target))
-			{
-				queueLog("Dial rule ignored: park target " + target +
-					" is not a park orbit for this build", true);
-			}
-			else
-			{
-				pbx::DialRule rule;
-				rule.pattern = pattern;
-				rule.action = parsed;
-				rule.target = target;
-				if (!_dialPlan.upsert(rule))
-				{
-					queueLog("Dial rule ignored (table full) for " + pattern, true);
-				}
-				else
-				{
-					queueLog("Dial rule " + pattern + " -> " +
-						pbx::dialActionName(parsed) + " " + target);
-					persistDialPlan();
-				}
-			}
-		}
-
-		// Refresh dashboard snapshot immediately (mirrors setRingGroup).
-		{
-			std::lock_guard<std::mutex> snapLock(_snapshotMutex);
-			_snapshot.dialRules.clear();
-			_snapshot.dialRules.reserve(_dialPlan.size());
-			for (const auto& r : _dialPlan.rules())
-			{
-				_snapshot.dialRules.emplace_back(r.pattern, pbx::dialActionName(r.action), r.target);
-			}
-		}
-
+		_cfg.setDialRule(pattern, action, target);
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
@@ -3691,46 +3267,22 @@ void RequestsHandler::tick()
 			nextSnapshot.sessions.emplace_back(caller, callee, sessionStateToString(session->getState()), durationSec);
 		}
 
-		// CDR view: copy the ring out newest-first into the snapshot.
-		nextSnapshot.cdr.reserve(_cdrCount);
-		for (size_t i = 0; i < _cdrCount; ++i)
-		{
-			// _cdrHead points one past the newest; walk backwards with wrap.
-			size_t idx = (_cdrHead + POCKETDIAL_CDR_RECORDS - 1 - i) % POCKETDIAL_CDR_RECORDS;
-			nextSnapshot.cdr.push_back(_cdrRing[idx]);
-		}
+		// CDR view: newest-first copy of the ring into the snapshot.
+		nextSnapshot.cdr = _cdr.snapshot();
 
 		// DND view: extensions currently in DND.
-		nextSnapshot.dnd.reserve(_dnd.size());
-		for (const auto& [ext, enabled] : _dnd)
-		{
-			if (enabled) nextSnapshot.dnd.push_back(ext);
-		}
+		nextSnapshot.dnd = _cfg.dndSnapshot();
 
 		// Call-forward view.
-		nextSnapshot.forwards.reserve(_forwards.size());
-		for (const auto& [ext, cfg] : _forwards)
-		{
-			nextSnapshot.forwards.emplace_back(ext, cfg.always, cfg.busy, cfg.noAnswer);
-		}
+		nextSnapshot.forwards = _cfg.forwardsSnapshot();
 
 		// Ring/hunt-group view.
-		nextSnapshot.ringGroups.reserve(_ringGroups.size());
-		for (const auto& [ext, g] : _ringGroups)
-		{
-			nextSnapshot.ringGroups.emplace_back(ext,
-				g.mode == pbx::GroupMode::Hunt ? "hunt" : "ringall",
-				pbx::joinMembers(g.members));
-		}
+		nextSnapshot.ringGroups = _cfg.ringGroupsSnapshot();
 
-		// Dial-plan rules (Issue #69), in table order. Rebuilt from _dialPlan here
-		// alongside ringGroups rather than mirrored out of band like pageZones, so
-		// the snapshot swap below can never blank or re-order them.
-		nextSnapshot.dialRules.reserve(_dialPlan.size());
-		for (const auto& r : _dialPlan.rules())
-		{
-			nextSnapshot.dialRules.emplace_back(r.pattern, pbx::dialActionName(r.action), r.target);
-		}
+		// Dial-plan rules (Issue #69), in table order. Rebuilt from _cfg's dial
+		// plan here alongside ringGroups rather than mirrored out of band like
+		// pageZones, so the snapshot swap below can never blank or re-order them.
+		nextSnapshot.dialRules = _cfg.dialRulesSnapshot();
 
 		// Parked calls view: {orbit, parkedExt, parker, secondsParked}. This full
 		// rebuild already reflects anything _park.sweep() just did above, so clear
@@ -3929,186 +3481,13 @@ void RequestsHandler::queueLog(std::string msg, bool isError)
 	_logQueue.push_back({isError, std::move(msg)});
 }
 
-// ── NVS persistence: PBX config (forwards / ring groups) + CDR ring ──────────
+// ── NVS persistence ────────────────────────────────────────────────────────────
 //
-// All five helpers are no-ops on host (the in-memory maps/ring ARE the store) and
-// gate their NVS access on ESP_PLATFORM. Each table is serialized as a single blob
-// (one record per line; fields tab-separated) under one NVS key, so a mutation
-// rewrites exactly one key — bounded size, low flash wear. Records are bounded by
-// POCKETDIAL_MAX_CLIENTS / POCKETDIAL_CDR_RECORDS, so the blob can never grow
-// without limit. The AOR charset (isValidAor) excludes tab/newline, so the
-// delimiters are safe. Callers hold _mutex (except construction-time loads, which
-// run single-threaded before any handler dispatches).
-
-using pbxpersist::deserializeBlob;
-
-void RequestsHandler::loadPbxConfig()
-{
-	if (_pbxConfigLoaded)
-	{
-		return;
-	}
-	_pbxConfigLoaded = true;
-
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	nvs_handle_t h;
-	if (nvs_open(NVS_PBX_NS, NVS_READWRITE, &h) != ESP_OK)
-	{
-		return;
-	}
-
-	auto readBlob = [&](const char* key) -> std::string {
-		size_t len = 0;
-		if (nvs_get_str(h, key, nullptr, &len) != ESP_OK || len == 0)
-		{
-			return {};
-		}
-		std::string buf(len, '\0');
-		if (nvs_get_str(h, key, buf.data(), &len) != ESP_OK)
-		{
-			return {};
-		}
-		if (!buf.empty() && buf.back() == '\0') buf.pop_back(); // drop NUL terminator
-		return buf;
-	};
-
-	// Forwards: ext \t always \t busy \t noAnswer
-	for (const auto& rec : deserializeBlob(readBlob("forwards")))
-	{
-		if (rec.size() < 4 || rec[0].empty()) continue;
-		if (_forwards.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS)) break;
-		pbx::ForwardConfig cfg;
-		cfg.always = rec[1];
-		cfg.busy = rec[2];
-		cfg.noAnswer = rec[3];
-		if (!cfg.empty()) _forwards[rec[0]] = std::move(cfg);
-	}
-
-	// Ring groups: ext \t mode \t m1,m2,...
-	for (const auto& rec : deserializeBlob(readBlob("groups")))
-	{
-		if (rec.size() < 3 || rec[0].empty()) continue;
-		if (_ringGroups.size() >= static_cast<size_t>(POCKETDIAL_MAX_CLIENTS)) break;
-		pbx::RingGroup g;
-		g.mode = (rec[1] == "hunt") ? pbx::GroupMode::Hunt : pbx::GroupMode::RingAll;
-		g.members = pbx::splitMembers(rec[2]);
-		if (!g.members.empty()) _ringGroups[rec[0]] = std::move(g);
-	}
-
-	// Page zones: ext \t m1,m2,...
-	for (const auto& rec : deserializeBlob(readBlob("pzones")))
-	{
-		if (rec.size() < 2 || rec[0].empty()) continue;
-		if (_pageZones.size() >= static_cast<size_t>(POCKETDIAL_MAX_PAGE_ZONES)) break;
-		pbx::PageZone z;
-		z.members = pbx::splitZoneMembers(rec[1]);
-		if (!z.members.empty()) _pageZones[rec[0]] = std::move(z);
-	}
-
-	// Dial plan (Issue #69): pattern \t action \t target, one record per rule, in
-	// evaluation order. DialPlan::upsert() enforces POCKETDIAL_MAX_DIAL_RULES on
-	// its own, so a blob written by a build with a larger cap simply stops being
-	// applied at this build's ceiling instead of overflowing it. Records that no
-	// longer validate (an unknown action, or a park target outside a shrunken
-	// POCKETDIAL_PARK_SLOTS) are dropped rather than loaded.
-	for (const auto& rec : deserializeBlob(readBlob("dplan")))
-	{
-		if (rec.size() < 3 || rec[0].empty() || rec[2].empty()) continue;
-		pbx::DialRule rule;
-		if (!pbx::parseDialAction(rec[1], rule.action)) continue;
-		if (!pbx::isDialTokenSafe(rec[0]) || !pbx::isDialTokenSafe(rec[2])) continue;
-		if (rule.action == pbx::DialActionType::PageZone && !pbx::isPageZoneExt(rec[2])) continue;
-		if (rule.action == pbx::DialActionType::ParkOrbit && !pbx::isParkOrbitExt(rec[2])) continue;
-		rule.pattern = rec[0];
-		rule.target = rec[2];
-		if (!_dialPlan.upsert(rule)) break;   // table full at this build's cap
-	}
-
-	nvs_close(h);
-#endif
-}
-
-void RequestsHandler::persistForwards()
-{
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	std::string blob;
-	for (const auto& [ext, cfg] : _forwards)
-	{
-		blob += ext; blob += '\t';
-		blob += cfg.always; blob += '\t';
-		blob += cfg.busy; blob += '\t';
-		blob += cfg.noAnswer; blob += '\n';
-	}
-	nvs_handle_t h;
-	if (nvs_open(NVS_PBX_NS, NVS_READWRITE, &h) == ESP_OK)
-	{
-		nvs_set_str(h, "forwards", blob.c_str());
-		nvs_commit(h);
-		nvs_close(h);
-	}
-#endif
-}
-
-void RequestsHandler::persistRingGroups()
-{
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	std::string blob;
-	for (const auto& [ext, g] : _ringGroups)
-	{
-		blob += ext; blob += '\t';
-		blob += (g.mode == pbx::GroupMode::Hunt ? "hunt" : "ringall"); blob += '\t';
-		blob += pbx::joinMembers(g.members); blob += '\n';
-	}
-	nvs_handle_t h;
-	if (nvs_open(NVS_PBX_NS, NVS_READWRITE, &h) == ESP_OK)
-	{
-		nvs_set_str(h, "groups", blob.c_str());
-		nvs_commit(h);
-		nvs_close(h);
-	}
-#endif
-}
-
-void RequestsHandler::persistPageZones()
-{
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	std::string blob;
-	for (const auto& [ext, z] : _pageZones)
-	{
-		blob += ext; blob += '\t';
-		blob += pbx::joinMembers(z.members); blob += '\n';
-	}
-	nvs_handle_t h;
-	if (nvs_open(NVS_PBX_NS, NVS_READWRITE, &h) == ESP_OK)
-	{
-		nvs_set_str(h, "pzones", blob.c_str());
-		nvs_commit(h);
-		nvs_close(h);
-	}
-#endif
-}
-
-void RequestsHandler::persistDialPlan()
-{
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	// Order matters here in a way it does not for the maps above: the blob is
-	// written (and replayed) in table order, because that IS the evaluation order.
-	std::string blob;
-	for (const auto& r : _dialPlan.rules())
-	{
-		blob += r.pattern; blob += '\t';
-		blob += pbx::dialActionName(r.action); blob += '\t';
-		blob += r.target; blob += '\n';
-	}
-	nvs_handle_t h;
-	if (nvs_open(NVS_PBX_NS, NVS_READWRITE, &h) == ESP_OK)
-	{
-		nvs_set_str(h, "dplan", blob.c_str());
-		nvs_commit(h);
-		nvs_close(h);
-	}
-#endif
-}
+// The PBX-config tables (forwards / ring groups / page zones / dial plan:
+// loadPbxConfig, persistForwards, persistRingGroups, persistPageZones,
+// persistDialPlan) now live on PbxFeatureConfig (see _cfg), and the CDR ring
+// (load/persist, its own NVS namespace and record shape) now lives on CdrRing
+// (see _cdr) — both still no-ops on host.
 
 // ── Registrar mode + device registry persistence (STAGE 2) ───────────────────
 
@@ -4116,7 +3495,7 @@ void RequestsHandler::loadAdminHttpTtl()
 {
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	nvs_handle_t h;
-	if (nvs_open(NVS_PBX_NS, NVS_READWRITE, &h) != ESP_OK)
+	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
 	{
 		return;
 	}
@@ -4131,80 +3510,13 @@ void RequestsHandler::loadAdminHttpTtl()
 #endif
 }
 
-void RequestsHandler::loadCdrRing()
-{
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	nvs_handle_t h;
-	if (nvs_open(NVS_CDR_NS, NVS_READWRITE, &h) != ESP_OK)
-	{
-		return;
-	}
-	size_t len = 0;
-	if (nvs_get_str(h, "ring", nullptr, &len) == ESP_OK && len > 0)
-	{
-		std::string buf(len, '\0');
-		if (nvs_get_str(h, "ring", buf.data(), &len) == ESP_OK)
-		{
-			if (!buf.empty() && buf.back() == '\0') buf.pop_back();
-			// Record: caller \t callee \t startMs \t durationSec \t result(int)
-			for (const auto& rec : deserializeBlob(buf))
-			{
-				if (rec.size() < 5) continue;
-				if (_cdrCount >= POCKETDIAL_CDR_RECORDS) break;
-				CallDetailRecord r;
-				r.caller = rec[0];
-				r.callee = rec[1];
-				r.startMs = static_cast<uint64_t>(strtoull(rec[2].c_str(), nullptr, 10));
-				r.durationSec = static_cast<uint32_t>(strtoul(rec[3].c_str(), nullptr, 10));
-				int ri = atoi(rec[4].c_str());
-				r.result = (ri >= 0 && ri <= static_cast<int>(CdrResult::Failed))
-					? static_cast<CdrResult>(ri) : CdrResult::Failed;
-				// Records were serialized oldest-first; append preserving order.
-				_cdrRing[_cdrHead] = std::move(r);
-				_cdrHead = (_cdrHead + 1) % POCKETDIAL_CDR_RECORDS;
-				++_cdrCount;
-			}
-		}
-	}
-	nvs_close(h);
-#endif
-}
-
-void RequestsHandler::persistCdrRing()
-{
-#if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
-	// Serialize the ring oldest-first (same order loadCdrRing replays). Bounded by
-	// POCKETDIAL_CDR_RECORDS, so the blob is fixed-footprint. Write-through on each
-	// teardown: the CDR ring is small (default 32) and calls end infrequently
-	// relative to flash endurance, so a per-call rewrite is acceptable — see summary.
-	std::string blob;
-	for (size_t i = 0; i < _cdrCount; ++i)
-	{
-		size_t idx = (_cdrHead + POCKETDIAL_CDR_RECORDS - _cdrCount + i) % POCKETDIAL_CDR_RECORDS;
-		const CallDetailRecord& r = _cdrRing[idx];
-		blob += r.caller; blob += '\t';
-		blob += r.callee; blob += '\t';
-		blob += std::to_string(r.startMs); blob += '\t';
-		blob += std::to_string(r.durationSec); blob += '\t';
-		blob += std::to_string(static_cast<int>(r.result)); blob += '\n';
-	}
-	nvs_handle_t h;
-	if (nvs_open(NVS_CDR_NS, NVS_READWRITE, &h) == ESP_OK)
-	{
-		nvs_set_str(h, "ring", blob.c_str());
-		nvs_commit(h);
-		nvs_close(h);
-	}
-#endif
-}
-
 // ── Task 2B: Admin extension NVS key ─────────────────────────────────────────
 
 void RequestsHandler::loadAdminExt()
 {
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	nvs_handle_t h;
-	if (nvs_open(NVS_PBX_NS, NVS_READWRITE, &h) != ESP_OK)
+	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h) != ESP_OK)
 	{
 		return;
 	}
@@ -4225,7 +3537,7 @@ void RequestsHandler::saveAdminExt(const std::string& ext)
 	_adminExt = ext;
 #if defined(ESP_PLATFORM) || defined(ESP32) || defined(ARDUINO)
 	nvs_handle_t h;
-	if (nvs_open(NVS_PBX_NS, NVS_READWRITE, &h) == ESP_OK)
+	if (nvs_open(pbxpersist::kNvsNamespace, NVS_READWRITE, &h) == ESP_OK)
 	{
 		nvs_set_str(h, "admin_ext", ext.c_str());
 		nvs_commit(h);
@@ -4494,7 +3806,7 @@ void RequestsHandler::onDtmfInfo(std::shared_ptr<SipMessage> data)
 		// uses (we're already inside _mutex here, via handle()) so the
 		// dashboard snapshot refreshes immediately instead of only on the
 		// next unrelated HTTP-side setDnd() call.
-		setDndLocked(callerExt, true);
+		_cfg.setDndLocked(callerExt, true);
 		accum.digits.clear();
 		return;
 	}
@@ -4502,7 +3814,7 @@ void RequestsHandler::onDtmfInfo(std::shared_ptr<SipMessage> data)
 	// *80 — Disable SCR/DND for caller's extension.
 	if (seq == "*80")
 	{
-		setDndLocked(callerExt, false);
+		_cfg.setDndLocked(callerExt, false);
 		accum.digits.clear();
 		return;
 	}
@@ -4514,7 +3826,7 @@ void RequestsHandler::onDtmfInfo(std::shared_ptr<SipMessage> data)
 		// "always" trigger exactly like the old inline erase did, but also
 		// refreshes the dashboard snapshot and applies the virtual-extension
 		// guard that the old inline path skipped.
-		setForwardLocked(callerExt, "always", "");
+		_cfg.setForwardLocked(callerExt, "always", "");
 		accum.digits.clear();
 		return;
 	}
@@ -4523,16 +3835,7 @@ void RequestsHandler::onDtmfInfo(std::shared_ptr<SipMessage> data)
 	if (seq == "*69")
 	{
 		// Find the last CDR entry where callee == callerExt (i.e. last inbound call).
-		std::string lastCaller;
-		for (size_t i = 0; i < _cdrCount; ++i)
-		{
-			size_t idx = (_cdrHead + POCKETDIAL_CDR_RECORDS - 1 - i) % POCKETDIAL_CDR_RECORDS;
-			if (_cdrRing[idx].callee == callerExt && !_cdrRing[idx].caller.empty())
-			{
-				lastCaller = _cdrRing[idx].caller;
-				break;
-			}
-		}
+		std::string lastCaller = _cdr.lastCallerFor(callerExt);
 		if (!lastCaller.empty())
 		{
 			queueLog("*69 last caller for " + callerExt + " is " + lastCaller);
@@ -4589,7 +3892,7 @@ void RequestsHandler::onDtmfInfo(std::shared_ptr<SipMessage> data)
 			// the virtual-extension guard setForward() has always had (which
 			// this inline path used to skip), and refreshes the dashboard
 			// snapshot immediately instead of leaving it stale.
-			setForwardLocked(callerExt, "always", target);
+			_cfg.setForwardLocked(callerExt, "always", target);
 			accum.digits.clear();
 			return;
 		}
@@ -4867,45 +4170,11 @@ void RequestsHandler::sweepSessionTimers(std::chrono::steady_clock::time_point n
 }
 
 // ── Paging zones (980–989) ────────────────────────────────────────────────────
-
-const pbx::PageZone* RequestsHandler::findPageZone(const std::string& extension) const
-{
-	auto it = _pageZones.find(extension);
-	return (it == _pageZones.end()) ? nullptr : &it->second;
-}
-
-bool RequestsHandler::isPageZoneDialog(const std::string& extension) const
-{
-	return pbx::isPageZoneExt(extension) && _pageZones.find(extension) != _pageZones.end();
-}
+// findPageZone/isPageZoneDialog now live on _cfg (PbxFeatureConfig).
 
 // ── Directed / group call pickup (Issue #68) ──────────────────────────────────
 // See PbxConfig.hpp's isGroupPickupCode/directedPickupTarget doc comment: pickup
 // groups are ring-group membership, reused as-is.
-
-std::vector<std::string> RequestsHandler::pickupPeersOf(const std::string& ext) const
-{
-	std::vector<std::string> peers;
-	for (const auto& [groupExt, group] : _ringGroups)
-	{
-		bool isMember = false;
-		for (const auto& m : group.members)
-		{
-			if (m == ext) { isMember = true; break; }
-		}
-		if (!isMember) continue;
-
-		for (const auto& m : group.members)
-		{
-			if (m == ext) continue;
-			if (std::find(peers.begin(), peers.end(), m) == peers.end())
-			{
-				peers.push_back(m);
-			}
-		}
-	}
-	return peers;
-}
 
 bool RequestsHandler::isSessionRingingExt(const std::shared_ptr<Session>& session, const std::string& ext) const
 {
@@ -5087,48 +4356,7 @@ void RequestsHandler::setPageZone(const std::string& zoneExt, const std::string&
 	std::vector<std::pair<bool, std::string>> localLogs;
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
-
-		if (!pbx::isPageZoneExt(zoneExt))
-		{
-			queueLog("Page zone ignored for non-zone extension " + zoneExt +
-				" (zones are 980-989)", true);
-		}
-		else
-		{
-			std::vector<std::string> list = pbx::splitZoneMembers(members);
-			if (list.empty())
-			{
-				_pageZones.erase(zoneExt);
-				queueLog("Page zone " + zoneExt + " deleted");
-				persistPageZones();
-			}
-			else
-			{
-				bool isNew = (_pageZones.find(zoneExt) == _pageZones.end());
-				if (isNew && _pageZones.size() >= static_cast<size_t>(POCKETDIAL_MAX_PAGE_ZONES))
-				{
-					queueLog("Page zone ignored (table full) for " + zoneExt, true);
-				}
-				else
-				{
-					pbx::PageZone& z = _pageZones[zoneExt];
-					z.members = std::move(list);
-					queueLog("Page zone " + zoneExt + " = " + pbx::joinMembers(z.members));
-					persistPageZones();
-				}
-			}
-		}
-
-		{
-			std::lock_guard<std::mutex> snapLock(_snapshotMutex);
-			_snapshot.pageZones.clear();
-			_snapshot.pageZones.reserve(_pageZones.size());
-			for (const auto& [ext, z] : _pageZones)
-			{
-				_snapshot.pageZones.emplace_back(ext, pbx::joinMembers(z.members));
-			}
-		}
-
+		_cfg.setPageZone(zoneExt, members);
 		localLogs = std::move(_logQueue);
 		_logQueue.clear();
 	}
@@ -5266,7 +4494,7 @@ std::shared_ptr<SipClient> RequestsHandler::allocateVirtualPeer(std::string numb
 	// is (Issue #101(A)). Past the ceiling this returns nullptr and the caller
 	// abandons the park/BLF operation rather than allocating without limit.
 	//
-	// No pool lock here, unlike acquirePooledMessage(): _virtualPeerPool is a
+	// No pool lock here, unlike SipMessagePool's acquirePooledMessage(): _virtualPeerPool is a
 	// per-instance member and every caller — the internal sites and ParkOrbit via
 	// PbxEnv::allocVirtualPeer — already runs under _mutex. The counter is still
 	// atomic because its decrement happens in the deleter, which runs wherever
@@ -5274,10 +4502,10 @@ std::shared_ptr<SipClient> RequestsHandler::allocateVirtualPeer(std::string numb
 	static std::atomic<std::size_t> vpeerWarnCount{0};
 	if (s_vpeerHeapFallbacksInFlight.load(std::memory_order_relaxed) >= POCKETDIAL_VPEER_HEAP_FALLBACK_MAX)
 	{
-		logPoolExhausted("Virtual-peer", PoolPressure::Refused, vpeerWarnCount);
+		sipmsgpool::logPoolExhausted("Virtual-peer", sipmsgpool::PoolPressure::Refused, vpeerWarnCount);
 		return nullptr;
 	}
-	logPoolExhausted("Virtual-peer", PoolPressure::Fallback, vpeerWarnCount);
+	sipmsgpool::logPoolExhausted("Virtual-peer", sipmsgpool::PoolPressure::Fallback, vpeerWarnCount);
 
 	SipClient* raw = nullptr;
 	try
