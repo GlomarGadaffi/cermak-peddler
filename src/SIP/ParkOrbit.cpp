@@ -69,6 +69,13 @@ void ParkOrbit::onInvite(const std::shared_ptr<SipMessage>& data,
 			session->setDest(virt);
 			session->setLocalTag(toTag);
 			session->setInviteMessage(data);
+			// Captured now, used later: once this parked leg is retrieved (see
+			// the RETRIEVE branch below) or rung back on timeout, onBye's
+			// peerCallID branch needs this dialog's own From/To (with our
+			// to-tag) to build a correctly-addressed BYE toward this party —
+			// same convention as CallPickup::complete()'s setDialogHeaders().
+			session->setDialogHeaders(std::string(data->getFrom()),
+				std::string(data->getTo()) + ";tag=" + toTag);
 			_env.insertSession(std::string(data->getCallID()), session);
 			session->setState(Session::State::Connected);
 		}
@@ -115,6 +122,12 @@ void ParkOrbit::onInvite(const std::shared_ptr<SipMessage>& data,
 	rsession->setPeerCallID(slot.callID);
 	rsession->setLocalTag(toTag);
 	rsession->setInviteMessage(data);
+	// Issue #127: onBye's peerCallID branch (RequestsHandler.cpp) only relays a
+	// BYE across the bridge when BOTH legs' dialog headers are captured — this
+	// was the missing half (the parked leg gets its own setDialogHeaders() call
+	// at park time, above). Same convention as CallPickup::complete().
+	rsession->setDialogHeaders(std::string(data->getFrom()),
+		std::string(data->getTo()) + ";tag=" + toTag);
 	_env.insertSession(std::string(data->getCallID()), rsession);
 	rsession->setState(Session::State::Connected);
 

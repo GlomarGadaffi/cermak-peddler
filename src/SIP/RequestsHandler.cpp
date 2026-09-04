@@ -1483,15 +1483,15 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		return;
 	}
 
-	// Cross-dialog bridge teardown (Issue #68 call pickup — and, as a
-	// byproduct, ParkOrbit's retrieve/ring-back legs, which set peerCallID
-	// too but had no relay wired up for it before this). A BYE here ends ONE
-	// of two independently-dialogued legs that only the server's own
-	// bookkeeping links together; relaying the raw BYE as-is (its own
-	// Call-ID) would be rejected 481 by the peer's phone (wrong dialog), so a
-	// peer-addressed BYE has to be built fresh from the PEER session's own
-	// dialog identifiers — exactly what sweepSessionTimers() already does for
-	// a single session's own two legs, generalized here across two sessions.
+	// Cross-dialog bridge teardown (Issue #68 call pickup and, since #127,
+	// ParkOrbit's park+retrieve legs — both set peerCallID AND capture dialog
+	// headers). A BYE here ends ONE of two independently-dialogued legs that
+	// only the server's own bookkeeping links together; relaying the raw BYE
+	// as-is (its own Call-ID) would be rejected 481 by the peer's phone
+	// (wrong dialog), so a peer-addressed BYE has to be built fresh from the
+	// PEER session's own dialog identifiers — exactly what sweepSessionTimers()
+	// already does for a single session's own two legs, generalized here
+	// across two sessions.
 	if (session.has_value() && !session.value()->getPeerCallID().empty())
 	{
 		std::string peerCallId = session.value()->getPeerCallID();
@@ -1499,11 +1499,14 @@ void RequestsHandler::onBye(std::shared_ptr<SipMessage> data)
 		{
 			auto peer = peerSession.value();
 			// Issue #72's guard, reused: a BYE with an empty From or To is
-			// malformed and phones drop it. CallPickup::complete() always captures
-			// both via setDialogHeaders(), but ParkOrbit's retrieve/ring-back legs
-			// (the other peerCallID-setting path) don't yet — so a park leg
-			// still gets the endCall() cleanup below, just not a peer-phone
-			// BYE, rather than emitting a "From: \r\nTo: \r\n" packet.
+			// malformed and phones drop it. CallPickup::complete() and
+			// ParkOrbit's park+retrieve paths always capture both via
+			// setDialogHeaders() (see ParkOrbit::onInvite). ParkOrbit's
+			// ring-back-timeout leg (isParkUac()) is the one path that still
+			// doesn't — it's a server-initiated (UAC-role) dialog, so its
+			// From/To would need swapped capture, not just the same call —
+			// left as-is: a ring-back leg still gets the endCall() cleanup
+			// below, just not a peer-phone BYE, rather than a malformed one.
 			if (auto notify = peer->getSrc();
 				notify && !peer->getDialogFrom().empty() && !peer->getDialogTo().empty())
 			{
