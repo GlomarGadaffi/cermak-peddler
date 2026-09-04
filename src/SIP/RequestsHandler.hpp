@@ -61,35 +61,16 @@ public:
 	RequestsHandler(std::string serverIp, int serverPort,
 		OnHandledEvent onHandledEvent);
 
-	// RETURNS NULL under sustained pressure — check it. The pool is bounded and
-	// its heap fallback is now bounded too (Issue #101(A)); once both are spent
-	// this refuses rather than allocating without limit. The contract for a
-	// caller that gets nullptr is to DROP: it cannot answer 503, because building
-	// the 503 would need a message out of the same empty pool. SIP over UDP
-	// retransmits, so a dropped packet costs latency, not the call.
-	// Issue #81: `message` is a view, never copied here — SipMessage::reset()
-	// below reads through it once, synchronously, to parse the pooled slot.
-	// Issue #105: taking it by view (not by value) also means a caller holding
-	// the original wire-received bytes (SipMessageFactory::createMessage, on
-	// behalf of SipServer::onNewMessage) keeps them intact after this returns.
+	// Forwarders onto the static pool in SipMessagePool.hpp/.cpp (Issue #53 /
+	// #101(A) / #101(E)) — kept as public statics here because SipMessageFactory,
+	// the handler table, and the test suite all call them as
+	// RequestsHandler::getMessageFromPool(...). See sipmsgpool::getMessageFromPool
+	// for the full contract (returns NULL under sustained pressure — check it;
+	// the caller's job on refusal is to drop, never to synthesize a response out
+	// of the same empty pool).
 	static std::shared_ptr<SipMessage> getMessageFromPool(std::string_view message, sockaddr_in src);
-	// Clones an already-parsed message into a free pool slot via a direct field
-	// copy (SipMessage's copy assignment is a plain owned-string/vector copy —
-	// no shared buffer to fix up). Used by every response-building call site that
-	// used to go through getMessageFromPool(source->toString(), source->getSource()),
-	// which paid a full serialize + reparse just to duplicate a message we had
-	// already parsed once (issue #76).
 	static std::shared_ptr<SipMessage> getMessageFromPool(const SipMessage& source);
 
-private:
-	// Hands out an uninitialized message the caller exclusively owns: a free
-	// (use_count()==1) pool slot, else a bounded heap fallback, else nullptr once
-	// POCKETDIAL_MSG_HEAP_FALLBACK_MAX are already alive (Issue #101(A)).
-	// Internally synchronized on a leaf mutex — the pool is reachable from the
-	// UDP receive task and the tick task at once. See the definition.
-	static std::shared_ptr<SipMessage> acquirePooledMessage();
-
-public:
 	// ── Media beachhead static helpers (pure; host-unit-tested) ──────────────────
 	// Build the server's own SDP body for the 440 answer (server media: PCMU on the
 	// server's RTP port). Pure formatter — exposed so tests can assert its body and
@@ -793,10 +774,10 @@ private:
 	void loadCdrRing();                   // boot-time reload of the ring
 	void persistCdrRing();                // flush the whole ring (bounded, fixed size)
 
-	// Pre-allocated static memory pools (Issue #53)
+	// Pre-allocated static memory pools (Issue #53). The SipMessage pool itself
+	// now lives in SipMessagePool.hpp/.cpp (static there, not a member here).
 	std::vector<std::shared_ptr<SipClient>> _clientPool;
 	std::vector<std::shared_ptr<Session>> _sessionPool;
-	static std::vector<std::shared_ptr<SipMessage>> _messagePool;
 	// Virtual-peer pool: transient SipClient slots for 777/440/park legs (Issue #70).
 	std::vector<std::shared_ptr<SipClient>> _virtualPeerPool;
 
