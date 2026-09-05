@@ -33,7 +33,8 @@
           "role": "app",
           "size": 1846640
         }
-      ]
+      ],
+      "cfgseed_offset": 16773120
     },
     "esp32s3-eth": {
       "name": "esp32s3-eth",
@@ -67,7 +68,8 @@
           "role": "app",
           "size": 1142656
         }
-      ]
+      ],
+      "cfgseed_offset": 16773120
     },
     "esp32s3-wifi": {
       "name": "esp32s3-wifi",
@@ -101,7 +103,8 @@
           "role": "app",
           "size": 1543888
         }
-      ]
+      ],
+      "cfgseed_offset": 16773120
     }
   }
 }

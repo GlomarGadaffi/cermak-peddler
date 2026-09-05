@@ -31,19 +31,19 @@
         },
         {
           "name": "flasher_args-esp32s3-display.json",
-          "size": 1051
+          "size": 1077
         },
         {
           "name": "flasher_args-esp32s3-eth.json",
-          "size": 1051
+          "size": 1077
         },
         {
           "name": "flasher_args-esp32s3-wifi.json",
-          "size": 1051
+          "size": 1077
         },
         {
           "name": "manifest.json",
-          "size": 2436
+          "size": 2539
         },
         {
           "name": "ota_data_initial-esp32s3-display.bin",

@@ -179,7 +179,12 @@ jobs:
           import glob, json, os, re, struct, sys
           version = sys.argv[1]
 
-          # esp_partition_info_t: 32 bytes each, magic 0xAA50, NUL-padded name.
+          # esp_partition_info_t: 32 bytes each, NUL-padded name. The magic is
+          # ESP_PARTITION_MAGIC, whose on-disk bytes AA 50 read back as 0x50AA
+          # through a little-endian uint16 - this compared against 0xAA50 and so
+          # bailed on entry 0 every time, meaning cfgseed_offset was silently
+          # absent from every manifest ever generated and the flasher always
+          # concluded the release predated flash-time configuration.
           def cfgseed_offset(path):
               try:
                   blob = open(path, "rb").read()
@@ -188,7 +193,7 @@ jobs:
               for i in range(0, len(blob) - 31, 32):
                   magic, ptype, subtype, offset, size, name, flags = \
                       struct.unpack("<HBBII16sI", blob[i:i + 32])
-                  if magic != 0xAA50:
+                  if magic != 0x50AA:
                       break  # end of table (the MD5 entry / 0xFF padding)
                   if name.rstrip(b"\x00") == b"cfgseed":
                       return offset
