@@ -297,8 +297,12 @@ section {
 
 .showcase-img {
     width: 100%;
+    /* height:auto is load-bearing. The <img> carries width/height attributes so
+       the hero does not reflow while it loads; without height:auto the browser
+       uses that attribute height literally against a 100% width, and
+       object-fit:cover then crops the screenshot to a tall slice of itself. */
+    height: auto;
     display: block;
-    object-fit: cover;
     image-rendering: auto;
 }
 
