@@ -704,6 +704,11 @@ section {
     display: flex;
     flex-direction: column;
     gap: 15px;
+    /* Grid items default to min-width:auto, so the Quickstart code block's
+       unbreakable lines refused to shrink and took the whole row — squeezing
+       Deployment Guidelines into a ~160px ribbon. This lets the 1.1fr/0.9fr
+       split actually apply, and lets .code-pre overflow-x work. */
+    min-width: 0;
 }
 
 .tab-group-os {
