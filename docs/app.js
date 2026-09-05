@@ -4,6 +4,41 @@
 // 1. HARDWARE PROFILES REGISTRY (ASCII & Pinouts)
 // ==========================================================================
 const HARDWARE_PROFILES = {
+    't-eth-elite': {
+        title: "LilyGO T-ETH-ELITE S3 (W5500, 802.3af PoE)",
+        desc: "The default Ethernet target. An ESP32-S3-WROOM-1 carrier (16 MB flash, 8 MB PSRAM) pairing a W5500 SPI controller with onboard 802.3af PoE and a 40-pin Pi-compatible header. A different board from the T-ETH-Lite \u2014 the pin map is not the same.",
+        specs: {
+            "Core CPU": "ESP32-S3-WROOM-1",
+            "PHY Interface": "W5500 SPI Controller",
+            "SPI Host": "SPI2_HOST (FSPI) @ 40 MHz",
+            "SCLK Pin": "GPIO 48",
+            "MISO Pin": "GPIO 47",
+            "MOSI Pin": "GPIO 21",
+            "CS Pin": "GPIO 45",
+            "INT Pin": "GPIO 14",
+            "RST Pin": "Not wired (-1)"
+        },
+        ascii:
+` \u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510
+ \u2502 [RJ45 PoE 802.3af] \u2550\u2550 [W5500 MAC/PHY]
+ \u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524
+ \u2502 SCLK:48 \u2551 MOSI:21 \u2551 CS:45  \u2551 RST:\u2014
+ \u2502 MISO:47 \u2551 INT:14  \u2551 SPI2   \u2551 40MHz
+ \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518`,
+        code:
+`// LilyGO T-ETH-ELITE S3 \u2014 the default 'eth' board
+// Build with: -D PD_ETH_BOARD=elite   (this is the default)
+#define W5500_SCLK_GPIO 48
+#define W5500_MISO_GPIO 47
+#define W5500_MOSI_GPIO 21
+#define W5500_CS_GPIO   45
+#define W5500_INT_GPIO  14
+#define W5500_RST_GPIO  -1   // not wired; reset via SPI soft command
+
+// 40 MHz is the hardware-verified ceiling here: the Elite's W5500 pins
+// route through the GPIO matrix rather than IOMUX, and 80 MHz hard-fails
+// at driver install with ESP_ERR_TIMEOUT.`
+    },
     't-eth-lite': {
         title: "LilyGO T-ETH-Lite S3 (W5500 via SPI)",
         desc: "Sleek ESP32-S3 board with onboard RJ45 wired SPI Ethernet. The hardware MAC is emulated in software via the W5500 driver over the SPI bus.",
@@ -249,7 +284,7 @@ function initHardwareExplorer() {
     });
 
     // Default Render
-    renderBoard("t-eth-lite");
+    renderBoard("t-eth-elite");
 }
 
 // Global copy helper
@@ -413,7 +448,7 @@ function initTerminalEmulator() {
                 break;
 
             case "ver":
-                appendLine("POCKET-DIAL Version: <span class='highlight-cyan'>v1.0.0 (Official Release)</span>");
+                appendLine("POCKET-DIAL Version: <span class='highlight-cyan'>v1.2.0</span>");
                 appendLine("Hardened C++17 Core Engine (CMake Build: MSVC 19.x/GCC 11.x)");
                 appendLine("lwIP Sockets binding: UDP/5060, HTTP/8080 (Web CGA Console)");
                 break;

@@ -21,10 +21,11 @@
         <div class="nav-container">
             <div class="brand">
                 <span class="logo">pocket-dial</span>
-                <span class="version-badge">v1.0.0</span>
+                <span class="version-badge">v1.2.0</span>
             </div>
             <nav class="nav-links">
                 <a href="#features" class="nav-link">Features</a>
+                <a href="#telephony" class="nav-link">Call Features</a>
                 <a href="#hardware" class="nav-link">Hardware Config</a>
                 <a href="#quickstart" class="nav-link">Quickstart</a>
                 <a href="flasher/" class="nav-link">Flash a board</a>
@@ -115,16 +116,16 @@
             <div class="features-grid">
                 <div class="feature-card">
                     <div class="card-icon">🔑</div>
-                    <h3 class="feature-card-title">No-Credential Registrar</h3>
+                    <h3 class="feature-card-title">Open By Default, Locked If You Want</h3>
                     <p class="feature-card-text">
-                        Any SIP endpoint registers immediately—no username or password is validated. Designed for flat, trusted LANs only. <strong>Do not expose SIP or the dashboard to the public Internet.</strong>
+                        Out of the box any SIP endpoint registers immediately — no username, no password, nothing to configure. Turn on SIP digest auth (RFC&nbsp;2617) when you are ready, with a <em>Learn</em> mode that adopts an existing phone fleet without re-provisioning it. Either way: <strong>do not expose SIP or the dashboard to the public Internet.</strong>
                     </p>
                 </div>
                 <div class="feature-card">
                     <div class="card-icon">🔊</div>
                     <h3 class="feature-card-title">Direct RTP Media Flow</h3>
                     <p class="feature-card-text">
-                        Voice data flows peer-to-peer directly between devices. The server handles only SIP signaling, ensuring minimal RAM consumption and low-latency audio transmission.
+                        Voice data flows peer-to-peer directly between devices. By default the server handles only SIP signalling and never touches call audio, which is what keeps RAM use and latency down. The optional conference mixer is the one exception, and it is off unless you build it in.
                     </p>
                 </div>
                 <div class="feature-card">
@@ -144,6 +145,62 @@
             </div>
         </section>
 
+
+        <!-- TELEPHONY FEATURES -->
+        <section id="telephony" class="features-section">
+            <div class="section-header-block">
+                <h2 class="section-title">It Behaves Like a Real PBX</h2>
+                <p class="section-desc">
+                    Everything below runs on the microcontroller itself &mdash; no cloud service, no companion server, no per-seat licence.
+                </p>
+            </div>
+
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="card-icon">⇄</div>
+                    <h3 class="feature-card-title">Transfer, Blind &amp; Attended</h3>
+                    <p class="feature-card-text">
+                        Blind transfer hands the call straight over. Attended transfer lets you consult first, then splice the two parties together with REFER + <code>Replaces</code> (RFC&nbsp;3891) &mdash; the transferor drops out and a later hang-up from either side still tears the call down cleanly.
+                    </p>
+                </div>
+                <div class="feature-card">
+                    <div class="card-icon">◎</div>
+                    <h3 class="feature-card-title">Park &amp; Retrieve</h3>
+                    <p class="feature-card-text">
+                        Dial a free orbit in <strong>700&ndash;709</strong> to park a call; anyone can dial the same orbit from any handset to pick it up. Useful for &ldquo;grab this on the phone in the back&rdquo; without an intercom.
+                    </p>
+                </div>
+                <div class="feature-card">
+                    <div class="card-icon">☎</div>
+                    <h3 class="feature-card-title">Call Pickup</h3>
+                    <p class="feature-card-text">
+                        <strong>*8</strong> answers whatever is ringing in your pickup group; <strong>**&lt;ext&gt;</strong> answers one specific extension. Stops the walk across the room to a ringing desk.
+                    </p>
+                </div>
+                <div class="feature-card">
+                    <div class="card-icon">⚇</div>
+                    <h3 class="feature-card-title">Ring Groups &amp; Hunting</h3>
+                    <p class="feature-card-text">
+                        Ring every member at once, or hunt down the list to the first phone that answers. Unanswered legs are cancelled properly rather than left ringing.
+                    </p>
+                </div>
+                <div class="feature-card">
+                    <div class="card-icon">↳</div>
+                    <h3 class="feature-card-title">Forwarding &amp; DND</h3>
+                    <p class="feature-card-text">
+                        Forward unconditionally, on busy, or on no-answer (CFU / CFB / CFNA), plus do-not-disturb with dial codes to toggle it from the handset.
+                    </p>
+                </div>
+                <div class="feature-card">
+                    <div class="card-icon">📢</div>
+                    <h3 class="feature-card-title">Paging Zones</h3>
+                    <p class="feature-card-text">
+                        Dial <strong>980&ndash;989</strong> to talk out of a zone of phones at once, or <strong>999</strong> to page everything. Star codes cover the rest &mdash; echo test, DND toggle and friends.
+                    </p>
+                </div>
+            </div>
+        </section>
+
         <!-- HARDWARE MATRIX EXPLORER -->
         <section id="hardware" class="hardware-section">
             <div class="section-header-block">
@@ -155,7 +212,8 @@
 
             <div class="hardware-box">
                 <div class="board-tabs-bar">
-                    <button class="board-tab active" data-board="t-eth-lite">LilyGO T-ETH-Lite S3 (W5500 SPI)</button>
+                    <button class="board-tab active" data-board="t-eth-elite">LilyGO T-ETH-ELITE S3 (W5500 PoE) — default</button>
+                    <button class="board-tab" data-board="t-eth-lite">LilyGO T-ETH-Lite S3 (W5500 SPI)</button>
                     <button class="board-tab" data-board="t-poe-pro">LilyGO T-POE-Pro (LAN8720 RMII)</button>
                     <button class="board-tab" data-board="waveshare-poe">Waveshare S3-ETH (W5500)</button>
                     <button class="board-tab" data-board="standard-wifi">ESP32 / CYD Wi-Fi AP (Wireless)</button>
@@ -206,7 +264,7 @@
                         </div>
                         <div class="sec-item">
                             <span class="badge badge-warning">RELEASE GAP</span>
-                            <p><strong>Releases lag <code>main</code>:</strong> the newest published tag predates the admin PIN, the hardened dashboard and the access-point and registrar controls above. A board flashed from a release has none of them &mdash; build from <code>main</code> if you need them.</p>
+                            <p><strong>Releases lag <code>main</code> badly:</strong> the newest published tag is <strong>v1.2.0 (June&nbsp;2026)</strong>, and <code>main</code> is <strong>134 commits</strong> ahead of it. That tag predates the admin PIN, the hardened dashboard, the access-point and registrar controls above <em>and</em> every call feature on this page &mdash; transfer, park, pickup, ring groups, forwarding and paging all landed after it. A board flashed from a release has none of them, so <strong>build from <code>main</code></strong> unless you specifically want the old behaviour.</p>
                         </div>
                     </div>
                 </div>
@@ -217,7 +275,7 @@
         <!-- MINIMAL FOOTER -->
         <footer class="system-footer">
             <div class="footer-columns">
-                <div>pocket-dial project — v1.0.0. Licensed under <span class="highlight-white">MIT</span>.</div>
+                <div>pocket-dial project — v1.2.0. Licensed under <span class="highlight-white">MIT</span>.</div>
                 <div>Source code available on <a href="https://github.com/GlomarGadaffi/pocket-dial" target="_blank" class="footer-link">GitHub</a></div>
             </div>
         </footer>
