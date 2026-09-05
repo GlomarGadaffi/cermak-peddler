@@ -534,7 +534,21 @@ footer { color: var(--text-dim); font-size: .86rem; text-align: center; margin-t
 // ---------------------------------------------------------------------------
 
 const REPO = "GlomarGadaffi/pocket-dial";
-const RELEASES_API = `https://api.github.com/repos/${REPO}/releases?per_page=15`;
+
+// Firmware is served from this very origin, not from the GitHub Release.
+//
+// A browser cannot fetch a Release asset: browser_download_url 302s to
+// release-assets.githubusercontent.com, and neither the redirect nor the final
+// response sets Access-Control-Allow-Origin. api.github.com *is* CORS-enabled,
+// so listing releases succeeded and only the downloads failed — the page looked
+// fine right up until someone pressed Flash (pocket-dial#138).
+//
+// release.yml copies each release's images into docs/firmware/<tag>/ and
+// regenerates this index, so the page fetches same-origin and CORS never
+// applies. The GitHub Release remains the source of truth and still carries
+// every asset; Pages holds only what this page actually downloads.
+// Relative to docs/flasher/, so one level up to the Pages root.
+const FIRMWARE_INDEX = "../firmware/index.json";
 
 // Variant ids double as the "<chip>-<transport>" tag the release workflow
 // (.github/workflows/release.yml) bakes into asset names, e.g.
@@ -1018,19 +1032,24 @@ const state = {
 
 async function loadReleases() {
   try {
-    const res = await fetch(RELEASES_API, { headers: { Accept: "application/vnd.github+json" } });
-    if (res.status === 403 || res.status === 429) throw new Error("rate-limited");
-    if (!res.ok) throw new Error(`GitHub API returned ${res.status}`);
+    // Same-origin, so no CORS and no API rate limit. no-cache because a re-tag
+    // republishes the same path with different bytes.
+    const res = await fetch(FIRMWARE_INDEX, { cache: "no-cache" });
+    if (!res.ok) throw new Error(`firmware index returned ${res.status}`);
 
-    const list = (await res.json()).filter((r) => !r.draft);
+    const list = (await res.json()).releases || [];
     if (!list.length) throw new Error("no-release");
 
     state.releases = list.map((r) => ({
-      tag: r.tag_name,
-      name: r.name || r.tag_name,
+      tag: r.tag,
+      name: r.name || r.tag,
       prerelease: !!r.prerelease,
-      url: r.html_url,
-      assets: new Map((r.assets || []).map((a) => [a.name, { url: a.browser_download_url, size: a.size }])),
+      // Metadata only — nothing on the flash path depends on reaching github.com.
+      url: `https://github.com/${REPO}/releases/tag/${encodeURIComponent(r.tag)}`,
+      assets: new Map((r.files || []).map((f) => [
+        f.name,
+        { url: `../firmware/${encodeURIComponent(r.tag)}/${encodeURIComponent(f.name)}`, size: f.size }
+      ])),
       manifest: undefined,
       resolved: new Map()
     }));
@@ -1105,14 +1124,9 @@ function renderRelease() {
   if (err.message === "no-release") {
     kind = "warn";
     body = `<p style="margin-bottom:6px"><strong>No release published yet.</strong></p>
-            <p class="muted" style="margin-bottom:0">There's nothing to download for this repository yet, so one-click flashing isn't available.
+            <p class="muted" style="margin-bottom:0">No release has been published to this site yet, so one-click flashing isn't available.
             You can still use <em>Flash your own build</em> below with images you built locally.</p>`;
     line.textContent = "No release available.";
-  } else if (err.message === "rate-limited") {
-    body = `<p style="margin-bottom:6px"><strong>GitHub rate-limited this browser.</strong></p>
-            <p class="muted" style="margin-bottom:0">Unauthenticated API requests are capped at 60 per hour per IP. Wait a while and reload,
-            or use <em>Flash your own build</em> below.</p>`;
-    line.textContent = "Couldn't reach GitHub.";
   } else {
     body = `<p style="margin-bottom:6px"><strong>Couldn't load the releases.</strong></p>
             <p class="muted" style="margin-bottom:0">${esc(err.message)} &mdash; you can still use <em>Flash your own build</em> below.</p>`;

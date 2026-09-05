@@ -39,12 +39,29 @@ machine.
    board. Every published build is ESP32-S3, so a non-S3 chip gets a warning
    pointing at the from-source `lan8720` build.
 
-3. **Fetch releases.** One call to
-   `https://api.github.com/repos/GlomarGadaffi/pocket-dial/releases?per_page=15`
-   populates a picker; drafts are hidden and the newest non-pre-release is
-   selected by default. Rate limiting (60 unauthenticated requests per hour
-   per IP), an empty release list, and network errors are all explained
-   states that steer the user to the local-file panel.
+3. **Fetch releases — from this site, not from the GitHub API.** One call to
+   `../firmware/index.json` populates the picker; the newest non-pre-release is
+   selected by default. An empty list and network errors are explained states
+   that steer the user to the local-file panel.
+
+   > **Why not the API?** It used to be `api.github.com/.../releases`, with each
+   > image fetched from its asset's `browser_download_url`. **A browser cannot do
+   > that.** Those URLs 302 to `release-assets.githubusercontent.com`, and
+   > neither the redirect nor the final response sets
+   > `Access-Control-Allow-Origin`, so every download fails CORS. The API itself
+   > *is* CORS-enabled, so listing releases worked and only the downloads failed
+   > — the page looked healthy right up until someone pressed **Flash** (#138).
+   >
+   > `release.yml` now copies each release's images into `docs/firmware/<tag>/`
+   > and regenerates `docs/firmware/index.json`, so everything the page fetches
+   > is same-origin and CORS never applies. Nothing on the flash path touches
+   > github.com; the only API-shaped thing left is the "view release" link,
+   > which is constructed from the tag and is cosmetic.
+   >
+   > The GitHub Release is still the source of truth and still carries every
+   > asset, including the host binary, `partitions.csv` and `SHA256SUMS`. Pages
+   > holds only the subset the page downloads. See
+   > [`docs/firmware/README.md`](../firmware/README.md).
 
 4. **Resolve the images.** Two release layouts are understood:
 

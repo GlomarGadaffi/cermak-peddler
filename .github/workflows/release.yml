@@ -253,3 +253,38 @@ jobs:
         env:
           # Built-in token; no external/cloud deploy credentials are used.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Same-origin copy for the browser flasher ────────────────────────────
+      # A browser cannot fetch a GitHub Release asset: browser_download_url 302s
+      # to release-assets.githubusercontent.com, and neither the redirect nor the
+      # final response sets Access-Control-Allow-Origin, so every download fails
+      # CORS. api.github.com *is* CORS-enabled, so listing releases worked and
+      # only the downloads failed — which is why this went unnoticed until
+      # someone actually tried to flash (pocket-dial#138).
+      #
+      # Publishing the same images under docs/ puts them on the origin that
+      # already serves the flasher, so CORS never applies. The Release stays the
+      # source of truth and keeps every asset (host binary, partitions.csv,
+      # SHA256SUMS); Pages carries only what the page actually fetches.
+      #
+      # This pushes to main, which does NOT re-trigger the workflow: the `on:`
+      # block above is tags-only. Runs after the Release is published so a Pages
+      # failure can never cost us the Release itself.
+      - name: Publish firmware to Pages (docs/firmware/<tag>/)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch main \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" pages-main
+          python3 tools/publish_pages_firmware.py "${GITHUB_REF_NAME}" release pages-main
+          cd pages-main
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/firmware
+          if git diff --cached --quiet; then
+            echo "docs/firmware already up to date — nothing to push."
+            exit 0
+          fi
+          git commit -m "chore(pages): publish ${GITHUB_REF_NAME} firmware for the browser flasher"
+          git push origin main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
