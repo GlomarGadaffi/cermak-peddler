@@ -1,6 +1,54 @@
 # Changelog
 
-## Unreleased (feat/issue-131-attended-transfer) - 2026-09-04
+## [v1.3.0] — 2026-09-04
+
+The first release since v1.2.0 (June 2026), 134 commits back. v1.2.0
+was a SIP registrar and proxy; v1.3.0 is a small PBX with an admin plane you can
+lock down.
+
+Nothing here breaks an existing deployment: the SSH/TUI admin surface removed
+below never shipped in a release, and every hardening feature is opt-in and off
+by default. Upgrading is an OTA or a reflash.
+
+### Highlights
+
+**It behaves like a PBX now.** Blind *and* attended transfer (REFER with
+`Replaces`, RFC 3891 — consult, then splice the two parties and drop out); call
+park and retrieve on orbits 700–709; call pickup, group (`*8`) and directed
+(`**<ext>`); ring/hunt groups on a bounded pattern→action dial plan; per-extension
+call-forward (always, on busy, on no-answer) and do-not-disturb; paging zones
+980–989; a conference mixer and a real Linux media path on extension 440.
+
+**Security is opt-in but it exists.** SIP digest auth (RFC 2617) with a Learn
+mode that adopts an existing phone fleet; WPA2 on the SoftAP, which encrypts the
+dashboard, SIP signalling *and* call audio together; an admin PIN with
+server-side sessions and CSRF tokens on every mutating endpoint; a dark-by-default
+HTTP admin plane that does not even listen on a provisioned device; an SDP
+admission gate that structurally checks every body before a decoder sees it. The
+second admin plane (SSH/TUI) was deleted rather than hardened.
+
+**Operability.** Zero-touch phone provisioning via `GET /config/<mac>.cfg`; a
+live SIP tracer in the dashboard and at `GET /api/trace`; a Wireshark-readable
+capture at `GET /api/pcap`; flash-time configuration written by the browser
+flasher into a `cfgseed` partition, so Wi-Fi mode, AP security and the
+passphrase are set without rebuilding.
+
+**Browser flasher.** Install any variant over USB from
+https://glomargadaffi.github.io/pocket-dial/flasher/ with no toolchain. Firmware
+for this release is served from the project site itself rather than from the
+Release's assets — a browser cannot fetch those, because GitHub serves release
+downloads without CORS headers (#138).
+
+### Fixed
+
+Beyond the entry below, this release carries a long tail of SIP correctness and
+robustness work: pool-exhaustion paths that abandoned half-mutated calls, a
+CANCEL that claimed success after failing to build, hold/resume 200 OKs that
+never reached the peer leg, a doubled Call-ID on the park-retrieve re-INVITE, a
+BLF regression in `forEachSessionInvolving`, CR/LF injection into provisioning
+`.cfg` files, RTP SSRC/sequence seeding moved off `std::rand`, and an lwIP UDP
+mailbox too small to absorb signalling bursts. See the git log between `v1.2.0`
+and this tag for the full list.
 
 ### Added — Attended transfer via REFER + Replaces (#131)
 
