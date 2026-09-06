@@ -199,7 +199,17 @@ TEST(InviteAdmission, SecureModeChallengesInviteThenAdmitsCredentialedRetry)
 	h.sent.clear();
 	h.handler.handle(makeInvite("sec", 2, kPcmuOffer, authz));
 	EXPECT_FALSE(anySentContains(h.sent, "401 Unauthorized")) << "valid credentials must not be re-challenged";
-	EXPECT_FALSE(anySentContains(h.sent, "403"));
+	// Match the status LINE, not a bare "403" (issue #136). anySentContains() is a
+	// plain substring search over the whole message, and the INVITE forked to 600
+	// echoes this request's Authorization header verbatim -- 64 characters of digest
+	// nonce and MD5 response hex. Those 62 three-character windows hit "403" roughly
+	// 1.5% of the time (measured 3/400 fresh processes), which is exactly the
+	// order-dependent-looking intermittent failure #136 recorded: the credentials
+	// were accepted and the fork went out, but a random hex triple spelled the code
+	// this line was watching for. The sibling assertion at the bottom of this test
+	// already uses the full "SIP/2.0 403 Bad Credentials" form.
+	EXPECT_FALSE(anySentContains(h.sent, "SIP/2.0 403"))
+		<< "valid credentials must not be rejected";
 	EXPECT_TRUE(anySentContains(h.sent, "INVITE sip:600@")) << "admitted INVITE is forked to the callee";
 
 	// 3. Wrong password -> 403, not a loop of challenges.
