@@ -1,6 +1,10 @@
 // MediaBridge_test.cpp — unit coverage for MediaBridge, the RTP<->AnchorClient
-// glue. On host, RtpReceiver/RtpSender::start() are no-op stubs (no real socket
-// or pacing task), so these tests exercise the parts that are real on host: the
+// glue. On host RtpReceiver::start() is a no-op stub, but RtpSender is NOT: its
+// "#elif defined(__linux__)" branch (issue #82) spawns a real 20 ms pacer thread
+// whose provider is MediaBridge::fillHandsetTx, which pops the very playout buffer
+// these tests assert on (PlayoutBuffer::read is destructive). Any test that reads
+// getPlayoutBuffer() must stop that sender right after startBridge() first -- see
+// issue #135. Otherwise these tests exercise the parts that are real on host: the
 // lifecycle/identity bookkeeping and the feedRx -> PlayoutBuffer path, including
 // an end-to-end run through a real LoopbackAnchorClient wired the way
 // RequestsHandler would wire any AnchorClient's single rx callback.
@@ -106,7 +110,10 @@ TEST(MediaBridge, FeedRxRejectedForWrongParticipant) {
 
 TEST(MediaBridge, FeedRxWritesIntoPlayoutBuffer) {
 	Fixture f;
-	f.bridge.startBridge("127.0.0.1", 5004, "call-1", "part-1");
+	ASSERT_TRUE(f.bridge.startBridge("127.0.0.1", 5004, "call-1", "part-1"));
+	// Halt the Linux pacer thread before asserting on the playout buffer it also
+	// drains via fillHandsetTx -> PlayoutBuffer::read() (issue #135).
+	ASSERT_TRUE(f.sender.stop("call-1"));
 
 	const int16_t in[] = {111, 222, 333};
 	EXPECT_TRUE(f.bridge.feedRx("part-1", in, 3));
@@ -127,7 +134,9 @@ TEST(MediaBridge, FeedRxWritesIntoPlayoutBuffer) {
 
 TEST(MediaBridge, AnchorAudioReachesPlayoutBufferThroughRxFanout) {
 	Fixture f;
-	f.bridge.startBridge("127.0.0.1", 5004, "call-1", "part-1");
+	ASSERT_TRUE(f.bridge.startBridge("127.0.0.1", 5004, "call-1", "part-1"));
+	// Same pacer-thread hazard as above (issue #135).
+	ASSERT_TRUE(f.sender.stop("call-1"));
 
 	f.anchor.registerAudioRxCallback([&f](const std::string& participantId,
 	                                       const int16_t* samples, size_t count) {

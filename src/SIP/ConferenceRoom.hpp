@@ -109,6 +109,18 @@ public:
 	MixBus& bus() { return _bus; }
 	MediaBridge* bridgeForCall(const std::string& callID);
 
+	// Test access to a leg's RtpSender. On a Linux host RtpSender::start() is NOT the
+	// inert stub the host build is often assumed to get: RtpSender.cpp's
+	// "#elif defined(__linux__)" branch (issue #82) spawns a real 20 ms pacer thread
+	// whose frame provider is MediaBridge::fillHandsetTx -- i.e. a DESTRUCTIVE
+	// MixBus::outputFrame() pop of this port's out ring (PlayoutBuffer::read advances
+	// the read pointer and decrements _count). A test that steps the bus with
+	// tickOnce() and then drains a leg by hand is therefore a SECOND consumer of that
+	// ring, and must stop the pacer first or it can lose the very frame it is about to
+	// assert on (issue #135). Production never needs this: the pacer is the only caller
+	// of fillHandsetTx.
+	RtpSender* senderForCall(const std::string& callID);
+
 private:
 	struct Leg
 	{

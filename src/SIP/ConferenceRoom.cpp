@@ -148,6 +148,13 @@ MediaBridge* ConferenceRoom::bridgeForCall(const std::string& callID)
 	return (idx < 0) ? nullptr : &_legs[static_cast<size_t>(idx)].bridge;
 }
 
+RtpSender* ConferenceRoom::senderForCall(const std::string& callID)
+{
+	std::lock_guard<std::mutex> lock(_mutex);
+	const int idx = indexOfLocked(callID);
+	return (idx < 0) ? nullptr : &_legs[static_cast<size_t>(idx)].tx;
+}
+
 // ── The single mix-tick driver ───────────────────────────────────────────────
 // One periodic clock for the whole room. Deliberately NOT hung off a leg's
 // RtpSender cadence: there are N senders and only one bus, so that would be N
