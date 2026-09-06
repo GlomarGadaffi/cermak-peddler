@@ -14,7 +14,6 @@ Cross-references:
 [THREAT_MODEL.md](THREAT_MODEL.md) ·
 [PROVISIONING.md](PROVISIONING.md) ·
 [OTA.md](OTA.md) ·
-[../ISSUES.md](../ISSUES.md) ·
 [../README.md](../README.md)
 
 > **Framing.** pocket-dial's default call path is a *signalling-only* SIP registrar/proxy: it
@@ -25,7 +24,7 @@ Cross-references:
 > **opt-in** exception exists: `AnchorClient`/`MediaBridge`/`TelephonyProvider` (`src/SIP/`) are a
 > vendor-neutral extension point for bridging a call to an external audio system, and `MixBus`
 > (`src/SIP/MixBus.*`) is a tested N-way mixer — both ship compiled and unit-tested but unwired
-> from call routing by default (see [ISSUES.md](../ISSUES.md) Non-Goals). They don't change the
+> from call routing by default (see Non-Goals below). They don't change the
 > framing above for the default path; they're there for a fork that wants to cross the line
 > deliberately, on its own terms.
 
@@ -50,7 +49,7 @@ Cross-references:
 | **Admin plane, dark by default** | HTTP is the only admin surface (SSH "sysop terminal" — wolfSSH + the ANSI/TUI hub — **removed**, not hardened). Unreachable on a provisioned device except for a bounded TTL after a source-IP-verified DTMF trigger or a fresh provisioning grace window. Ring groups, call-forward, and DND remain configurable — now over the web dashboard only. | `src/Helpers/HttpServer.*`, `src/SIP/RequestsHandler::onDtmfInfo`, [THREAT_MODEL.md](THREAT_MODEL.md) §5.5. `docs/design/` (TUI design docs) is now historical — describes the removed SSH surface, not current behavior. |
 | **PBX call features** | CDR ring, per-extension **DND**, **call-forward** (CFU/CFB/CFNA), **ring groups** (ring-all / hunt), **blind transfer** (REFER), **hold/resume** (re-INVITE + RFC 3311 UPDATE), **session timers** (RFC 4028), **call parking** (orbits `700`-`709`), **paging zones** (`980`-`989`), **BLF/presence** (`SUBSCRIBE`/`NOTIFY`, RFC 4235), DTMF star-codes (`*60/*80/*72/*73/*69/*11`) | `src/SIP/RequestsHandler.cpp`, `CallDetailRecord.hpp`, `PbxConfig.hpp` |
 | **Server-mixed conference** | `MixBus` (N−1 minus-self summing junction, int32 accumulator clipped once) wired into `MediaBridge`'s BUS mode and dialable as extension `888`. `ConferenceRoom` owns one bus, `POCKETDIAL_CONF_LEGS` legs, and the single 20 ms mix tick. No anchor/vendor required. | `src/SIP/ConferenceRoom.*`, `src/SIP/MixBus.*`, [CONFERENCE_MIXER.md](CONFERENCE_MIXER.md) |
-| **Anchored media (opt-in, unwired)** | `AnchorClient`/`MediaBridge`/`TelephonyProvider`/`TelephonyApiConfig` — vendor-neutral building blocks for bridging a call to an external audio system (ships with only a `Loopback` reference). The anchor side is not wired into call routing by default; see [ISSUES.md](../ISSUES.md) Non-Goals. | `src/SIP/MediaBridge.*`, `src/SIP/TelephonyProvider.*` |
+| **Anchored media (opt-in, unwired)** | `AnchorClient`/`MediaBridge`/`TelephonyProvider`/`TelephonyApiConfig` — vendor-neutral building blocks for bridging a call to an external audio system (ships with only a `Loopback` reference). The anchor side is not wired into call routing by default; see Non-Goals below. | `src/SIP/MediaBridge.*`, `src/SIP/TelephonyProvider.*` |
 
 ---
 
@@ -124,7 +123,7 @@ Complexity is a t-shirt size for *signalling-side* work unless noted.
 | **P2** | **Optional self-signed HTTPS for dashboard** | Still P2, still not the primary control. Documented add-on *on top of* WPA2 only. Browser-warning UX is bad on a LAN appliance and TLS handshakes cost MCU RAM/CPU; not the primary control. | **M** | [THREAT_MODEL.md](THREAT_MODEL.md) §6 (answered "not as primary") |
 | **P2** | **SRTP for media** | App-layer media encryption. Heavyweight on the MCU and key-management UX; WPA2 already encrypts media at the link layer for far less. Low priority given the P2P/no-DSP model. | **L** | [THREAT_MODEL.md](THREAT_MODEL.md) I-1 |
 
-### 3.4 Developer / ops experience (cross-ref [../ISSUES.md](../ISSUES.md))
+### 3.4 Developer / ops experience
 
 | Pri | Feature | Rationale (technical) | Complexity | Issue |
 |-----|---------|----------------------|------------|-------|
@@ -168,13 +167,13 @@ Iteration D  ── Observability & ops
   P2  Provisioning dashboard editor ........ UI on top of Iteration B
 
 Iteration E+ ── Bigger bets
-  ✓   Call parking · BLF/presence · paging zones ........... shipped (ISSUES.md #65-67)
-  ✓   Dial plan / hunt-group generalization (pattern -> action table) ... shipped (ISSUES.md #69)
-  P1  Directed call pickup (pickup groups) ................................ ISSUES.md #68
+  ✓   Call parking · BLF/presence · paging zones ........... shipped (tracker #65-67)
+  ✓   Dial plan / hunt-group generalization (pattern -> action table) ... shipped (tracker #69)
+  P1  Directed call pickup (pickup groups) .................................. tracker #68
   P2  DHCP Opt-66 · multi-vendor provisioning
   P2  Secure Boot v2 + flash encryption + signed OTA  (durable physical/supply-chain fix)
   P2  Multi-AP/mesh · optional HTTPS · SRTP
-  P2  Wire MixBus into MediaBridge for local N-way conferencing (opt-in) .......... ISSUES.md #75
+  P2  Wire MixBus into MediaBridge for local N-way conferencing (opt-in) ............ tracker #75
 ```
 
 **Why this order:**
@@ -202,7 +201,7 @@ static-pool architecture, not for any other reason.
 
 | Non-goal | Why (technical) |
 |----------|-----------------|
-| **On-MCU media mixing / conferencing wired into live calls** | The scalar mixer (`MixBus`) is implemented and tested — ~64k adds/s at ≤8 narrowband ports, a rounding error on a 240 MHz core (see [CONFERENCE_MIXER.md](CONFERENCE_MIXER.md) §4) — but it is *not* wired into `MediaBridge`'s call path or any dial-plan entry point (tracked: [ISSUES.md](../ISSUES.md) #75). Still breaks the "server never touches RTP" invariant for the *default* path ([SCALING.md](SCALING.md) §1) whenever it IS wired in — that's a deliberate, bounded opt-in, not a removal of the invariant for ordinary LAN calls. |
+| **On-MCU media mixing / conferencing wired into live calls** | The scalar mixer (`MixBus`) is implemented and tested — ~64k adds/s at ≤8 narrowband ports, a rounding error on a 240 MHz core (see [CONFERENCE_MIXER.md](CONFERENCE_MIXER.md) §4) — but it is *not* wired into `MediaBridge`'s call path or any dial-plan entry point (tracked: internal tracker #75). Still breaks the "server never touches RTP" invariant for the *default* path ([SCALING.md](SCALING.md) §1) whenever it IS wired in — that's a deliberate, bounded opt-in, not a removal of the invariant for ordinary LAN calls. |
 | **On-device voicemail (record/playback)** | Same reason: media must traverse and be stored/transcoded on the device. Scope only as routing to an external SIP voicemail UA. |
 | **On-MCU transcoding** | No DSP budget. The engine deliberately *rewrites SDP to G.711 (`0 8 101`)* and forces phones via provisioning rather than transcoding; that is the design, not a gap. |
 | **Wideband / Opus / G.722 media negotiation** | The interop strategy is to *lock* to G.711; supporting wideband would reintroduce the codec-mismatch failures `enforceG711()` exists to prevent. |

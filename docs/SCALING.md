@@ -24,7 +24,7 @@ the audio for an ordinary call:
   bytes of `Session` bookkeeping that remember who is talking to whom. (The
   capacity model below is about THIS path. `AnchorClient`/`MediaBridge`/`MixBus`
   are an opt-in exception that puts the board in the media path when a fork wires
-  them in — see [ISSUES.md](../ISSUES.md) Non-Goals; they carry their own,
+  them in — see [FEATURE_ROADMAP.md](FEATURE_ROADMAP.md) Non-Goals; they carry their own,
   separate CPU/RAM budget, not accounted for here.)
 * **Signalling is bursty and tiny.** A REGISTER or INVITE is a sub-1 KB UDP
   datagram handled in microseconds. Even with aggressive OPTIONS keepalives the

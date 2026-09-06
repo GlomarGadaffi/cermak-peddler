@@ -79,7 +79,7 @@ We estimate heap consumption across three key operating states:
 3. **State 3 (Active SIP Call):**
    * Reuses already allocated pool items from `_clientPool` and `_sessionPool`.
    * **Zero additional dynamic memory is allocated** for clients or sessions.
-   * Minimal transient allocations ($< 1\text{ KB}$) occur in lwIP buffers and `SipMessage` parsing, returning free memory immediately to State 1 levels. This prevents the severe fragmentation failures identified in [Issue #53](../ISSUES.md#L67).
+   * Minimal transient allocations ($< 1\text{ KB}$) occur in lwIP buffers and `SipMessage` parsing, returning free memory immediately to State 1 levels. This prevents the severe fragmentation failures identified in Issue #53.
 
 ---
 

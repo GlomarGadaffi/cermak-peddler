@@ -139,7 +139,7 @@ The **`MixBus`** and **`MediaBridge`** are fully tested but **not wired into cal
 - **`MediaBridge`** glues RTP streams to a vendor-neutral `AnchorClient` interface (e.g., a radio transmitter, recording system, external audio processor)
 - **`MixBus`**: N-way conference mixer with assembly-optimized kernels
 
-If you need conference calls or external bridging, see **[docs/CONFERENCE_MIXER.md](docs/CONFERENCE_MIXER.md)** and **[ISSUES.md](ISSUES.md#non-goals)** for the design rationale.
+If you need conference calls or external bridging, see **[docs/CONFERENCE_MIXER.md](docs/CONFERENCE_MIXER.md)** for the design rationale.
 
 ## Docs
 
