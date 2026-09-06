@@ -1982,6 +1982,43 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 
 	std::string callID(data->getCallID());
 
+	// Issue #133: reject an off-path forged transfer, the REFER analogue of #46's
+	// BYE guard. findClient() above only proves the From header names a REGISTERed
+	// extension — From is attacker-chosen, so on its own it lets any registered
+	// phone name someone else's Call-ID and tear that session down (blind path:
+	// endCall() + a BYE to the victim's peer) or splice it into another dialog
+	// (attended path). Same rule as onBye: an in-dialog REFER must arrive from one
+	// of the dialog's own leg IPs. isDialogSourceAuthorized() fails open on an
+	// unknown or half-set-up session, so a genuinely out-of-dialog REFER still
+	// falls through to the blind-transfer path exactly as before.
+	if (auto referred = getSession(callID); referred.has_value() &&
+		!isDialogSourceAuthorized(referred.value(), data->getSource()))
+	{
+		queueLog("REFER for Call-ID " + callID +
+			" rejected: source not a dialog leg (spoofed transfer)", true);
+		_registrar.sendForbidden(data, "Forbidden");
+		return;
+	}
+
+	// The consult dialog gets the same treatment. The attended block below only
+	// checks that the transferor's NUMBER is common to both dialogs — also a
+	// From-header claim — so without this a party legitimately on the A-B dialog
+	// could still name any unrelated call A happens to be in as ?Replaces= and
+	// splice A out of it. A real transferor is a leg of both dialogs and passes
+	// both checks; anyone else fails one.
+	if (!replacesCallIdBare.empty())
+	{
+		if (auto consult = getSession("Call-ID: " + replacesCallIdBare);
+			consult.has_value() &&
+			!isDialogSourceAuthorized(consult.value(), data->getSource()))
+		{
+			queueLog("REFER Replaces=" + replacesCallIdBare +
+				" rejected: source not a leg of the consult dialog (spoofed transfer)", true);
+			_registrar.sendForbidden(data, "Forbidden");
+			return;
+		}
+	}
+
 	// ── Attended transfer (RFC 3891 Replaces), issue #131 ─────────────────────────
 	// A (transferor) has two active calls: A-B (this REFER's own dialog, callID)
 	// and A-C (the consult session, replacesCallIdBare). Splice B<->C via cross
@@ -2019,9 +2056,10 @@ void RequestsHandler::onRefer(std::shared_ptr<SipMessage> data)
 				bool aIsDestAB = ab->getDest() && ab->getDest()->getNumber() == aNum;
 				aIsSrcAC = ac->getSrc() && ac->getSrc()->getNumber() == aNum;
 				bool aIsDestAC = ac->getDest() && ac->getDest()->getNumber() == aNum;
-				// Narrower than #133's general onRefer auth gap: A must be common to
-				// BOTH dialogs, or there is nothing coherent to splice. Stays regardless
-				// of how #133 is eventually resolved.
+				// A coherence check, not an auth check (#133's source gate above is
+				// the auth one): A must be common to BOTH dialogs, or there is nothing
+				// to splice. Kept even though the source gate now subsumes the
+				// spoofing case — it still catches an honest client's mismatched pair.
 				if (!(aIsSrcAB || aIsDestAB) || !(aIsSrcAC || aIsDestAC))
 				{
 					queueLog("REFER: attended transfer invariant violated (A not common to both dialogs)", true);

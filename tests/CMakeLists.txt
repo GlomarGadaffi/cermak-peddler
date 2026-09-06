@@ -79,6 +79,12 @@ add_executable(sip_parser_tests
     # BYE relay between the two remaining legs, and the 603-decline path for
     # an unresolvable Replaces target.
     AttendedTransfer_test.cpp
+    # Issue #133: onRefer() admitted any REGISTERed From, never checking that the
+    # REFER's source was actually a leg of the Call-ID it named — onBye's #46
+    # guard with no counterpart. Covers the forged blind teardown, the forged
+    # ?Replaces= splice of a consult dialog the source is not on, and that a
+    # genuine in-dialog transfer still completes.
+    ReferSourceAuth_test.cpp
     # Issue #69: the bounded pattern -> action dial plan that generalizes the
     # ring-group mechanism. Pure grammar/precedence/cap coverage against
     # DialPlan.hpp, end-to-end routing (dispatch + fallthrough) driven through
