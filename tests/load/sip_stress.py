@@ -31,7 +31,7 @@ following genuinely produce distinct buckets:
     one kernel network stack, and one physical host with the process under
     test, so it is NOT a substitute for a real multi-host run when the question
     is production capacity under real network conditions -- see
-    docs/SCALING.md / STRESS_FINDINGS.md for what was actually measured this
+    docs/SCALING.md for what was actually measured this
     way vs. what a real multi-host run still needs to confirm.
 
 Usage:

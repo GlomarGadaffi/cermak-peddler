@@ -75,7 +75,7 @@ CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
 # (Harmless/ignored for non-display builds that don't link wolfSSL.)
 CONFIG_ESP_WOLFSSL_NO_STACK_SIZE_BUILD_WARNING=y
 
-# lwIP receive mailbox depth (Issue #78 / tests/load/STRESS_FINDINGS.md finding #1).
+# lwIP receive mailbox depth (Issue #78, stress-test finding #1).
 # The IDF default of 6 overruns under a burst of simultaneous SIP packets from one
 # source — the packets are dropped at the lwip layer before the SIP task ever sees
 # them (30 parallel REGISTERs measured 0 responses; the same REGISTER sent singly
