@@ -87,6 +87,24 @@ namespace
 		return RtpReceiver::mulawDecode(RtpSender::linearToUlaw(saturate(mix)));
 	}
 
+	// Halt every named leg's RtpSender pacer thread so the test is the ONLY consumer
+	// of each port's out ring before it starts draining legs by hand (issue #135).
+	// On this host RtpSender::start() spawns a real 20 ms thread whose provider is
+	// MediaBridge::fillHandsetTx -- the same destructive PlayoutBuffer::read() that
+	// drainLeg() below performs -- so without this the pacer can pop the very frame
+	// the test is about to assert on. stop() joins synchronously; the bridge and its
+	// bus port stay live, so tickOnce()/drainLeg() remain valid afterwards. Same shape
+	// as the tx.stop("call-x") in AnchorModeIsUnchangedByTheBusRewiring.
+	void quiesceSenders(ConferenceRoom& room, const std::vector<std::string>& callIds)
+	{
+		for (const auto& id : callIds)
+		{
+			RtpSender* tx = room.senderForCall(id);
+			ASSERT_NE(tx, nullptr) << "no leg for " << id;
+			ASSERT_TRUE(tx->stop(id)) << "pacer for " << id << " was not running";
+		}
+	}
+
 	// Pull one 20 ms frame out of a leg and decode it back to PCM16.
 	std::vector<int16_t> drainLeg(MediaBridge& bridge)
 	{
@@ -188,6 +206,7 @@ TEST(ConferenceRoom, ThreeLegsEachHearTheOthersMinusThemselves)
 	ASSERT_GE(room.join("call-b", "102", "127.0.0.1", 10002), 0);
 	ASSERT_GE(room.join("call-c", "103", "127.0.0.1", 10003), 0);
 	EXPECT_EQ(room.legCount(), 3);
+	quiesceSenders(room, {"call-a", "call-b", "call-c"});
 
 	MediaBridge* a = room.bridgeForCall("call-a");
 	MediaBridge* b = room.bridgeForCall("call-b");
@@ -239,6 +258,7 @@ TEST(ConferenceRoom, LoudLegsDoNotOverSaturateThroughTheBridge)
 		ASSERT_GE(room.join(ids.back(), "10" + std::to_string(i), "127.0.0.1",
 			static_cast<uint16_t>(11000 + i)), 0);
 	}
+	quiesceSenders(room, ids);
 
 	const int16_t level = 30000;
 	for (const auto& id : ids)
@@ -264,6 +284,7 @@ TEST(ConferenceRoom, LegLeavingDoesNotDisturbTheRest)
 	ASSERT_GE(room.join("call-a", "101", "127.0.0.1", 12001), 0);
 	ASSERT_GE(room.join("call-b", "102", "127.0.0.1", 12002), 0);
 	ASSERT_GE(room.join("call-c", "103", "127.0.0.1", 12003), 0);
+	quiesceSenders(room, {"call-a", "call-b", "call-c"});
 
 	MediaBridge* a = room.bridgeForCall("call-a");
 	MediaBridge* b = room.bridgeForCall("call-b");
