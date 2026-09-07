@@ -65,15 +65,24 @@ static const char* TAG = "SipServerETH";
 //     waveshare → Waveshare ESP32-S3-ETH (W5500, PoE)
 //   Defaults to the Elite when neither macro is defined, so a stray build of
 //   this file targets the board that's actually on the bench.
-//   Verify against your board's schematic / silkscreen before trusting it.
+//   Both maps below are hardware-verified: the Elite continuously, the Waveshare
+//   as of #155. A wrong pin here is not a soft failure -- esp_eth_driver_install()
+//   returns ESP_ERR_TIMEOUT and the ESP_ERROR_CHECK at eth_init_w5500() aborts
+//   the boot, so the board reset-loops with no network to diagnose it over.
 #if defined(PD_ETH_BOARD_WAVESHARE)
 #  define W5500_BOARD_NAME "Waveshare ESP32-S3-ETH"
-#  define W5500_SCLK_GPIO  12
-#  define W5500_MISO_GPIO  13
+// Verified on hardware 2026-09-07 (issue #155). The previous map here had SCLK
+// and MISO transposed, CS and INT transposed, and no reset line; it did not just
+// fail to link, it timed out inside esp_eth_driver_install() and the
+// ESP_ERROR_CHECK aborted the boot, so the board sat in a reset loop
+// (108 consecutive rst:0xc in one capture). These values are the ones the
+// ESP32_AdBlocker_Reborn firmware has been running on this exact board.
+#  define W5500_SCLK_GPIO  13
+#  define W5500_MISO_GPIO  12
 #  define W5500_MOSI_GPIO  11
-#  define W5500_CS_GPIO    10
-#  define W5500_INT_GPIO   14
-#  define W5500_RST_GPIO   -1
+#  define W5500_CS_GPIO    14
+#  define W5500_INT_GPIO   10
+#  define W5500_RST_GPIO   9    // Waveshare wires a real reset line; the Elite does not
 #else  // PD_ETH_BOARD_ELITE (default)
 #  define W5500_BOARD_NAME "LilyGO T-ETH-ELITE S3"
 #  define W5500_SCLK_GPIO  48
