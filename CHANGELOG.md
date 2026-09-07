@@ -43,20 +43,27 @@ out with a silently inert feature and a green test suite. Verified in both
 directions — the assertion fires on a deliberately mismatched constant, and the
 322-test host suite passes with it restored.
 
-### Hardware verification
+### How the diagnosis was pinned down
 
-On a LilyGO T-ETH-Elite S3 running this build, flash-erased, with a `cfgseed`
-record at `0xFFF000` carrying only `kSeedHasRegMode` and `regMode = 1`:
+On a LilyGO T-ETH-Elite S3 running the **published v1.4.0** `esp32s3-eth`
+artifact, flash-erased, with a valid `cfgseed` record at `0xFFF000` carrying only
+`kSeedHasRegMode` and `regMode = 1`:
 
-```
-Learn: adopted device e45f01654516 as ext 1001
-```
+- Reading NVS back off the chip showed `reg_mode = 1` and `cfgseed_gen`
+  committed — under `storage`. So the seed was found, validated and applied; the
+  value simply landed somewhere the registrar does not look.
+- The registrar stayed in `open`: three REGISTERs produced `New Client: 1001`
+  and **neither** of the two lines `admitLearn()` emits unconditionally on a
+  first REGISTER from an unknown MAC.
+- Writing `reg_mode` under `pbxcfg` instead — same board, same binary, nothing
+  else changed — produced `Learn: adopted device e45f01654516 as ext 1001` with
+  zero ARP misses.
 
-That is the documented route working end to end for the first time — browser
-flasher writes the seed, firmware reads it, registrar comes up in Learn mode,
-and the device is adopted. On v1.4.0 the identical board and an identical seed
-produced `New Client: 1001` and no Learn line at all, because the registrar was
-still in `open`.
+One board, one binary, one variable, which isolates the fault to the namespace
+and nothing else. That evidence was gathered by writing NVS directly rather than
+through the seed, so it proves the diagnosis rather than this release's
+end-to-end path; the end-to-end run against the v1.4.1 artifact is recorded on
+#151.
 
 ### Known issues
 
