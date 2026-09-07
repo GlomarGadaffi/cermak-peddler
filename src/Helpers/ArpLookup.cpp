@@ -87,9 +87,23 @@ namespace ArpLookup
 
 		Mac mac{};
 		// AP first (the common case: phones associate to the device's SoftAP), then
-		// STA (the device is itself a client on an upstream LAN). First hit wins.
+		// STA (the device is itself a client on an upstream LAN), then Ethernet.
+		// First hit wins.
+		//
+		// ETH_DEF is not optional (issue #103). On an Ethernet build -- the whole
+		// SIP_TRANSPORT=eth family, e.g. the LilyGO T-ETH-Elite -- there is no Wi-Fi
+		// netif at all, so both Wi-Fi probes get a nullptr handle and this function
+		// returned nullopt for EVERY caller, forever. That is a permanent ARP miss,
+		// and admitLearn() treats a miss as "accept but defer the MAC-lock to the
+		// next REGISTER" -- a next REGISTER that could never resolve either. The
+		// device registry therefore stayed empty on every Ethernet board, so no
+		// device was ever adopted and GET /config/<mac>.cfg answered 404 for all of
+		// them. Silently: the miss path is a deliberate non-error.
+		// The key string is ESP-IDF's own (esp_netif_defaults.h,
+		// ESP_NETIF_INHERENT_DEFAULT_ETH sets .if_key = "ETH_DEF").
 		if (probeIfkey("WIFI_AP_DEF", ip, mac) ||
-			probeIfkey("WIFI_STA_DEF", ip, mac))
+			probeIfkey("WIFI_STA_DEF", ip, mac) ||
+			probeIfkey("ETH_DEF", ip, mac))
 		{
 			return mac;
 		}
