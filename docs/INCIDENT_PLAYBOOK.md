@@ -304,7 +304,7 @@ The firmware is reinforced against remote attacks, memory leaks, and exhaustion 
 | :--- | :--- | :--- |
 | `open` | No SIP authentication. **The shipped default.** | Compiled-in default; `POST /api/registrar mode=open` |
 | `learn` | Trust-on-first-use: an unknown MAC claiming an unclaimed extension is adopted and locked to it; already-secured devices stay digest-enforced. **Temporary, by design.** | Dashboard *Extension Registration & Onboarding* panel; `POST /api/registrar` |
-| `secure` | Every `REGISTER` digest-challenged; extension ↔ MAC locked. | As above, or the flash-time `cfgseed` record (`regMode`, byte 13) — the only way to set it on a headless board before first boot |
+| `secure` | Every `REGISTER` digest-challenged; extension ↔ MAC locked. | As above. The flash-time `cfgseed` record (`regMode`, byte 13) is documented as the headless route but **does not work** ([#151](https://github.com/GlomarGadaffi/pocket-dial/issues/151)) — it writes to the wrong NVS namespace |
 
 **Triage:**
 ```bash

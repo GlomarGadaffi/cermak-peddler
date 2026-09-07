@@ -1,6 +1,6 @@
 # Learn Mode — Fleet-Cutover Runbook
 
-**Status:** Shipped on `main` (digest auth + Learn mode), and now operator-selectable from the dashboard, `POST /api/registrar`, or the flash-time seed. The registrar default is still `open`, so this runbook describes a mode you must switch **to**. | **Audience:** Installers / field operators converting an existing phone deployment to pocket-dial. | **Scope:** Operational runbook, not implementation spec.
+**Status:** Shipped on `main` (digest auth + Learn mode), and operator-selectable from the dashboard or `POST /api/registrar`. The flash-time `cfgseed` seed is *documented* as a third route but **does not currently work** — see [#151](https://github.com/GlomarGadaffi/pocket-dial/issues/151); the value lands in the wrong NVS namespace and the registrar never reads it. The registrar default is still `open`, so this runbook describes a mode you must switch **to**. | **Audience:** Installers / field operators converting an existing phone deployment to pocket-dial. | **Scope:** Operational runbook, not implementation spec.
 
 > **TL;DR.** Learn mode lets you drop pocket-dial into a *running* phone deployment and
 > adopt the handsets that are already there — without re-typing a SIP account into every
@@ -17,9 +17,17 @@
 ## 1. The three registrar modes
 
 The registrar mode is a runtime setting (NVS-backed, chosen at onboarding and changeable
-from the dashboard's *Extension Registration & Onboarding* panel, or `POST /api/registrar`;
-on a headless board, from the browser flasher's flash-time configuration panel). It
-controls how a REGISTER is treated.
+from the dashboard's *Extension Registration & Onboarding* panel, or `POST /api/registrar`).
+It controls how a REGISTER is treated.
+
+> [!WARNING]
+> The browser flasher's flash-time configuration panel also offers a registrar mode, and
+> this runbook used to point headless operators at it. **It does not work**
+> ([#151](https://github.com/GlomarGadaffi/pocket-dial/issues/151)): the seed writes
+> `reg_mode` into NVS namespace `storage` while `Registrar::loadMode()` reads `pbxcfg`.
+> On a headless `eth`/`wifi` board, set the mode over `POST /api/registrar` during the
+> provisioning window — once the board is provisioned its HTTP plane goes dark, and the
+> `*4887` star-code that reopens it is not reliable.
 
 | Mode | What it does | When to use it |
 |------|--------------|----------------|

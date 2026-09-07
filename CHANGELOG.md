@@ -67,6 +67,15 @@ Fixed in `e559368`, which also backfilled the already-published v1.3.0 manifest
 rather than re-cutting that tag — the images were always fine, only the field was
 missing. v1.4.0 is the first release whose manifest carries it natively.
 
+Verified on hardware after the tag was cut: the seed is written, found and applied
+— an NVS dump off a board shows `cfgseed_gen` and the seeded values committed. The
+Wi-Fi mode, AP security and passphrase fields work. **The registrar-mode field of
+the same panel does not**, for an unrelated second reason found by that same test:
+it is written to NVS namespace `storage` while the registrar reads `pbxcfg`
+(#151). That has never worked on any release, and is not a v1.4.0 regression —
+v1.4.0 is simply the first release in which the seed reaches the firmware at all,
+which is what made it visible.
+
 ### Removed — the Arduino sketch path (#144)
 
 `sketches/` is gone. It was a second, parallel build of the same firmware that
@@ -121,6 +130,13 @@ Two confirmed bugs are open against this release and are **not** fixed in it:
   486 suffices) will drive the board's message pool to exhaustion, after which
   unrelated signalling is dropped silently. This mostly bites synthetic test
   clients, but any phone that ignores the beep will trigger it.
+- **#151** — the `cfgseed` `regMode` field is written to NVS namespace `storage`
+  while `Registrar::loadMode()` reads `pbxcfg`, so flash-time registrar mode has
+  never worked on any release. `docs/LEARN_MODE.md`, `docs/INCIDENT_PLAYBOOK.md`
+  and `DeviceConfig.hpp` all describe it as the only way to move a **headless**
+  board off `open` before first boot; it is not, and a provisioned board's HTTP
+  plane is dark, so there is currently no reliable route. The dashboard and
+  `POST /api/registrar` paths are unaffected — they use `pbxcfg` on both sides.
 
 
 ## [v1.3.0] — 2026-09-04
