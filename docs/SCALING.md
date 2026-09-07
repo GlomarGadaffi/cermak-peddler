@@ -181,6 +181,36 @@ headroom and bump the tier before exhaustion becomes routine.
 > #115. This was a single-host, host-build measurement (loopback-range source
 > IPs, not real distinct hosts), not a real multi-host run against firmware.
 
+> **Measured on firmware, multi-host (Issue #79, 2026-09-06):** the run above has
+> now been repeated against a real board — a LilyGO T-ETH-Elite S3 (W5500,
+> `SIP_TRANSPORT=eth`, default 32/8 tier) — driven concurrently from **two
+> genuinely distinct physical hosts** on the same LAN, so the Issue #38 per-IP
+> token bucket is bypassed by having separate buckets rather than by loopback
+> aliases:
+>
+> | source host | attempts | `200` | `503` | p50 latency |
+> |---|--:|--:|--:|--:|
+> | `192.168.12.110` | 25 | **25** | 0 | 7.3 ms |
+> | `192.168.12.161` | 25 | **7** | 18 | 11.8 ms |
+> | **total** | 50 | **32** | 18 | — |
+>
+> The client-pool ceiling lands at **exactly 32** across the two hosts, matching
+> `POCKETDIAL_MAX_CLIENTS` — confirming the pool is global, not per-source. Every
+> rejection was a clean `503 Service Unavailable`; `packetsDropped` stayed 0, and
+> the serial console showed no watchdog, panic, abort or reboot. The board kept
+> answering REGISTERs afterwards. A separate single-host run (45 attempts, paced
+> under the per-IP limit) reproduced the same 32/13 split with p50 4.6 ms.
+>
+> Two caveats worth recording. First, the **session** ceiling (8) was *not*
+> cleanly demonstrated on firmware: 14 concurrent `777` echo calls returned 11 ×
+> `200` and 3 × *no response at all* rather than `503` — the Issue #115 behaviour,
+> now confirmed on hardware. Second, sustained registration load makes the
+> register-beep INVITE flood the static message pool
+> (`[tx] pool exhausted — INVITE sent without retransmit tracking`), which is
+> Issue #148; a starved pool silently drops unrelated signalling, so the latency
+> figures above should be read as "healthy tier, known beep bug", not as a clean
+> bill of health.
+
 ---
 
 ## 5. Why the defaults are 32 / 8 — and what breaks if you 10× them
