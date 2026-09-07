@@ -523,11 +523,24 @@ namespace DeviceConfig
 		if (flags & kSeedHasRegMode)
 		{
 			// The SIP registrar's admission mode. Written as a RAW u8 to the key
-			// Registrar::loadMode() reads ("reg_mode" in this same "storage"
-			// namespace, src/SIP/Registrar.cpp) — deliberately WITHOUT including
-			// any src/SIP header: this translation unit is also compiled into the
-			// host test suite and into the pure-Ethernet transports, and pulling
-			// the registrar in would drag its dependencies along for no gain.
+			// Registrar::loadMode() reads: "reg_mode" in the **"pbxcfg"**
+			// namespace (pbxpersist::kNvsNamespace, src/SIP/PbxPersist.hpp) — NOT
+			// this function's own "storage" namespace, which is why it needs its
+			// own handle below.
+			//
+			// The literal is duplicated here deliberately, WITHOUT including any
+			// src/SIP header: this translation unit is also compiled into the host
+			// test suite and into the pure-Ethernet transports, and pulling the
+			// registrar in would drag its dependencies along for no gain.
+			// DeviceConfig_test.cpp static_asserts the two against each other so
+			// they cannot drift apart again.
+			//
+			// This was issue #151: the write went to `h` ("storage") while
+			// loadMode() read "pbxcfg", so the flash-time registrar mode silently
+			// did nothing on every release that shipped it. It stayed invisible
+			// because a second bug (the byte-swapped partition magic fixed in
+			// e559368) meant no seed was ever written at all, so this line never
+			// got the chance to fail until v1.4.0.
 			//
 			// The values mirror Registrar::Mode byte for byte: 0 = open,
 			// 1 = learn, 2 = secure. That duplication is only safe because of the
@@ -545,9 +558,21 @@ namespace DeviceConfig
 			// HEADLESS board (esp32s3-wifi / esp32s3-eth, no screen, and no
 			// dashboard access until it is on a network) a `secure` or `learn`
 			// registrar. A dashboard endpoint covers the boards that do have one.
-			if (regMode <= 2 && nvs_set_u8(h, "reg_mode", regMode) == ESP_OK)
+			if (regMode <= 2)
 			{
-				applied = true;
+				// Separate handle: a different namespace from every other field
+				// this function writes. Committed and closed here rather than
+				// deferred to the shared commit below, which only covers `h`.
+				nvs_handle_t rh;
+				if (nvs_open(kRegistrarNvsNamespace, NVS_READWRITE, &rh) == ESP_OK)
+				{
+					if (nvs_set_u8(rh, "reg_mode", regMode) == ESP_OK)
+					{
+						nvs_commit(rh);
+						applied = true;
+					}
+					nvs_close(rh);
+				}
 			}
 		}
 

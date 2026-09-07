@@ -1,5 +1,70 @@
 # Changelog
 
+## [v1.4.1] — 2026-09-07
+
+A single-bug patch release. It makes the flash-time registrar mode actually
+work — the one thing v1.4.0 claimed and did not deliver.
+
+Nothing else changes. Upgrading is an OTA or a reflash.
+
+### Fixed — flash-time registrar mode reached the wrong NVS namespace (#151)
+
+`DeviceConfig::applyFlashSeed()` wrote the `cfgseed` record's `regMode` to NVS
+namespace `storage`, alongside every other field of the seed.
+`Registrar::loadMode()` reads `reg_mode` from `pbxpersist::kNvsNamespace`, which
+is `pbxcfg`. The value was written, committed, and never read.
+
+So the `regMode` field did nothing, on every release that shipped it. That
+matters more than a typo normally would, because `docs/LEARN_MODE.md`,
+`docs/INCIDENT_PLAYBOOK.md` and `DeviceConfig.hpp` all described it as *the only*
+way to put a **headless** `esp32s3-eth` / `esp32s3-wifi` board into `learn` or
+`secure` before first boot — and once such a board is provisioned its HTTP admin
+plane is dark, leaving only the unreliable `*4887` star-code. A headless board
+was effectively stuck in the `open` default with no supported way out.
+
+It stayed invisible through v1.3.0 because a second, unrelated bug sat in front
+of it: the release workflow's byte-swapped partition magic (fixed in `e559368`,
+shipped in v1.4.0) meant `cfgseed_offset` was never emitted, so the browser
+flasher never wrote a seed at all and this line never got the chance to fail.
+Fixing the outer bug is what exposed the inner one — v1.4.0 is the release that
+made the failure reachable, not the release that introduced it.
+
+**The fix** is to open a second NVS handle on `pbxcfg` for this one key. The
+namespace literal still has to be duplicated — `DeviceConfig` is compiled into
+the host test suite and into the pure-Ethernet transports, and must not pull in
+any `src/SIP` header — so `DeviceConfig::kRegistrarNvsNamespace` is now a named
+header constant, and `tests/DeviceConfig_test.cpp` `static_assert`s it against
+`pbxpersist::kNvsNamespace`. Renaming either one now fails the build.
+
+That guard is a compile-time assertion rather than a test because there is
+nothing to run: `applyFlashSeed()` is inside `#if defined(ESP_PLATFORM)` and
+compiles out entirely on the host build, which is exactly why two releases went
+out with a silently inert feature and a green test suite. Verified in both
+directions — the assertion fires on a deliberately mismatched constant, and the
+322-test host suite passes with it restored.
+
+### Hardware verification
+
+On a LilyGO T-ETH-Elite S3 running this build, flash-erased, with a `cfgseed`
+record at `0xFFF000` carrying only `kSeedHasRegMode` and `regMode = 1`:
+
+```
+Learn: adopted device e45f01654516 as ext 1001
+```
+
+That is the documented route working end to end for the first time — browser
+flasher writes the seed, firmware reads it, registrar comes up in Learn mode,
+and the device is adopted. On v1.4.0 the identical board and an identical seed
+produced `New Client: 1001` and no Learn line at all, because the registrar was
+still in `open`.
+
+### Known issues
+
+Unchanged from v1.4.0: **#146** (`Via` `received=` carries the server's own IP,
+RFC 3261 §18.2.1) and **#148** (register-beep INVITE retransmission flood
+exhausting the message pool).
+
+
 ## [v1.4.0] — 2026-09-06
 
 Two days after v1.3.0, and small. It is a minor bump rather than a patch because
@@ -72,7 +137,8 @@ Verified on hardware after the tag was cut: the seed is written, found and appli
 Wi-Fi mode, AP security and passphrase fields work. **The registrar-mode field of
 the same panel does not**, for an unrelated second reason found by that same test:
 it is written to NVS namespace `storage` while the registrar reads `pbxcfg`
-(#151). That has never worked on any release, and is not a v1.4.0 regression —
+(#151, **fixed in v1.4.1**). That had never worked on any release, and was not a
+v1.4.0 regression —
 v1.4.0 is simply the first release in which the seed reaches the firmware at all,
 which is what made it visible.
 
@@ -130,9 +196,9 @@ Two confirmed bugs are open against this release and are **not** fixed in it:
   486 suffices) will drive the board's message pool to exhaustion, after which
   unrelated signalling is dropped silently. This mostly bites synthetic test
   clients, but any phone that ignores the beep will trigger it.
-- **#151** — the `cfgseed` `regMode` field is written to NVS namespace `storage`
-  while `Registrar::loadMode()` reads `pbxcfg`, so flash-time registrar mode has
-  never worked on any release. `docs/LEARN_MODE.md`, `docs/INCIDENT_PLAYBOOK.md`
+- **#151** (**fixed in v1.4.1**) — the `cfgseed` `regMode` field is written to NVS
+  namespace `storage` while `Registrar::loadMode()` reads `pbxcfg`, so flash-time
+  registrar mode had never worked on any release. `docs/LEARN_MODE.md`, `docs/INCIDENT_PLAYBOOK.md`
   and `DeviceConfig.hpp` all describe it as the only way to move a **headless**
   board off `open` before first boot; it is not, and a provisioned board's HTTP
   plane is dark, so there is currently no reliable route. The dashboard and
