@@ -15,9 +15,28 @@
 #include <gtest/gtest.h>
 
 #include "DeviceConfig.hpp"
+#include "PbxPersist.hpp"
 
 #include <set>
 #include <string>
+#include <string_view>
+
+// Issue #151. applyFlashSeed() writes the seed's `regMode` to the NVS namespace
+// the REGISTRAR reads, which is not the "storage" namespace the rest of the seed
+// lands in. DeviceConfig cannot include any src/SIP header (it is compiled into
+// the pure-Ethernet transports and into this test binary), so the namespace name
+// is duplicated — and a duplicated string is exactly what drifted apart before.
+//
+// This is a compile-time pin, not a runtime test, because there is nothing to
+// run: applyFlashSeed() is inside `#if defined(ESP_PLATFORM)` and compiles out
+// entirely on the host, which is precisely why the original bug reached two
+// releases without a single test noticing. Anyone who renames either constant
+// now fails the build here instead of shipping a silently inert feature.
+static_assert(std::string_view(DeviceConfig::kRegistrarNvsNamespace)
+                  == std::string_view(pbxpersist::kNvsNamespace),
+              "DeviceConfig::kRegistrarNvsNamespace must match "
+              "pbxpersist::kNvsNamespace, or the flash-time registrar mode is "
+              "written where Registrar::loadMode() will never read it (#151)");
 
 namespace
 {

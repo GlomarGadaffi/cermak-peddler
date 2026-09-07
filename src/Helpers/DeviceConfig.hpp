@@ -146,6 +146,22 @@ namespace DeviceConfig
 	constexpr uint16_t kSeedVersion = 1;
 	constexpr size_t   kSeedSize    = 256;
 
+	// Where the seed's `regMode` must be written. The registrar keeps its
+	// admission mode in its OWN NVS namespace, NOT the "storage" one every other
+	// field of the seed lands in: Registrar::loadMode() opens
+	// pbxpersist::kNvsNamespace (src/SIP/PbxPersist.hpp).
+	//
+	// The literal is duplicated here rather than included so this header stays
+	// free of any src/SIP dependency — it is pulled into the host test suite and
+	// into the pure-Ethernet transports, neither of which should drag the
+	// registrar in. tests/DeviceConfig_test.cpp static_asserts the two against
+	// each other, so the duplication cannot silently drift.
+	//
+	// Getting this wrong was issue #151: the write went to "storage", the read
+	// came from "pbxcfg", and flash-time registrar mode did nothing at all on
+	// every release that shipped it.
+	constexpr const char* kRegistrarNvsNamespace = "pbxcfg";
+
 	// `flags` bits. Each "Has" bit says "this field is meaningful"; a seed may
 	// carry any subset, so the flasher can write only what the user changed.
 	constexpr uint16_t kSeedHasApSecure = 1u << 0;  // apply the bit below
