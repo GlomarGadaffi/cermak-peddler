@@ -6,12 +6,20 @@ Welcome! This guide assists contributors in setting up the development environme
 
 ## 1. Development Toolchain Prerequisites
 
-The **pocket-dial** firmware compiles under two build environments depending on your target configuration:
-* **ESP-IDF Toolchain**: Preferred for production, smart-displays, and advanced multithreading builds.
-* **Arduino Toolchain**: Used for rapid prototyping and flashing individual `.ino` sketch targets.
+The **pocket-dial** firmware builds with **ESP-IDF**. That is the only supported
+firmware toolchain: it is what CI builds on every pull request, what the release
+workflow ships, and what the browser flasher serves.
 
-### A. ESP-IDF Environment Setup (Recommended)
-1. Install **ESP-IDF v5.1** or newer (v5.1.x / v5.2.x are fully supported). Follow the [Espressif Installation Guide](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/index.html).
+> [!NOTE]
+> An Arduino/`.ino` sketch path used to live in `sketches/`. It was removed: it had
+> been broken since June 2026, nothing in CI compiled it, and nobody noticed. See
+> issues #41 and #143 for the history.
+
+### ESP-IDF Environment Setup
+1. Install **ESP-IDF v6.0 or newer**. `main/CMakeLists.txt` hard-fails at configure
+   time below v6.0 (components such as `esp_driver_ledc` were split out of the
+   monolithic `driver` component after v5.2, so older toolchains cannot build this
+   project at all). CI pins **v6.0.1**. Follow the [Espressif Installation Guide](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/index.html).
 2. Configure environmental paths (Windows PowerShell example):
    ```powershell
    . $HOME\esp\esp-idf\export.ps1
@@ -21,21 +29,11 @@ The **pocket-dial** firmware compiles under two build environments depending on 
    xtensa-esp32s3-elf-gcc --version
    ```
 
-### B. Arduino IDE Toolchain
-1. Download **Arduino IDE v2.x** or compile via `arduino-cli`.
-2. Add the Espressif Board Manager URL under Preferences:
-   ```text
-   https://espressif.github.io/arduino-esp32/package_esp32_index.json
-   ```
-3. Install **ESP32 by Espressif Systems (v3.0.0 or higher)**.
-   > [!IMPORTANT]
-   > ESP32 Arduino Core 3.x is required. It contains the native Wiznet W5500 SPI Ethernet and LAN8720 RMII drivers used in the sketches.
-
 ---
 
 ## 2. Compilation & Flashing Instructions
 
-### A. Compiling via ESP-IDF CLI
+### Compiling & flashing via the ESP-IDF CLI
 1. Open your terminal in the root workspace directory.
 2. Select your hardware chip target (`esp32s3` for displays and S3-ETH, `esp32` for legacy POE-Pro):
    ```bash
@@ -53,15 +51,6 @@ The **pocket-dial** firmware compiles under two build environments depending on 
    ```bash
    idf.py -p COM3 flash monitor
    ```
-
-### B. Compiling via Arduino IDE
-1. Open the `.ino` sketch from the `sketches/` directory corresponding to your board (e.g., `sketches/SipServer_T_ETH_Lite_W5500/SipServer_T_ETH_Lite_W5500.ino`).
-2. Select your board under **Tools > Board**:
-   * For S3-ETH and T-ETH-Lite: Select **ESP32S3 Dev Module**.
-   * For POE-Pro: Select **ESP32 Wrover Module**.
-3. Enable **PSRAM** under **Tools > PSRAM > OPI PSRAM** (if applicable).
-4. Select the **Huge APP (3MB No OTA/1MB SPIFFS)** or custom partition scheme.
-5. Click **Upload** to compile and flash.
 
 ---
 
