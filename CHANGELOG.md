@@ -60,10 +60,24 @@ artifact, flash-erased, with a valid `cfgseed` record at `0xFFF000` carrying onl
   zero ARP misses.
 
 One board, one binary, one variable, which isolates the fault to the namespace
-and nothing else. That evidence was gathered by writing NVS directly rather than
-through the seed, so it proves the diagnosis rather than this release's
-end-to-end path; the end-to-end run against the v1.4.1 artifact is recorded on
-#151.
+and nothing else. That evidence was gathered by writing NVS directly, so it
+proves the diagnosis rather than this release's own seed path.
+
+### End-to-end, on this release's artifact
+
+Confirmed separately against the published v1.4.1 `esp32s3-eth` binary (sha256
+matching `SHA256SUMS`), flash-erased, driven by a `cfgseed` record alone with no
+direct NVS write:
+
+```
+reg_mode = 1  in namespace 'pbxcfg' (index 2)
+Learn: adopted device e45f01654516 as ext 1001
+```
+
+Same board, same seed bytes, same offset, on v1.4.0: `New Client: 1001` and no
+Learn line at all. So v1.4.1 is the first release on which the documented
+headless route — pick a registrar mode in the flasher, flash, boot — does
+anything at all. Full run on #151.
 
 ### Known issues
 
