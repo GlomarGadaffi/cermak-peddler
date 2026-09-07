@@ -3,7 +3,7 @@
 This document serves as the authoritative production-grade field operation and incident playbook for the pocket-dial ESP32 / ESP32-S3 firmware. It is intended for field engineers, system administrators, and core firmware maintainers to diagnose, isolate, secure, and recover devices suffering from field anomalies.
 
 > [!IMPORTANT]
-> **Establish which posture the device is in before you triage.** Current `main` adds three
+> **Establish which posture the device is in before you triage.** v1.3.0 and newer add three
 > opt-in controls that change how the device answers you, and **all three default to off**.
 > One `curl` tells you where you stand:
 > ```bash

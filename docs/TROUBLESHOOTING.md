@@ -9,7 +9,7 @@ Quick references: [SETUP_GUIDE.md](SETUP_GUIDE.md) ·
 [THREAT_MODEL.md](THREAT_MODEL.md)
 
 > [!NOTE]
-> **Firmware newer than the last release changed three operator-visible things.** If a
+> **v1.3.0 changed three operator-visible things.** If a
 > recipe here does not match your device, check which you are running.
 > * Mutating API calls now need an **`X-CSRF` header** — see
 >   [403 on an API call that used to work](#403-on-an-api-call-that-used-to-work).

@@ -1,5 +1,128 @@
 # Changelog
 
+## [v1.4.0] — 2026-09-06
+
+Two days after v1.3.0, and small. It is a minor bump rather than a patch because
+two of the changes alter what the firmware does rather than how it is built: a
+call transfer can no longer be forged from off-path, and zero-touch provisioning
+works on Ethernet builds for the first time. A supported build path is also
+removed.
+
+Nothing here changes configuration or breaks an existing deployment. Upgrading is
+an OTA or a reflash.
+
+### Security — REFER is gated on the dialog's own source IPs (#133)
+
+`onRefer` authenticated nothing about *where* a REFER came from. Any host that
+could reach the signalling port and learn or guess a live Call-ID could transfer
+a call in progress to a destination of its choosing: the victim's dialog would be
+re-INVITEd away with no participation from either real party. `Replaces` widened
+it — a REFER could name a second dialog the sender was not a leg of, splicing two
+unrelated calls together.
+
+Both paths now check the request's source against the addresses of the dialog's
+own legs (`isDialogSourceAuthorized`) and answer **403 Forbidden** when it is not
+one of them. The referred dialog and the `Replaces` target are checked
+separately, so neither can be used to reach the other. In-dialog transfer from a
+real leg is unaffected. Three regression tests cover the forged, legitimate and
+`Replaces`-crossing cases (`tests/ReferSourceAuth_test.cpp`).
+
+### Fixed — zero-touch provisioning on Ethernet builds (#103)
+
+`ArpLookup::pdLookupMac()` probed `WIFI_AP_DEF` and `WIFI_STA_DEF` and nothing
+else. An Ethernet build has no Wi-Fi netif at all, so both handles came back null
+and every lookup returned "not found" — which `admitLearn()` reads as a benign
+first-packet cache miss, deferring the MAC-lock to the next REGISTER, which could
+never resolve either. On the whole `SIP_TRANSPORT=eth` family the device registry
+therefore stayed permanently empty and `GET /config/<mac>.cfg` returned 404 for
+every phone, silently, because the miss path is a non-error by design. `ETH_DEF`
+is now in the probe chain.
+
+The long-standing hypothesis for this bug was a MAC *format* mismatch between the
+registry key and the URL. That was wrong — both sides go through
+`ArpLookup::toHex12()` and do agree — but the feature was still completely
+broken, because there was never a key to compare.
+
+Verified on a LilyGO T-ETH-Elite S3 (W5500), flash-erased between runs: before
+the fix, `ARP miss, deferring MAC-lock` on 4 of 4 REGISTERs with an empty
+registry; after it, `Learn: adopted device e45f01654516 as ext 1001` and zero
+misses. The adopted key is exactly the 12-lowercase-hex form the URL parser
+yields. **The `GET /config/<mac>.cfg` 200 was not itself re-observed** — a
+provisioned board closes its HTTP plane by design, and the DTMF star-code that
+reopens it would not fire from the test client — so that last hop is inferred
+from the key matching, not measured. Full write-up in #147.
+
+### Fixed — the browser flasher can seed flash-time configuration
+
+The release workflow's manifest generator walks the partition table looking for
+the `cfgseed` entry, and compared each record's magic against `0xAA50`. The
+on-disk bytes are `AA 50`, which read back through a little-endian `uint16` is
+`0x50AA` — so the check failed on entry 0, the walk stopped immediately, and
+`cfgseed_offset` was silently omitted from every manifest ever generated. The
+flasher reads a missing `cfgseed_offset` as "this release predates flash-time
+configuration" and warns, so Wi-Fi mode, AP security and passphrase could never
+be written at flash time despite the partition existing in `partitions.csv`.
+
+Fixed in `e559368`, which also backfilled the already-published v1.3.0 manifest
+rather than re-cutting that tag — the images were always fine, only the field was
+missing. v1.4.0 is the first release whose manifest carries it natively.
+
+### Removed — the Arduino sketch path (#144)
+
+`sketches/` is gone. It was a second, parallel build of the same firmware that
+nothing verified, and it had been broken since 2026-06-01: `4e35566` changed
+`HttpServer`'s third constructor parameter from a reference to a pointer, the
+sketches were last touched three days earlier, and all five stopped compiling.
+Nobody noticed for three months.
+
+This is a deliberate removal, not a cleanup of something that could never work —
+with arduino-cli 1.5.2 and ESP32 Arduino Core 3.3.11, a one-character fix gets
+three of the five building for `esp32:esp32:esp32s3`. The other two need a
+third-party display library and an unresolved LAN8720 Ethernet issue (#41, #143).
+Keeping them meant carrying a second toolchain in CI and in the contributor docs
+for a path nothing shipped from.
+
+ESP-IDF is now the only supported toolchain. `docs/CONTRIBUTING.md` loses its two
+Arduino sections and its ESP-IDF prerequisite is corrected: it claimed "v5.1 or
+newer", but `fb29f14` made `main/CMakeLists.txt` a hard configure-time
+`FATAL_ERROR` below **v6.0**, so the documented toolchain could not build the
+project at all.
+
+### Documentation
+
+- `docs/SCALING.md` gains the first concurrency measurement taken on firmware
+  with two genuinely distinct source hosts rather than on the host harness: 50
+  offered calls, exactly 32 accepted and 18 rejected with 503, `packetsDropped:
+  0`, no watchdog. It confirms the call pool is **global, not per-source** (#79).
+- The `TROUBLESHOOTING.md` and `INCIDENT_PLAYBOOK.md` banners described the three
+  opt-in hardening controls as "newer than the last release" and on "current
+  `main`". They shipped in v1.3.0; the banners now say so. Both still note
+  correctly that a device flashed from `v1.3.0-pre-alpha` has none of them.
+
+### Also
+
+Two test-only fixes for flakes that were real but harness-side, both found by
+sampling as independent processes under CPU oversubscription rather than with
+`--gtest_repeat` (which under-samples anything seeded once per process):
+`ConferenceRoom`/`MediaBridge` now stop the RTP pacer before a test drains a leg
+by hand — 29 failures in 400 runs before, 0 after (#135) — and
+`InviteAdmission_test` matches the `SIP/2.0 403` status line rather than a bare
+`403` anywhere in the message, 3 in 400 before, 0 after (#136).
+
+### Known issues
+
+Two confirmed bugs are open against this release and are **not** fixed in it:
+
+- **#146** — the `Via` `received=` parameter is stamped with the server's own IP
+  instead of the sender's, contrary to RFC 3261 §18.2.1. Confirmed on hardware.
+  It misdirects responses to a sender behind NAT.
+- **#148** — the register-beep INVITE retransmits roughly 55 times in 8 seconds
+  and continues after its own CANCEL. A SIP endpoint that does not answer it (a
+  486 suffices) will drive the board's message pool to exhaustion, after which
+  unrelated signalling is dropped silently. This mostly bites synthetic test
+  clients, but any phone that ignores the beep will trigger it.
+
+
 ## [v1.3.0] — 2026-09-04
 
 The first release since v1.2.0 (June 2026), 134 commits back. v1.2.0
